@@ -1,0 +1,6 @@
+build/
+*.o
+*.json.tmp
+compile_commands.json
+__pycache__/
+*.pyc

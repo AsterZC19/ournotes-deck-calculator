@@ -1,0 +1,31 @@
+{
+  "schema": "ournotes-deck-formation@1",
+  "leader": 1,
+  "slots": [
+    {
+      "member": 1,
+      "snapshot": 1,
+      "trigger": 1
+    },
+    {
+      "member": 2,
+      "snapshot": 2,
+      "trigger": 2
+    },
+    {
+      "member": 3,
+      "snapshot": 3,
+      "trigger": 3
+    },
+    {
+      "member": 4,
+      "snapshot": 4,
+      "trigger": 4
+    },
+    {
+      "member": 5,
+      "snapshot": 5,
+      "trigger": 5
+    }
+  ]
+}
