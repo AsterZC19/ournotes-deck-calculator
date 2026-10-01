@@ -1,0 +1,374 @@
+{
+  "schema": "ournotes-deck-problem@1",
+  "song": {
+    "id": 1,
+    "type": 1
+  },
+  "chart": {
+    "difficulty": "expert",
+    "level": 27,
+    "notes": [
+      {
+        "t": 0,
+        "op": 1
+      },
+      {
+        "t": 250,
+        "op": 2
+      },
+      {
+        "t": 500,
+        "op": 1
+      },
+      {
+        "t": 750,
+        "op": 1
+      },
+      {
+        "t": 1000,
+        "op": 2
+      },
+      {
+        "t": 1250,
+        "op": 1
+      },
+      {
+        "t": 1500,
+        "op": 1
+      },
+      {
+        "t": 1750,
+        "op": 2
+      },
+      {
+        "t": 2000,
+        "op": 1
+      },
+      {
+        "t": 2250,
+        "op": 1
+      },
+      {
+        "t": 2500,
+        "op": 2
+      },
+      {
+        "t": 2750,
+        "op": 1
+      }
+    ],
+    "skill_times_ms": [
+      0,
+      1000,
+      2000
+    ]
+  },
+  "catalog": {
+    "members": [
+      {
+        "id": 10,
+        "character": 1,
+        "band": 1,
+        "card_type": 1,
+        "trained": [
+          14,
+          0,
+          0
+        ],
+        "live_skill": 1,
+        "leader_skill": 1
+      },
+      {
+        "id": 20,
+        "character": 2,
+        "band": 1,
+        "card_type": 1,
+        "trained": [
+          3,
+          0,
+          0
+        ],
+        "live_skill": 2,
+        "leader_skill": 2
+      },
+      {
+        "id": 30,
+        "character": 3,
+        "band": 1,
+        "card_type": 1,
+        "trained": [
+          3,
+          0,
+          0
+        ],
+        "live_skill": 3,
+        "leader_skill": 3
+      },
+      {
+        "id": 40,
+        "character": 4,
+        "band": 1,
+        "card_type": 1,
+        "trained": [
+          2,
+          0,
+          0
+        ],
+        "live_skill": 4,
+        "leader_skill": 4
+      }
+    ],
+    "snapshots": [
+      {
+        "id": 1,
+        "characters": [
+          1
+        ],
+        "bands": [
+          1
+        ],
+        "card_type": 1,
+        "trained": [
+          1165,
+          0,
+          0
+        ],
+        "support_skills": [
+          1
+        ]
+      },
+      {
+        "id": 2,
+        "characters": [
+          1
+        ],
+        "bands": [
+          1
+        ],
+        "card_type": 1,
+        "trained": [
+          321,
+          0,
+          0
+        ],
+        "support_skills": [
+          2
+        ]
+      },
+      {
+        "id": 3,
+        "characters": [
+          1
+        ],
+        "bands": [
+          1
+        ],
+        "card_type": 1,
+        "trained": [
+          1,
+          0,
+          0
+        ],
+        "support_skills": [
+          3
+        ]
+      },
+      {
+        "id": 4,
+        "characters": [
+          1
+        ],
+        "bands": [
+          1
+        ],
+        "card_type": 1,
+        "trained": [
+          2058,
+          0,
+          0
+        ],
+        "support_skills": [
+          4
+        ]
+      }
+    ],
+    "note_parameters": [
+      {
+        "op": 1,
+        "score_percent": 100
+      },
+      {
+        "op": 2,
+        "score_percent": 10
+      }
+    ],
+    "live_skills": [
+      {
+        "id": 1,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 2000,
+            "value": 11272
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 2000,
+            "value": 3891
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 2000,
+            "value": 5057
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 2000,
+            "value": 5414
+          }
+        ]
+      }
+    ],
+    "leader_skills": [
+      {
+        "id": 1,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 1000,
+            "value": 3542
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 1000,
+            "value": 2986
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 1000,
+            "value": 4588
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 1000,
+            "value": 2196
+          }
+        ]
+      }
+    ],
+    "support_skills": [
+      {
+        "id": 1,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 15000,
+            "value": 0
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 15000,
+            "value": 250
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 15000,
+            "value": 500
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "effects": [
+          {
+            "level": 5,
+            "effect_type": 15000,
+            "value": 750
+          }
+        ]
+      }
+    ],
+    "combo_bonuses": [
+      {
+        "type": 0,
+        "required_combo_count": 3,
+        "factor": 0.01
+      },
+      {
+        "type": 0,
+        "required_combo_count": 6,
+        "factor": 0.01
+      }
+    ]
+  },
+  "settings": {
+    "team_size": 3,
+    "base_duration_ms": 500,
+    "score_model": {
+      "level_alpha": 0.005,
+      "rounding": "float32_floor"
+    },
+    "power_model": {
+      "rounding": "float64_floor",
+      "sources": {
+        "type_link": false,
+        "band_item": false,
+        "music_type": false,
+        "music_tag": false,
+        "vip": false
+      }
+    }
+  },
+  "constraints": {
+    "distinct_snapshots": true,
+    "required_members": [
+      10
+    ],
+    "required_snapshots": [
+      2
+    ]
+  },
+  "search": {
+    "seed": 36
+  }
+}

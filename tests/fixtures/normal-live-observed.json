@@ -1,0 +1,73 @@
+{
+  "source": "User screenshots IMG_0908/0909/0910/0911 and formation screenshot, 2026-10-01",
+  "song_title": "うちゅうのふしぎ",
+  "difficulty": "expert",
+  "level": 22,
+  "notes": 481,
+  "all_perfect": true,
+  "score": 2322217,
+  "score_rank_label": "B",
+  "master_score_rank": 4,
+  "normal_boost_cost": 3,
+  "reward_rate": 15,
+  "event_pt_bonus_bp": 12400,
+  "event_drop_bonus_bp": 12000,
+  "base": {
+    "cp": 5,
+    "pt": 35,
+    "shop_currency": 42
+  },
+  "observed": {
+    "cp": 75,
+    "pt": 1176,
+    "shop_currency_expected": 1386
+  },
+  "formation_power": 457586,
+  "leader_position": 3,
+  "member_levels": [
+    70,
+    70,
+    80,
+    70,
+    80
+  ],
+  "member_pt_bonus_bp": [
+    3200,
+    5000,
+    0,
+    3200,
+    1000
+  ],
+  "snapshot_levels": [
+    70,
+    90,
+    70,
+    50,
+    70
+  ],
+  "band_item_bonus_bp_by_name": {
+    "夢限大みゅーたいぷ": 210,
+    "MyGO!!!!!": 230,
+    "Ave Mujica": 210
+  },
+  "member_ids_verified": false,
+  "skill_levels_verified": false,
+  "challenge_rewards_verified": false,
+  "song_id": 100057,
+  "chart_verified": true,
+  "chart_summary": {
+    "full_weight_note_count": 291,
+    "tenth_weight_note_count": 190,
+    "all_note_weight_sum": 310,
+    "converted_note_count": 310,
+    "combo_weighted_sum": 359.874,
+    "skill_times_ms": [
+      19672,
+      43278,
+      51147,
+      60983,
+      68852
+    ],
+    "normalized_chart_sha256": "b014397e8cf3200dda8b38eb75682daf66e255d3f0128b3f0720e8537f35c786"
+  }
+}

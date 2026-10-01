@@ -1,4 +1,3 @@
-// json.cpp 的测试。
 #include "json.hpp"
 
 #include <cmath>
@@ -15,20 +14,19 @@ using deckcalc::JsonError;
 
 static int g_checks = 0;
 
-#define CHECK(cond)                                                              \
-    do {                                                                         \
-        ++g_checks;                                                              \
-        if (!(cond)) {                                                           \
-            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
-            std::exit(1);                                                        \
-        }                                                                        \
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        ++g_checks;                                                                                \
+        if (!(cond)) {                                                                             \
+            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                   \
+            std::exit(1);                                                                          \
+        }                                                                                          \
     } while (0)
 
-template <typename F>
-static bool throws_json_error_type(F&& action) {
+template <typename F> static bool throws_json_error_type(F &&action) {
     try {
         action();
-    } catch (const JsonError&) {
+    } catch (const JsonError &) {
         return true;
     } catch (...) {
         return false;
@@ -36,10 +34,10 @@ static bool throws_json_error_type(F&& action) {
     return false;
 }
 
-static bool throws_json_error(const std::string& text) {
+static bool throws_json_error(const std::string &text) {
     try {
         Json::parse(text);
-    } catch (const JsonError&) {
+    } catch (const JsonError &) {
         return true;
     } catch (...) {
         return false;
@@ -47,10 +45,10 @@ static bool throws_json_error(const std::string& text) {
     return false;
 }
 
-static std::string error_message(const std::string& text) {
+static std::string error_message(const std::string &text) {
     try {
         Json::parse(text);
-    } catch (const JsonError& e) {
+    } catch (const JsonError &e) {
         return e.what();
     } catch (...) {
         return "<not JsonError>";
@@ -58,16 +56,15 @@ static std::string error_message(const std::string& text) {
     return "<no throw>";
 }
 
-static bool message_has_offset(const std::string& text, size_t offset) {
+static bool message_has_offset(const std::string &text, size_t offset) {
     const std::string message = error_message(text);
     return message.find("byte " + std::to_string(offset)) != std::string::npos;
 }
 
 int main() {
-    // 嵌套文档的紧凑往返
-    const std::string nested =
-        R"({"name":"deck","count":3,"ratio":0.5,"ok":true,"none":null,)"
-        R"("tags":["a","b"],"nested":{"x":[1,2,{"y":[]}]},"empty":{}})";
+
+    const std::string nested = R"({"name":"deck","count":3,"ratio":0.5,"ok":true,"none":null,)"
+                               R"("tags":["a","b"],"nested":{"x":[1,2,{"y":[]}]},"empty":{}})";
     Json doc = Json::parse(nested);
     CHECK(doc.is_object());
     CHECK(doc.size() == 8);
@@ -78,7 +75,6 @@ int main() {
     CHECK(doc.at("tags").at(1).as_string() == "b");
     CHECK(doc.at("nested").at("x").at(2).at("y").size() == 0);
 
-    // dump(0) 与 dump(2)
     Json pretty_src = Json::parse(R"({"a":1,"b":[1,2],"c":{},"d":[]})");
     CHECK(pretty_src.dump(0) == R"({"a":1,"b":[1,2],"c":{},"d":[]})");
     CHECK(pretty_src.dump(-1) == pretty_src.dump(0));
@@ -94,7 +90,6 @@ int main() {
     CHECK(Json::parse("[1,[2]]").dump(4).find("\n    1,") != std::string::npos);
     CHECK(Json::parse("[1,[2]]").dump(4).find("\n        2") != std::string::npos);
 
-    // 转义序列
     const std::string escaped = std::string("\"\\/\b\f\n\r\t");
     Json ev = Json::parse(R"("\"\\\/\b\f\n\r\t")");
     CHECK(ev.as_string() == escaped);
@@ -103,19 +98,16 @@ int main() {
     CHECK(Json(std::string("\x01\x1f")).dump(0) == "\"\\u0001\\u001f\"");
     CHECK(Json(std::string("\x7f")).dump(0) == "\"\x7f\"");
 
-    // 含引号与反斜杠的字符串
     const std::string tricky = "he said \"hi\\\" then C:\\path\\file";
     Json tricky_json = Json::parse(Json(tricky).dump(0));
     CHECK(tricky_json.as_string() == tricky);
     CHECK(tricky_json.dump(0).find("\\\"hi\\\\\\\"") != std::string::npos);
 
-    // 非 ASCII 字节原样保留
     Json utf8_raw = Json::parse("\"\xe4\xb8\xad\xe6\x96\x87\"");
     CHECK(utf8_raw.as_string() == "\xe4\xb8\xad\xe6\x96\x87");
     CHECK(utf8_raw.dump(0) == "\"\xe4\xb8\xad\xe6\x96\x87\"");
     CHECK(utf8_raw.dump(0).find("\\u") == std::string::npos);
 
-    // \uXXXX 与代理对
     CHECK(Json::parse(R"("\u4e2d\u6587")").as_string() == "\xe4\xb8\xad\xe6\x96\x87");
     CHECK(Json::parse(R"("\ud83d\ude00")").as_string() == "\xf0\x9f\x98\x80");
     CHECK(Json::parse(R"("\uD834\uDD1E")").as_string() == "\xf0\x9d\x84\x9e");
@@ -131,7 +123,6 @@ int main() {
     CHECK(throws_json_error(R"("\uZZZZ")"));
     CHECK(throws_json_error(R"("\u00")"));
 
-    // 数字形式
     CHECK(Json::parse("0").as_double() == 0.0);
     CHECK(Json::parse("-0").as_double() == 0.0);
     CHECK(Json::parse("123").as_double() == 123.0);
@@ -155,7 +146,6 @@ int main() {
     CHECK(Json::parse("-7").dump(0) == "-7");
     CHECK(Json::parse("0.1").dump(0) == "0.1");
 
-    // 非法数字
     CHECK(throws_json_error("01"));
     CHECK(throws_json_error("-01"));
     CHECK(throws_json_error("1."));
@@ -175,7 +165,6 @@ int main() {
     CHECK(throws_json_error("[01]"));
     CHECK((message_has_offset("01", 1)));
 
-    // 字面量
     CHECK(Json::parse("true").as_bool() == true);
     CHECK(Json::parse("false").as_bool() == false);
     CHECK(Json::parse("null").is_null());
@@ -188,7 +177,6 @@ int main() {
     CHECK(throws_json_error("\v1"));
     CHECK(throws_json_error("\f1"));
 
-    // 结构错误
     CHECK(throws_json_error(""));
     CHECK(throws_json_error("   "));
     CHECK(throws_json_error("[1] x"));
@@ -214,7 +202,6 @@ int main() {
     CHECK((message_has_offset("[1] x", 4)));
     CHECK(error_message("{a:1}").find("byte 1") != std::string::npos);
 
-    // 字符串错误
     CHECK(throws_json_error("\"abc"));
     CHECK(throws_json_error("{\"a\""));
     CHECK(throws_json_error(std::string("\"a\nb\"")));
@@ -225,30 +212,30 @@ int main() {
     CHECK(throws_json_error(R"("\")"));
     CHECK(throws_json_error("[1,\"a]"));
 
-    // BOM
     CHECK(Json::parse("\xef\xbb\xbf{\"a\":1}").at("a").as_double() == 1.0);
     CHECK(Json::parse("\xef\xbb\xbf[1,2]").size() == 2);
     CHECK(Json::parse("\xef\xbb\xbf 42").as_double() == 42.0);
     CHECK(throws_json_error("\xef\xbb\xbf"));
     CHECK(throws_json_error("\xef\xbb\xbf\xef\xbb\xbf{}"));
 
-    // 重复键：后值覆盖，位置保留
     Json dup = Json::parse(R"({"a":1,"b":2,"a":3})");
     CHECK(dup.size() == 2);
     CHECK(dup.at("a").as_double() == 3.0);
     CHECK(dup.dump(0) == R"({"a":3,"b":2})");
 
-    // 深度保护
     std::string deep_ok;
-    for (int i = 0; i < 512; ++i) deep_ok += '[';
-    for (int i = 0; i < 512; ++i) deep_ok += ']';
+    for (int i = 0; i < 512; ++i)
+        deep_ok += '[';
+    for (int i = 0; i < 512; ++i)
+        deep_ok += ']';
     CHECK(Json::parse(deep_ok).is_array());
     std::string deep_bad;
-    for (int i = 0; i < 600; ++i) deep_bad += '[';
-    for (int i = 0; i < 600; ++i) deep_bad += ']';
+    for (int i = 0; i < 600; ++i)
+        deep_bad += '[';
+    for (int i = 0; i < 600; ++i)
+        deep_bad += ']';
     CHECK(throws_json_error(deep_bad));
 
-    // find / at / set / push_back / size 语义
     Json obj = Json::object();
     CHECK(obj.is_object());
     CHECK(obj.size() == 0);
@@ -299,7 +286,6 @@ int main() {
     CHECK(fresh2.is_object());
     CHECK(fresh2.at("k").is_null());
 
-    // size 语义
     CHECK(Json().size() == 0);
     CHECK(Json(true).size() == 0);
     CHECK(Json(1.5).size() == 0);
@@ -308,7 +294,6 @@ int main() {
     CHECK(Json::array().size() == 0);
     CHECK(Json::object().size() == 0);
 
-    // as_* 类型检查
     CHECK(Json(true).as_bool() == true);
     CHECK(Json(false).as_bool() == false);
     CHECK(Json(3).as_int64() == 3);
@@ -334,12 +319,10 @@ int main() {
     CHECK(throws_json_error_type([&] { Json(1e300).as_int64(); }));
     CHECK(throws_json_error_type([&] { Json(-1e300).as_int64(); }));
 
-    // 非有限数不输出 nan/inf
     CHECK(Json(inf).dump(0) == "null");
     CHECK(Json(-inf).dump(0) == "null");
     CHECK(Json(nan).dump(0) == "null");
 
-    // 文件读取
     const std::string path = "test_json_tmp.json";
     {
         std::ofstream out(path, std::ios::binary);
@@ -354,12 +337,11 @@ int main() {
     bool file_missing_threw = false;
     try {
         Json::parse_file("no_such_file_json_test.json");
-    } catch (const JsonError&) {
+    } catch (const JsonError &) {
         file_missing_threw = true;
     }
     CHECK(file_missing_threw);
 
-    // "-" 从 stdin 读取
     {
         std::ofstream out(path, std::ios::binary);
         out << R"({"stdin":[1,2,3]})";

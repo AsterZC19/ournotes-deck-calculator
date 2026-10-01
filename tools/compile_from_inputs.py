@@ -57,6 +57,8 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
                     "level": int(_field(effect, "_level", 0)),
                     "effect_type": int(_field(effect, "_skillEffectType", 0)),
                     "value": int(_field(effect, "_effectValue", 0)),
+                    "targets": [int(t) for t in (_field(effect, "_skillTargetIDs", []) or [])],
+                    "condition_group": int(_field(effect, "_skillConditionGroup", 0)),
                 }
                 for effect in live_effects.get(int(row["_id"]), [])
             ],
@@ -112,8 +114,12 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
             "card_type": int(_field(row, "_cardType", 0)),
             "tag": int(_field(row, "_tagID", 0)),
             "gekisou_mission_type": int(_field(row, "_gekisouMissionType", 0)),
-            "live_skill_categories": [int(v) for v in (_field(row, "_liveSkillCategories", []) or [])],
-            "gekisou_skill_categories": [int(v) for v in (_field(row, "_gekisouSkillCategories", []) or [])],
+            "live_skill_categories": [
+                int(v) for v in (_field(row, "_liveSkillCategories", []) or [])
+            ],
+            "gekisou_skill_categories": [
+                int(v) for v in (_field(row, "_gekisouSkillCategories", []) or [])
+            ],
         }
         for row in tables.get("MasterSkillTarget", [])
     ]
@@ -122,6 +128,7 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
             "id": int(row["_id"]),
             "type": int(_field(row, "_conditionType", 0)),
             "positive": bool(_field(row, "_isPositive", True)),
+            "values": [int(v) for v in (_field(row, "_conditionValues", []) or [])],
             "targets": [int(t) for t in (_field(row, "_conditionTargetIDs", []) or [])],
         }
         for row in tables.get("MasterSkillCondition", [])
@@ -171,7 +178,9 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
 
 
 def _member(row: Mapping[str, Any], tables: Mapping[str, Any]) -> dict[str, Any]:
-    raw = next((r for r in tables.get("MasterMemberCard", []) if int(r["_id"]) == int(row["id"])), {})
+    raw = next(
+        (r for r in tables.get("MasterMemberCard", []) if int(r["_id"]) == int(row["id"])), {}
+    )
     rank = row["rank"]
     return {
         "id": int(row["id"]),
@@ -232,7 +241,9 @@ def build_problem_document(
 ) -> dict[str, Any]:
     song = next((s for s in inputs["songs"] if int(s["id"]) == int(song_id)), None)
     if song is None:
-        raise SystemExit(f"inputs.json 中没有歌曲 {song_id}；可用: {[s['id'] for s in inputs['songs']]}")
+        raise SystemExit(
+            f"inputs.json 中没有歌曲 {song_id}；可用: {[s['id'] for s in inputs['songs']]}"
+        )
     chart_entry = next((c for c in song["charts"] if c["difficulty"] == difficulty), None)
     if chart_entry is None:
         raise SystemExit(
@@ -264,7 +275,9 @@ def build_problem_document(
         "chart": {
             "difficulty": difficulty,
             "level": float(master["_musicScoreLevel"]),
-            "display_level": float(_field(master, "_musicScoreDisplayLevel", master["_musicScoreLevel"])),
+            "display_level": float(
+                _field(master, "_musicScoreDisplayLevel", master["_musicScoreLevel"])
+            ),
             "full_combo_count": int(master["_fullComboCount"]),
             "notes": notes,
             "skill_times_ms": skill_times,
@@ -301,7 +314,9 @@ def validate_with_binary(path: Path) -> None:
     if not binary.exists():
         print("提示：build/deckcalc 不存在，跳过 schema 校验")
         return
-    completed = subprocess.run([str(binary), "validate", "-p", str(path)], capture_output=True, text=True)
+    completed = subprocess.run(
+        [str(binary), "validate", "-p", str(path)], capture_output=True, text=True
+    )
     if completed.returncode != 0:
         raise SystemExit(f"deckcalc validate 失败: {completed.stderr.strip()}")
 

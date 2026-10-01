@@ -1,4 +1,3 @@
-// problem / formation 的结构与解析。
 #pragma once
 
 #include <array>
@@ -15,15 +14,15 @@ namespace deckcalc {
 
 class SpecError : public std::runtime_error {
 public:
-    explicit SpecError(const std::string& message) : std::runtime_error(message) {}
+    explicit SpecError(const std::string &message) : std::runtime_error(message) {}
 };
 
-inline constexpr const char* kSchemaProblem = "ournotes-deck-problem@1";
-inline constexpr const char* kSchemaFormation = "ournotes-deck-formation@1";
-inline constexpr const char* kSchemaResult = "ournotes-deck-result@1";
-inline constexpr const char* kModelId = "ournotes-index@1";
-inline constexpr const char* kToolName = "ournotes-deck-calculator";
-inline constexpr const char* kToolVersion = "0.1.0";
+inline constexpr const char *kSchemaProblem = "ournotes-deck-problem@1";
+inline constexpr const char *kSchemaFormation = "ournotes-deck-formation@1";
+inline constexpr const char *kSchemaResult = "ournotes-deck-result@1";
+inline constexpr const char *kModelId = "ournotes-index@1";
+inline constexpr const char *kToolName = "ournotes-deck-calculator";
+inline constexpr const char *kToolVersion = "0.2.0";
 
 using Triple = std::array<int64_t, 3>;
 
@@ -69,6 +68,8 @@ struct Member {
     std::vector<int> tags;
     int64_t live_skill = 0;
     int64_t leader_skill = 0;
+    std::optional<int> live_skill_level;
+    std::optional<int> leader_skill_level;
     int64_t gekisou_skill = 0;
     CardRankBonus card_rank_bonus_bp;
     int level = 0;
@@ -89,6 +90,7 @@ struct Snapshot {
     int rank = 0;
     int level = 0;
     std::vector<int64_t> support_skills;
+    std::map<int64_t, int> support_skill_levels;
     CardRankBonus card_rank_bonus_bp;
 };
 
@@ -96,6 +98,7 @@ struct Fix {
     Triple character_rank_bonus{};
     Triple character_total_rank_bonus{};
     Triple band_item_bonus_bp{};
+    std::map<int, Triple> band_item_bonus_bp_by_band;
     Triple vip_bonus_bp{};
     int64_t type_link_base_bp = 0;
     int64_t music_type_base_bp = 0;
@@ -129,6 +132,7 @@ struct Target {
 };
 
 struct Condition {
+    std::vector<int64_t> values;
     int64_t id = 0;
     int type = 0;
     bool positive = true;
@@ -189,7 +193,7 @@ struct PowerModel {
 struct ScoreModel {
     double adjustment_factor = 3.0;
     double level_base = 5.0;
-    std::optional<double> level_alpha;
+    std::optional<double> level_alpha = 0.005;
     std::string rounding = "float32_floor";
 };
 
@@ -291,9 +295,9 @@ struct Problem {
     Json raw;
 
     void validate() const;
-    std::vector<const Member*> available_members() const;
-    std::vector<const Snapshot*> available_snapshots() const;
-    std::vector<const Member*> leader_candidates() const;
+    std::vector<const Member *> available_members() const;
+    std::vector<const Snapshot *> available_snapshots() const;
+    std::vector<const Member *> leader_candidates() const;
     Json describe() const;
 };
 
@@ -305,23 +309,22 @@ struct Slot {
 
 struct Formation {
     int64_t leader = 0;
-    std::vector<Slot> slots;  // 按 trigger 升序
-    void validate(const Problem& problem) const;
+    std::vector<Slot> slots;
+    void validate(const Problem &problem) const;
     std::vector<int64_t> members() const;
 };
 
-// 解析助手，供 model.cpp 与其它模块复用
-const Json* opt(const Json& object, const char* key);
-int64_t int_field(const Json& object, const char* key, int64_t fallback = 0);
-double num_field(const Json& object, const char* key, double fallback = 0);
-bool bool_field(const Json& object, const char* key, bool fallback = false);
-std::string str_field(const Json& object, const char* key, const std::string& fallback = "");
-std::vector<int> int_array_field(const Json& object, const char* key);
-std::vector<int64_t> int64_array_field(const Json& object, const char* key);
-Triple triple_field(const Json& object, const char* key, Triple fallback = Triple{0, 0, 0});
+const Json *opt(const Json &object, const char *key);
+int64_t int_field(const Json &object, const char *key, int64_t fallback = 0);
+double num_field(const Json &object, const char *key, double fallback = 0);
+bool bool_field(const Json &object, const char *key, bool fallback = false);
+std::string str_field(const Json &object, const char *key, const std::string &fallback = "");
+std::vector<int> int_array_field(const Json &object, const char *key);
+std::vector<int64_t> int64_array_field(const Json &object, const char *key);
+Triple triple_field(const Json &object, const char *key, Triple fallback = Triple{0, 0, 0});
 
-Problem parse_problem(const Json& document);
-Formation parse_formation(const Json& document);
-Json dump_formation(const Formation& formation);
+Problem parse_problem(const Json &document);
+Formation parse_formation(const Json &document);
+Json dump_formation(const Formation &formation);
 
-}  // namespace deckcalc
+}

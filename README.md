@@ -1,62 +1,66 @@
 # ournotes-deck-calculator
 
-BanG Dream! Our Notes 的组卡计算器。
+BanG Dream! Our Notes 组队计算器：搜索成员与 Snapshot 配对、最高分技能顺序，以及 CP 活动的 PT 和商店货币收益。
 
 ## 构建
 
-```sh
-make        # 产出 build/deckcalc
-make test   # 跑单元测试
-```
-
-## 用法
+需要支持 C++20 的编译器、Make 和 Python 3。导入原始谱面时需要 NumPy。
 
 ```sh
-# 校验 problem
-./build/deckcalc validate -p problem.json
-
-# 给一个编队算分
-./build/deckcalc score -p problem.json -f formation.json -o score.json
-
-# 搜索前 20 个不同成员组合
-./build/deckcalc rank -p problem.json --top 20 --time-limit 60 -o rank.json
+make
+make test
 ```
 
-`-p` 和 `-f` 传 `-` 表示从 stdin 读，`-o` 省略就写到 stdout。
+## 准备输入
 
-`rank` 有三种搜索方式：
-
-- `fast`：默认。束搜索加局部改进，很快，结果是候选
-- `exact`：先跑一遍 fast，再用剩下的时间做分支定界，跑完才在 audit 里标 `certified`
-- `auto`：卡池小的时候用 exact，否则用 fast
-
-`--time-limit` 是整个搜索的秒数预算，超时就输出当前最好的结果。
-
-## 输入输出
-
-字段定义见 [docs/design.md](docs/design.md)，计分模型见 [docs/model.md](docs/model.md)。
-
-现在只算组卡的出分指数和单曲预计分数，不算活动 pt：
-
-- `index` = `综合力 × (1 + Σ 技能收益)`，只在同一份 problem 内排序用，不是游戏结算分
-- `estimated_score` 只有 problem 给出 `settings.score_model.level_alpha` 时才算，且没和游戏结算核对过
-- 活动加成只作为属性加成进入综合力；活动 pt、道具掉落加成、撃奏真人排名都不计算
-
-## 生成 problem
-
-从解包 Master 直接生成：
+从 Master 和谱面生成计算输入：
 
 ```sh
 python3 tools/compile_from_master.py \
-  --master-dir /path/to/master-decrypted/<CURRENT> \
-  --charts-dir /path/to/event-detail/charts \
-  --event-id 1 --songs 100109 --difficulty expert \
-  --output problem.json
+  --master-dir /path/to/master \
+  --charts-dir /path/to/charts \
+  --event-id 1 --song-context challenge \
+  --songs 100109 --difficulty expert --output problem.json
 ```
 
-已经有研究项目编译好的 `inputs.json` 时，用 `tools/compile_from_inputs.py --help`。
-`examples/` 里有一份能直接跑的小 problem。
+普通曲使用 `--song-context normal`；难度可选 `easy`、`normal`、`hard`、`expert`。默认按满养成导入，个人计算需调整卡池、Rank、等级和技能等级。可直接使用 `examples/` 中的示例输入。
+
+## 计算
+
+搜索最高分队伍和最佳技能顺序：
+
+```sh
+./build/deckcalc rank -p problem.json --method fast --top 10 --detail -o rank.json
+```
+
+不限时精确搜索第一名：
+
+```sh
+./build/deckcalc rank -p problem.json --method exact --time-limit 0 --detail -o best.json
+```
+
+逐名证明前十：
+
+```sh
+python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10
+```
+
+计算指定队伍的最高分和最佳技能顺序：
+
+```sh
+./build/deckcalc score -p problem.json -f formation.json --objective score --detail -o score.json
+```
+
+计算 CP 活动普通曲与课题曲的收益配队：
+
+```sh
+./build/deckcalc event -p normal.json --challenge-problem challenge.json -o event.json
+```
+
+`ranking_score` 为理论最高分，`order_analysis.best_score_order` 为对应技能顺序。实际技能顺序随机。精确搜索完成后，`audit.theoretical_max_certified` 标记模型内第一名已证明；普通 `--top 10` 的其他名次仍是候选。
+
+`--time-limit` 单位为秒，0 表示不限时；`--warm-start` 可复用历史结果。查看完整参数：`./build/deckcalc --help`。
 
 ## 许可证
 
-MIT。`tools/convert_chart.py` 来自 [empty-sekai/nnnotes](https://github.com/empty-sekai/nnnotes)，MIT。
+MIT，见 [LICENSE](LICENSE)。

@@ -34,10 +34,10 @@ SCHEMA_PROBLEM = "ournotes-deck-problem@1"
 DIFFICULTIES = ("easy", "normal", "hard", "expert")
 JST = timezone(timedelta(hours=9), "+09:00")
 
-# 谱面里引用的 op 必须都能在 MasterLiveNoteParameter 找到 score_percent（见 chart-schema.md 第 7 节）。
+
 EXPECTED_SKILL_COUNT = 5
 
-# 复刻 prepare.py 的逐字段挑选规则需要这些表；缺任何一张都直接报错。
+
 REQUIRED_TABLES = (
     "MasterCharacter",
     "MasterChallengeMusic",
@@ -69,7 +69,7 @@ REQUIRED_TABLES = (
     "MasterLiveComboScoreBonus",
 )
 
-# 与其它模块保持一致的问题设置；其余字段交给 spec 的默认值。
+
 PROBLEM_SETTINGS: dict[str, Any] = {
     "combo_type": 0,
     "live_level": 5,
@@ -84,11 +84,6 @@ PROBLEM_SETTINGS: dict[str, Any] = {
 
 class CompileError(RuntimeError):
     """Master 数据缺失或自相矛盾，无法产出可信的 problem。"""
-
-
-# --------------------------------------------------------------------------------------
-# Master 表读取
-# --------------------------------------------------------------------------------------
 
 
 def _read_table_file(path: Path) -> list[dict[str, Any]]:
@@ -139,16 +134,12 @@ class MasterTables:
         missing = [name for name in names if not self.path_for(name).is_file()]
         if missing:
             raise CompileError(
-                "Master 目录缺少必需的表: " + ", ".join(sorted(missing))
+                "Master 目录缺少必需的表: "
+                + ", ".join(sorted(missing))
                 + f"（master-dir={self.master_dir}）"
             )
         for name in names:
             self.table(name)
-
-
-# --------------------------------------------------------------------------------------
-# 小工具
-# --------------------------------------------------------------------------------------
 
 
 def _int(value: Any, *, default: int = 0) -> int:
@@ -232,17 +223,12 @@ def _isoformat_jst(moment: datetime | None = None) -> str:
     return (moment or datetime.now(JST)).astimezone(JST).isoformat()
 
 
-# --------------------------------------------------------------------------------------
-# 目录（catalog）构建
-# --------------------------------------------------------------------------------------
-
-
 def _load_texts(tables: MasterTables) -> dict[str, str]:
     return {str(r["_id"]): str(r.get("_japanese") or "") for r in tables.table("MasterText")}
 
 
 def _event_bonus_index(
-    tables: MasterTables, event_id: int
+    tables: MasterTables, event_id: int, bonus_type: int = 2
 ) -> dict[int, list[Mapping[str, Any]]]:
     """把 ``_eventBonusType == 2`` 且 ``_eventId == event_id`` 的行按 kind 分桶。"""
     if event_id == 0:
@@ -251,7 +237,7 @@ def _event_bonus_index(
     for row in tables.table("MasterEventEffect"):
         if _int(row.get("_eventId")) != event_id:
             continue
-        if _int(row.get("_eventBonusType")) != 2:
+        if _int(row.get("_eventBonusType")) != bonus_type:
             continue
         constraint = _int(row.get("_resourceTypeConstraint"))
         for kind in (2, 3):
@@ -268,6 +254,7 @@ def _event_bonus_bp(
     band_ids: set[int],
     card_type: int,
     tags: set[int],
+    rank: int = 5,
 ) -> int:
     """复刻 prepare.py 的 event_bonus(card, kind)：逐条过滤后对 _rank5EffectValue 求和。"""
     total = 0
@@ -290,7 +277,7 @@ def _event_bonus_bp(
         tag_id = _int(row.get("_tagId"))
         if tag_id and tag_id not in tags:
             continue
-        total += _int(row.get("_rank5EffectValue"))
+        total += _int(row.get(f"_rank{rank}EffectValue"))
     return total
 
 
@@ -316,25 +303,19 @@ def build_members(
 
         level_row = _group_max_row(level_rows, "_group", level_group, "_level")
         awake_row = _group_max_row(awake_rows, "_group", awake_group, "_awakeCount")
-        # 覆盖值走「该等级/该觉醒数对应的行」，比率不做任何缩放。
+
         if ideal_level is not None:
-            level_row = _group_row_at(
-                level_rows, "_group", level_group, "_level", int(ideal_level)
-            )
+            level_row = _group_row_at(level_rows, "_group", level_group, "_level", int(ideal_level))
         if ideal_awake is not None:
             awake_row = _group_row_at(
                 awake_rows, "_group", awake_group, "_awakeCount", int(ideal_awake)
             )
         if ideal_rank is not None:
-            rank_row = _group_row_at(
-                rank_rows, "_group", rank_group, "_rank", int(ideal_rank)
-            )
+            rank_row = _group_row_at(rank_rows, "_group", rank_group, "_rank", int(ideal_rank))
         else:
             rank_row = _group_max_row(rank_rows, "_group", rank_group, "_rank")
 
-        base = [
-            _int(card[f"_{key}PowerMax"]) for key in ("performance", "technic", "visual")
-        ]
+        base = [_int(card[f"_{key}PowerMax"]) for key in ("performance", "technic", "visual")]
         trained = _trained(
             base, (level_row, rank_row, awake_row), ("performance", "technic", "visual")
         )
@@ -357,15 +338,22 @@ def build_members(
                 "rarity": _int(card.get("_rarity")),
                 "trained": trained,
                 "event_bonus_bp": _event_bonus_bp(
-                    buckets[2], 2, card, {character_id}, {_int(character.get("_bandID"))},
-                    _int(card.get("_cardType")), set(tags),
+                    buckets[2],
+                    2,
+                    card,
+                    {character_id},
+                    {_int(character.get("_bandID"))},
+                    _int(card.get("_cardType")),
+                    set(tags),
+                    _int(rank_row.get("_rank")),
                 ),
                 "tags": tags,
                 "live_skill": _int(card.get("_liveSkillID")),
                 "leader_skill": _int(card.get("_leaderSkillID")),
+                "leader_skill_level": _int(rank_row.get("_leaderSkillLevel")),
                 "gekisou_skill": _int(card.get("_gekisouSkillID")),
                 "card_rank_bonus_bp": {
-                    "type_link": 0,  # 刻意的不对称：type_link 只取自 Snapshot Rank 行
+                    "type_link": 0,
                     "music_type": _int(rank_row.get("_musicTypeBonusRate")),
                     "music_tag": _int(rank_row.get("_musicTagBonusRate")),
                 },
@@ -401,10 +389,24 @@ def build_snapshots(
         else:
             rank_row = _group_max_row(rank_rows, "_group", rank_group, "_rank")
 
-        base = [
-            _int(card[f"_{key}PowerMax"]) for key in ("performance", "technic", "visual")
-        ]
-        # Snapshot 的 trained 只有 level 一项（见 prepare.py）。
+        limit = _int(rank_row.get("_limitLevel"))
+        if limit > 0:
+            if ideal_level is not None and int(ideal_level) > limit:
+                raise CompileError(
+                    f"Snapshot {card['_id']} Rank {rank_row['_rank']} 的等级上限为 {limit}，不能使用等级 {ideal_level}"
+                )
+            if ideal_level is None:
+                eligible = [
+                    row
+                    for row in level_rows
+                    if row["_group"] == level_group and _int(row["_level"]) <= limit
+                ]
+                if not eligible:
+                    raise CompileError(f"Snapshot {card['_id']} 缺少等级上限以内的等级表")
+                level_row = max(eligible, key=lambda row: _int(row["_level"]))
+
+        base = [_int(card[f"_{key}PowerMax"]) for key in ("performance", "technic", "visual")]
+
         trained = _trained(base, (level_row,), ("performance", "technic", "visual"))
 
         character_ids = _int_list(card.get("_characterIDs"))
@@ -428,8 +430,14 @@ def build_snapshots(
                 "rarity": _int(card.get("_rarity")),
                 "trained": trained,
                 "event_bonus_bp": _event_bonus_bp(
-                    buckets[3], 3, card, set(character_ids), bands,
-                    _int(card.get("_cardType")), set(),
+                    buckets[3],
+                    3,
+                    card,
+                    set(character_ids),
+                    bands,
+                    _int(card.get("_cardType")),
+                    set(),
+                    _int(rank_row.get("_rank")),
                 ),
                 "rank": _int(rank_row.get("_rank")),
                 "level": _int(level_row.get("_level")),
@@ -437,6 +445,13 @@ def build_snapshots(
                     _int(card.get("_supportSkillId01")),
                     _int(card.get("_supportSkillId02")),
                 ],
+                "support_skill_levels": {
+                    str(_int(card.get(f"_supportSkillId0{i}"))): _int(
+                        rank_row.get(f"_supportSkill0{i}Level")
+                    )
+                    for i in (1, 2)
+                    if _int(card.get(f"_supportSkillId0{i}")) != 0
+                },
                 "card_rank_bonus_bp": {
                     "type_link": _int(rank_row.get("_cardTypeLinkBonusRate")),
                     "music_type": 0,
@@ -447,9 +462,7 @@ def build_snapshots(
     return snapshots
 
 
-def build_fix(
-    tables: MasterTables, band_item_bp: int
-) -> tuple[dict[str, Any], dict[str, Any]]:
+def build_fix(tables: MasterTables, band_item_bp: int) -> tuple[dict[str, Any], dict[str, Any]]:
     """静态加成 + 供 --ideal-* 默认值使用的「表内最大值」信息。"""
     character_rank_rows = tables.table("MasterCharacterRank")
     max_rank_row = _max_row(character_rank_rows, "_rank")
@@ -461,15 +474,12 @@ def build_fix(
     if not total_rows:
         raise CompileError(f"MasterCharacterTotalRank 没有 _totalRank <= {total_rank} 的行")
     total_bonus_row = _max_row(total_rows, "_totalRank")
-    vip_rows = [
-        r for r in tables.table("MasterVipRankBonus") if _int(r.get("_vipBonusType")) == 7
-    ]
+    vip_rows = [r for r in tables.table("MasterVipRankBonus") if _int(r.get("_vipBonusType")) == 7]
     if not vip_rows:
         raise CompileError("MasterVipRankBonus 没有 _vipBonusType == 7 的行")
     vip_bonus = max(_int(r["_value"]) for r in vip_rows)
 
     fix = {
-        # _bonus 是标量，按 model.py 的广播语义展开成三维。
         "character_rank_bonus": [_int(max_rank_row["_bonus"])] * 3,
         "character_total_rank_bonus": [_int(total_bonus_row["_bonus"])] * 3,
         "band_item_bonus_bp": [int(band_item_bp)] * 3,
@@ -502,9 +512,7 @@ def build_catalog(
     members = build_members(
         tables, texts, characters, int(event_id), ideal_level, ideal_rank, ideal_awake
     )
-    snapshots = build_snapshots(
-        tables, texts, characters, int(event_id), ideal_level, ideal_rank
-    )
+    snapshots = build_snapshots(tables, texts, characters, int(event_id), ideal_level, ideal_rank)
     fix, ideal_info = build_fix(tables, band_item_bp)
 
     live_skills = [
@@ -517,6 +525,8 @@ def build_catalog(
                     "level": _int(e.get("_level")),
                     "effect_type": _int(e.get("_skillEffectType")),
                     "value": _int(e.get("_effectValue")),
+                    "targets": _int_list(e.get("_skillTargetIDs")),
+                    "condition_group": _int(e.get("_skillConditionGroup")),
                 }
                 for e in tables.table("MasterLiveSkillEffect")
                 if _int(e.get("_liveSkillID")) == _int(row["_id"])
@@ -585,6 +595,7 @@ def build_catalog(
             "id": _int(row["_id"]),
             "type": _int(row.get("_conditionType")),
             "positive": bool(row.get("_isPositive")),
+            "values": _int_list(row.get("_conditionValues")),
             "targets": _int_list(row.get("_conditionTargetIDs")),
         }
         for row in tables.table("MasterSkillCondition")
@@ -592,9 +603,7 @@ def build_catalog(
     grouped: dict[int, list[list[int]]] = {}
     for row in tables.table("MasterSkillConditionSet"):
         grouped.setdefault(_int(row.get("_group")), []).append(_int_list(row.get("_conditionIds")))
-    condition_groups = [
-        {"group": group, "rows": grouped[group]} for group in sorted(grouped)
-    ]
+    condition_groups = [{"group": group, "rows": grouped[group]} for group in sorted(grouped)]
     note_parameters = [
         {
             "op": _int(row.get("_noteOperateType")),
@@ -628,11 +637,6 @@ def build_catalog(
     return catalog, ideal_info
 
 
-# --------------------------------------------------------------------------------------
-# 谱面转换
-# --------------------------------------------------------------------------------------
-
-
 def _load_convert_chart() -> Any:
     """import 同目录下 vendored 的 convert_chart.py（MIT, empty-sekai/nnnotes）。
 
@@ -643,7 +647,7 @@ def _load_convert_chart() -> Any:
     if not path.is_file():
         raise CompileError(f"找不到谱面转换器 {path}")
     spec = importlib.util.spec_from_file_location("our_notes_convert_chart", path)
-    if spec is None or spec.loader is None:  # pragma: no cover - 只在异常布局下发生
+    if spec is None or spec.loader is None:
         raise CompileError(f"无法加载谱面转换器 {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules["our_notes_convert_chart"] = module
@@ -671,13 +675,11 @@ def _load_chart_runtime(charts_dir: Path, code: str) -> dict[str, Any]:
         return _load_convert_chart().convert(raw)
     except CompileError:
         raise
-    except Exception as exc:  # 转换器的失败模式（见 docs/reference/chart-schema.md 第 1 节）
+    except Exception as exc:
         raise CompileError(f"谱面 {path} 转换失败: {type(exc).__name__}: {exc}") from exc
 
 
-def build_chart(
-    score: Mapping[str, Any], charts_dir: Path, difficulty: str
-) -> dict[str, Any]:
+def build_chart(score: Mapping[str, Any], charts_dir: Path, difficulty: str) -> dict[str, Any]:
     code = score.get("_musicScoreTextFileName")
     if not code:
         raise CompileError(f"MasterLiveMusicScore {score.get('_id')} 缺少 _musicScoreTextFileName")
@@ -731,14 +733,7 @@ def build_chart(
     }
 
 
-# --------------------------------------------------------------------------------------
-# 歌曲选择
-# --------------------------------------------------------------------------------------
-
-
-def _songs_for_event(
-    tables: MasterTables, event_id: int
-) -> dict[int, list[Mapping[str, Any]]]:
+def _songs_for_event(tables: MasterTables, event_id: int) -> dict[int, list[Mapping[str, Any]]]:
     """返回 {liveMusicId: [MasterChallengeMusic 行...]}。
 
     ``event_id == 0`` 表示没有活动：收录所有被 MasterChallengeMusic 引用到的曲子。
@@ -782,7 +777,6 @@ def _resolve_song_ids(
             raise CompileError(f"MasterChallengeMusic 里没有 _eventId == {event_id} 的曲目")
         return sorted(grouped), grouped
 
-    # event 0：默认收录 MasterLiveMusic 全集。
     all_music = sorted(_int(row["_id"]) for row in tables.table("MasterLiveMusic"))
     if not all_music:
         raise CompileError("MasterLiveMusic 为空")
@@ -796,12 +790,18 @@ def build_song(
     tasks: Sequence[Mapping[str, Any]],
     charts_dir: Path,
     difficulty: str,
+    song_context: str = "auto",
 ) -> dict[str, Any]:
-    if not tasks:
-        raise CompileError(
-            f"MasterLiveMusic {music.get('_id')} 没有被 MasterChallengeMusic 引用，无法确定 _musicType"
-        )
-    task = tasks[0]
+    if song_context not in ("auto", "normal", "challenge"):
+        raise CompileError(f"未知 song_context: {song_context}")
+    if song_context == "challenge" and not tasks:
+        raise CompileError("课题曲必须有当前活动的 MasterChallengeMusic 行")
+    if song_context == "normal":
+        tasks = []
+
+    task = tasks[0] if tasks else music
+    if task.get("_musicType") is None:
+        raise CompileError(f"曲目 {music.get('_id')} 缺少 _musicType")
     if len(tasks) > 1:
         types = {_int(t.get("_musicType")) for t in tasks}
         if len(types) > 1:
@@ -815,7 +815,9 @@ def build_song(
     scores = tables.table("MasterLiveMusicScore")
     score = next((s for s in scores if _int(s["_id"]) == _int(music[diff_key])), None)
     if score is None:
-        raise CompileError(f"MasterLiveMusic {music.get('_id')} 的 {diff_key}={music[diff_key]} 没有对应谱面行")
+        raise CompileError(
+            f"MasterLiveMusic {music.get('_id')} 的 {diff_key}={music[diff_key]} 没有对应谱面行"
+        )
 
     title_id = str(music.get("_titleTextID") or "")
     return {
@@ -826,11 +828,6 @@ def build_song(
         "tags": _int_list(music.get("_bestMusicTagIDs")),
         "chart": build_chart(score, charts_dir, difficulty),
     }
-
-
-# --------------------------------------------------------------------------------------
-# problem 组装与校验
-# --------------------------------------------------------------------------------------
 
 
 def validate_problem(problem: Mapping[str, Any]) -> None:
@@ -862,6 +859,7 @@ def compile_problem(
     band_item_bp: int = 2500,
     validate: bool = True,
     generated_at: str | None = None,
+    song_context: str = "auto",
 ) -> dict[str, Any]:
     """编译一首歌的 problem JSON（纯函数：不做文件写入）。"""
     if difficulty not in DIFFICULTIES:
@@ -884,7 +882,14 @@ def compile_problem(
     if music is None:
         raise CompileError(f"MasterLiveMusic 里没有 _id == {song_id}")
 
-    song = build_song(tables, texts, music, tasks, Path(charts_dir), difficulty)
+    if song_context == "challenge" and not event_id:
+        raise CompileError("--song-context challenge 必须指定非零 --event-id")
+    effective_context = (
+        ("challenge" if tasks and event_id else "normal")
+        if song_context == "auto"
+        else song_context
+    )
+    song = build_song(tables, texts, music, tasks, Path(charts_dir), difficulty, effective_context)
 
     problem: dict[str, Any] = {
         "schema": SCHEMA_PROBLEM,
@@ -895,6 +900,17 @@ def compile_problem(
                 "latest_dir": None if latest_dir is None else str(latest_dir),
                 "charts_dir": str(charts_dir),
                 "event_id": int(event_id),
+                "song_context": effective_context,
+                "music_type_source": (
+                    "MasterChallengeMusic"
+                    if effective_context == "challenge"
+                    else "MasterLiveMusic"
+                ),
+                "score_mode": (
+                    "challenge_without_competitive_gekisou"
+                    if effective_context == "challenge"
+                    else "normal"
+                ),
             },
             "tool": TOOL,
             "ideal": ideal_info,
@@ -904,6 +920,9 @@ def compile_problem(
         "catalog": catalog,
         "settings": copy.deepcopy(PROBLEM_SETTINGS),
     }
+
+    if event_id:
+        problem["event"] = build_event(tables, catalog, event_id, song_id)
 
     if validate:
         validate_problem(problem)
@@ -925,11 +944,6 @@ def write_problem(problem: Mapping[str, Any], path: Path) -> None:
     if path.parent and str(path.parent):
         path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(problem, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-# --------------------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -981,6 +995,12 @@ def build_parser() -> argparse.ArgumentParser:
             "逗号分隔的 MasterLiveMusic id 列表（如 100109,100056,100063）。"
             "省略时：event-id != 0 取该活动的全部挑战曲；event-id == 0 取 MasterLiveMusic 全集"
         ),
+    )
+    parser.add_argument(
+        "--song-context",
+        choices=("auto", "normal", "challenge"),
+        default="auto",
+        help="普通曲使用原曲属性；课题曲使用当前活动属性；auto 自动选择",
     )
     parser.add_argument(
         "--difficulty",
@@ -1066,6 +1086,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 band_item_bp=args.band_item_bp,
                 validate=not args.no_validate,
                 generated_at=generated_at,
+                song_context=args.song_context,
             )
             path = output_path_for(output, song_id, args.difficulty, multiple)
             write_problem(problem, path)
@@ -1084,6 +1105,119 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"compile_from_master: 错误: {exc}", file=sys.stderr)
         return 2
     return 0
+
+
+def build_event(
+    tables: MasterTables, catalog: dict, event_id: int, song_id: int | None = None
+) -> dict:
+    event = next((e for e in tables.table("MasterEvent") if _int(e["_id"]) == event_id), None)
+    if event is None:
+        raise CompileError(f"活动 {event_id} 不存在")
+    for kind, key, table in (
+        (2, "members", "MasterMemberCard"),
+        (3, "snapshots", "MasterSupportCard"),
+    ):
+        raw = {_int(c["_id"]): c for c in tables.table(table)}
+        for card in catalog[key]:
+            characters = {card["character"]} if kind == 2 else set(card["characters"])
+            bands = {card["band"]} if kind == 2 else set(card["bands"])
+            for bonus_type, field in ((0, "event_pt_bonus_bp"), (1, "event_drop_bonus_bp")):
+                card[field] = _event_bonus_bp(
+                    _event_bonus_index(tables, event_id, bonus_type)[kind],
+                    kind,
+                    raw[card["id"]],
+                    characters,
+                    bands,
+                    card["card_type"],
+                    set(card.get("tags", [])),
+                    card["rank"],
+                )
+
+    def points(name, group=None):
+        return [
+            {"rank": row["_scoreRank"], "value": row["_value"]}
+            for row in tables.table(name)
+            if group is None or row["_group"] == group
+        ]
+
+    music = next((m for m in tables.table("MasterLiveMusic") if _int(m["_id"]) == song_id), None)
+    reward_group = _int(music.get("_scoreRankRewardGroup"), default=1) if music else 1
+
+    def rewards(name, group):
+        return [
+            {
+                "rank": row["_scoreRank"],
+                "count": row["_resourceCount"],
+                "resource_type": row["_resourceType"],
+                "resource_id": row["_resourceId"],
+                "probability_bp": row["_probability"],
+            }
+            for row in tables.table(name)
+            if row["_group"] == reward_group and row["_eventGroup"] == group
+        ]
+
+    result = {
+        "id": event_id,
+        "normal": {
+            "cp": points("MasterLiveChallengePoint"),
+            "pt": points("MasterLiveEventPoint", event["_liveEventPointGroup"]),
+            "rewards": rewards("MasterLiveEventReward", event["_liveEventRewardGroup"]),
+        },
+        "challenge": {
+            "pt": points("MasterChallengeLiveEventPoint", event["_challengeLiveEventPointGroup"]),
+            "rewards": rewards(
+                "MasterChallengeLiveEventReward", event["_challengeLiveEventRewardGroup"]
+            ),
+        },
+        "normal_boosts": [
+            {
+                "cost": row["_consumedLiveBoostCount"],
+                "pt_rate": row["_eventPointRate"],
+                "reward_rate": row["_liveMusicRewardRate"],
+            }
+            for row in tables.table("MasterLiveMusicBoostBonus")
+        ],
+        "challenge_boosts": [
+            {
+                "cost": row["_consumedChallengePointCount"],
+                "pt_rate": row["_eventPointRate"],
+                "reward_rate": row["_liveMusicRewardRate"],
+            }
+            for row in tables.table("MasterChallengeMusicBoostBonus")
+        ],
+        "assumptions": {
+            "score_rank": 7,
+            "normal_boost_cost": 1,
+            "challenge_cp_cost": 200,
+            "minimum_index": 0,
+            "cp_bonus_source": "none",
+            "shop_resource_type": 1,
+            "shop_resource_id": 0,
+        },
+    }
+
+    currencies = {(row["resource_type"], row["resource_id"]) for row in result["normal"]["rewards"]}
+    if len(currencies) != 1:
+        raise CompileError("活动奖励有多种货币，需显式选择商店货币后再生成收益模型")
+    resource_type, resource_id = next(iter(currencies))
+    result["assumptions"].update(shop_resource_type=resource_type, shop_resource_id=resource_id)
+    if not any(row["cost"] == 0 for row in result["normal_boosts"]):
+        result["normal_boosts"].insert(0, {"cost": 0, "pt_rate": 1, "reward_rate": 1})
+    if music is not None:
+        result["score_ranks"] = [
+            {"rank": row["_liveScoreRank"], "required_score": row["_requiredScore"]}
+            for row in tables.table("MasterLiveScoreRank")
+            if row["_group"] == music["_liveScoreRankGroup"]
+        ]
+    result["assumptions"]["score_rank_mode"] = "fixed"
+    result["challenge_music_ids"] = sorted(
+        {
+            _int(row["_liveMusicId"])
+            for row in tables.table("MasterChallengeMusic")
+            if _int(row["_eventId"]) == event_id
+        }
+    )
+    return result
 
 
 if __name__ == "__main__":

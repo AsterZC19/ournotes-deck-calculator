@@ -1,6 +1,9 @@
 build/
+tmp/
+reports/
+output/
+__pycache__/
+*.py[cod]
 *.o
 *.json.tmp
 compile_commands.json
-__pycache__/
-*.pyc

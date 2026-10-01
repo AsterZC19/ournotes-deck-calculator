@@ -1,4 +1,3 @@
-// 用参考数据核对 engine 的数值。
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,7 +15,7 @@ namespace {
 int checks = 0;
 int failures = 0;
 
-void check(bool value, const char* what, int line) {
+void check(bool value, const char *what, int line) {
     ++checks;
     if (!value) {
         std::printf("FAIL line %d: %s\n", line, what);
@@ -24,7 +23,7 @@ void check(bool value, const char* what, int line) {
     }
 }
 
-void check_near(double actual, double expected, double tolerance, const char* what, int line) {
+void check_near(double actual, double expected, double tolerance, const char *what, int line) {
     ++checks;
     double scale = std::max(1.0, std::fabs(expected));
     if (std::fabs(actual - expected) / scale > tolerance) {
@@ -36,10 +35,10 @@ void check_near(double actual, double expected, double tolerance, const char* wh
 #define CHECK(cond) check((cond), #cond, __LINE__)
 #define CHECK_NEAR(actual, expected, tol) check_near((actual), (expected), (tol), #actual, __LINE__)
 
-}  // namespace
+}
 
 int main() {
-    const char* from_env = std::getenv("OURNOTES_PROBLEM");
+    const char *from_env = std::getenv("OURNOTES_PROBLEM");
     std::string path = from_env != nullptr ? from_env : "/tmp/prob-100109-expert.json";
     if (!std::filesystem::exists(path)) {
         std::printf("test_engine: 跳过，找不到 %s\n", path.c_str());
@@ -49,7 +48,6 @@ int main() {
     Problem problem = parse_problem(Json::read(path));
     Engine engine(problem);
 
-    // 谱面统计，与参考 difficulty-comparison.json 一致
     ChartInfo info = engine.chart_info();
     CHECK(info.judged_notes == 759);
     CHECK(info.converted_note_count == 525);
@@ -58,20 +56,25 @@ int main() {
     CHECK(info.skill_times.size() == 5);
     CHECK(info.skill_times[0] == 9411 && info.skill_times[4] == 84705);
 
-    // 参考榜单首位配队：leader 61，五个槽位
     Formation formation;
     formation.leader = 61;
     formation.slots = {
-        Slot{62, 63, 1},
-        Slot{59, 33, 2},
-        Slot{63, 55, 3},
-        Slot{55, 61, 4},
-        Slot{61, 62, 5},
+        Slot{62, 63, 1}, Slot{59, 33, 2}, Slot{63, 55, 3}, Slot{55, 61, 4}, Slot{61, 62, 5},
     };
     EvalOptions options;
     options.order_search = "given";
     options.validate = true;
     Evaluation evaluation = engine.evaluate(formation, options);
+    EvalOptions deferred_options = options;
+    deferred_options.calculate_score = false;
+    Evaluation deferred = engine.evaluate(formation, deferred_options);
+    CHECK(!deferred.has_estimated);
+    CHECK(deferred.power == evaluation.power);
+    CHECK_NEAR(deferred.index, evaluation.index, 1e-15);
+    engine.populate_estimated_score(deferred);
+    CHECK(deferred.has_estimated == evaluation.has_estimated);
+    CHECK(deferred.estimated_score.dump(0) == evaluation.estimated_score.dump(0));
+
     CHECK(evaluation.power == 3124510);
     CHECK_NEAR(evaluation.weight_factor, 1.6301943540873203, 1e-12);
     CHECK_NEAR(evaluation.index, 5093558.561289373, 1e-12);
@@ -85,7 +88,6 @@ int main() {
         CHECK(evaluation.slots[4].power == 1002599 && evaluation.slots[4].duration_ms == 10000);
     }
 
-    // 单格综合力与技能持续时间，独立于榜单的手算值
     int leader_pos = engine.member_pos(61);
     int member_pos = engine.member_pos(61);
     int snap_pos = engine.snapshot_pos(62);

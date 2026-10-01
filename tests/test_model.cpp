@@ -1,6 +1,6 @@
-// model.cpp 的解析与校验测试。
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -17,37 +17,38 @@ namespace {
 int g_passed = 0;
 int g_failed = 0;
 
-#define CHECK(condition)                                                                          \
-    do {                                                                                          \
-        if (condition) {                                                                          \
-            ++g_passed;                                                                           \
-        } else {                                                                                  \
-            ++g_failed;                                                                           \
-            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #condition);    \
-        }                                                                                         \
+#define CHECK(condition)                                                                           \
+    do {                                                                                           \
+        if (condition) {                                                                           \
+            ++g_passed;                                                                            \
+        } else {                                                                                   \
+            ++g_failed;                                                                            \
+            std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #condition);     \
+        }                                                                                          \
     } while (false)
 
-#define CHECK_SPEC_ERROR(expression, needle)                                                      \
-    do {                                                                                          \
-        bool ok = false;                                                                          \
-        try {                                                                                     \
-            expression;                                                                           \
-        } catch (const SpecError& error) {                                                        \
-            ok = std::string(error.what()).find(needle) != std::string::npos;                     \
-            if (!ok) {                                                                            \
-                std::fprintf(stderr, "%s:%d: 错误消息不符: %s\n", __FILE__, __LINE__, error.what()); \
-            }                                                                                     \
-        } catch (const std::exception& error) {                                                   \
-            std::fprintf(stderr, "%s:%d: 非 SpecError: %s\n", __FILE__, __LINE__, error.what());  \
-        }                                                                                         \
-        if (ok) {                                                                                 \
-            ++g_passed;                                                                           \
-        } else {                                                                                  \
-            ++g_failed;                                                                           \
-        }                                                                                         \
+#define CHECK_SPEC_ERROR(expression, needle)                                                       \
+    do {                                                                                           \
+        bool ok = false;                                                                           \
+        try {                                                                                      \
+            expression;                                                                            \
+        } catch (const SpecError &error) {                                                         \
+            ok = std::string(error.what()).find(needle) != std::string::npos;                      \
+            if (!ok) {                                                                             \
+                std::fprintf(stderr, "%s:%d: 错误消息不符: %s\n", __FILE__, __LINE__,              \
+                             error.what());                                                        \
+            }                                                                                      \
+        } catch (const std::exception &error) {                                                    \
+            std::fprintf(stderr, "%s:%d: 非 SpecError: %s\n", __FILE__, __LINE__, error.what());   \
+        }                                                                                          \
+        if (ok) {                                                                                  \
+            ++g_passed;                                                                            \
+        } else {                                                                                   \
+            ++g_failed;                                                                            \
+        }                                                                                          \
     } while (false)
 
-bool replace_all(std::string& text, const std::string& from, const std::string& to) {
+bool replace_all(std::string &text, const std::string &from, const std::string &to) {
     const std::size_t position = text.find(from);
     if (position == std::string::npos) {
         return false;
@@ -56,8 +57,8 @@ bool replace_all(std::string& text, const std::string& from, const std::string& 
     return true;
 }
 
-const Member* find_member(const Problem& problem, int64_t id) {
-    for (const Member& member : problem.catalog.members) {
+const Member *find_member(const Problem &problem, int64_t id) {
+    for (const Member &member : problem.catalog.members) {
         if (member.id == id) {
             return &member;
         }
@@ -65,8 +66,8 @@ const Member* find_member(const Problem& problem, int64_t id) {
     return nullptr;
 }
 
-const Snapshot* find_snapshot(const Problem& problem, int64_t id) {
-    for (const Snapshot& snapshot : problem.catalog.snapshots) {
+const Snapshot *find_snapshot(const Problem &problem, int64_t id) {
+    for (const Snapshot &snapshot : problem.catalog.snapshots) {
         if (snapshot.id == id) {
             return &snapshot;
         }
@@ -74,24 +75,24 @@ const Snapshot* find_snapshot(const Problem& problem, int64_t id) {
     return nullptr;
 }
 
-bool parses(const std::string& text) {
+bool parses(const std::string &text) {
     try {
         parse_problem(Json::parse(text));
         return true;
-    } catch (const std::exception&) {
+    } catch (const std::exception &) {
         return false;
     }
 }
 
-std::string formation_text(int64_t leader, const std::vector<Slot>& slots, bool with_trigger) {
-    std::string out = "{\"schema\":\"" + std::string(kSchemaFormation) + "\",\"leader\":" +
-                      std::to_string(leader) + ",\"slots\":[";
+std::string formation_text(int64_t leader, const std::vector<Slot> &slots, bool with_trigger) {
+    std::string out = "{\"schema\":\"" + std::string(kSchemaFormation) +
+                      "\",\"leader\":" + std::to_string(leader) + ",\"slots\":[";
     for (std::size_t i = 0; i < slots.size(); ++i) {
         if (i != 0) {
             out += ",";
         }
-        out += "{\"member\":" + std::to_string(slots[i].member) + ",\"snapshot\":" +
-               std::to_string(slots[i].snapshot);
+        out += "{\"member\":" + std::to_string(slots[i].member) +
+               ",\"snapshot\":" + std::to_string(slots[i].snapshot);
         if (with_trigger) {
             out += ",\"trigger\":" + std::to_string(slots[i].trigger);
         }
@@ -100,8 +101,7 @@ std::string formation_text(int64_t leader, const std::vector<Slot>& slots, bool 
     return out + "]}";
 }
 
-// 最小合法 problem，用于四个失败模式检查。
-const char* kMinimalProblem = R"JSON({
+const char *kMinimalProblem = R"JSON({
   "schema": "ournotes-deck-problem@1",
   "song": {"id": 1, "title": "t", "type": 1},
   "chart": {"difficulty": "expert", "level": 20, "notes": [{"t": 0, "op": 1}], "skill_times_ms": [1000]},
@@ -113,15 +113,17 @@ const char* kMinimalProblem = R"JSON({
   "settings": {"team_size": 1}
 })JSON";
 
-const char* kSettingsKey = "\"settings\": {\"team_size\": 1}";
+const char *kSettingsKey = "\"settings\": {\"team_size\": 1}";
 
-}  // namespace
+}
 
 int main() {
-    const std::string path = "/tmp/prob-100109-expert.json";
+    const char *from_env = std::getenv("OURNOTES_PROBLEM");
+    const std::string path = from_env != nullptr ? from_env : "/tmp/prob-100109-expert.json";
     std::ifstream input(path, std::ios::binary);
     if (!input) {
-        std::printf("test_model: %s 不存在，跳过（先用 tools/compile_from_inputs.py 生成）\n", path.c_str());
+        std::printf("test_model: %s 不存在，跳过（先用 tools/compile_from_inputs.py 生成）\n",
+                    path.c_str());
         return 0;
     }
     std::ostringstream buffer;
@@ -130,7 +132,7 @@ int main() {
     Problem problem;
     try {
         problem = parse_problem(Json::parse(buffer.str()));
-    } catch (const std::exception& error) {
+    } catch (const std::exception &error) {
         std::printf("test_model: 参考 problem 解析失败: %s\n", error.what());
         return 1;
     }
@@ -139,7 +141,7 @@ int main() {
     CHECK(problem.catalog.snapshots.size() == 64);
 
     std::size_t judged = 0;
-    for (const Note& note : problem.chart.notes) {
+    for (const Note &note : problem.chart.notes) {
         if (note.scoring) {
             ++judged;
         }
@@ -151,7 +153,7 @@ int main() {
 
     bool op_1 = false;
     bool op_120 = false;
-    for (const NoteParameter& parameter : problem.catalog.note_parameters) {
+    for (const NoteParameter &parameter : problem.catalog.note_parameters) {
         if (parameter.op == 1 && parameter.score_percent == 100) {
             op_1 = true;
         }
@@ -162,7 +164,7 @@ int main() {
     CHECK(op_1);
     CHECK(op_120);
 
-    const Member* member_61 = find_member(problem, 61);
+    const Member *member_61 = find_member(problem, 61);
     CHECK(member_61 != nullptr);
     if (member_61 != nullptr) {
         CHECK(member_61->live_skill == 5);
@@ -172,7 +174,7 @@ int main() {
         CHECK(member_61->card_rank_bonus_bp.music_type == 2000);
         CHECK(member_61->card_rank_bonus_bp.music_tag == 2000);
     }
-    const Snapshot* snapshot_33 = find_snapshot(problem, 33);
+    const Snapshot *snapshot_33 = find_snapshot(problem, 33);
     CHECK(snapshot_33 != nullptr);
     if (snapshot_33 != nullptr) {
         CHECK(snapshot_33->card_rank_bonus_bp.type_link == 2000);
@@ -194,10 +196,9 @@ int main() {
     CHECK(described.at("constraints").at("member_pool").is_null());
     CHECK(described.at("search").at("mode").as_string() == "rank");
 
-    // -- formation 往返 --------------------------------------------------------------
-    std::vector<const Member*> picked;
+    std::vector<const Member *> picked;
     std::set<int> characters;
-    for (const Member* member : problem.available_members()) {
+    for (const Member *member : problem.available_members()) {
         if (characters.insert(member->character).second) {
             picked.push_back(member);
         }
@@ -205,7 +206,7 @@ int main() {
             break;
         }
     }
-    const std::vector<const Snapshot*> snapshots = problem.available_snapshots();
+    const std::vector<const Snapshot *> snapshots = problem.available_snapshots();
     CHECK(picked.size() == 5);
     CHECK(snapshots.size() >= 5);
     if (picked.size() == 5 && snapshots.size() >= 5) {
@@ -217,19 +218,21 @@ int main() {
             const std::size_t trigger = static_cast<std::size_t>(triggers[position] - 1);
             member_for_trigger[trigger] = picked[position]->id;
             snapshot_for_trigger[trigger] = snapshots[position]->id;
-            document_slots.push_back(Slot{picked[position]->id, snapshots[position]->id, triggers[position]});
+            document_slots.push_back(
+                Slot{picked[position]->id, snapshots[position]->id, triggers[position]});
         }
 
         Formation formation;
         formation.leader = picked[2]->id;
         for (int trigger = 1; trigger <= 5; ++trigger) {
-            formation.slots.push_back(Slot{member_for_trigger[static_cast<std::size_t>(trigger - 1)],
-                                           snapshot_for_trigger[static_cast<std::size_t>(trigger - 1)], trigger});
+            formation.slots.push_back(
+                Slot{member_for_trigger[static_cast<std::size_t>(trigger - 1)],
+                     snapshot_for_trigger[static_cast<std::size_t>(trigger - 1)], trigger});
         }
         bool validated = true;
         try {
             formation.validate(problem);
-        } catch (const SpecError& error) {
+        } catch (const SpecError &error) {
             validated = false;
             std::fprintf(stderr, "formation.validate 失败: %s\n", error.what());
         }
@@ -242,7 +245,8 @@ int main() {
         CHECK(dumped.at("slots").size() == 5);
         CHECK(dumped.at("slots").at(0).size() == 3);
 
-        const Formation round_trip = parse_formation(Json::parse(formation_text(formation.leader, document_slots, true)));
+        const Formation round_trip =
+            parse_formation(Json::parse(formation_text(formation.leader, document_slots, true)));
         CHECK(round_trip.leader == formation.leader);
         CHECK(round_trip.slots.size() == 5);
         bool ordered = true;
@@ -254,18 +258,20 @@ int main() {
         CHECK(ordered);
         CHECK(parse_formation(Json::parse(dump_formation(round_trip).dump())).slots.size() == 5);
 
-        const Formation defaults = parse_formation(Json::parse(formation_text(formation.leader, formation.slots, false)));
+        const Formation defaults =
+            parse_formation(Json::parse(formation_text(formation.leader, formation.slots, false)));
         bool default_triggers = defaults.slots.size() == 5;
         for (std::size_t i = 0; i < defaults.slots.size(); ++i) {
-            default_triggers = default_triggers && defaults.slots[i].trigger == static_cast<int>(i) + 1;
+            default_triggers =
+                default_triggers && defaults.slots[i].trigger == static_cast<int>(i) + 1;
         }
         CHECK(default_triggers);
-        CHECK_SPEC_ERROR(parse_formation(Json::parse("{\"schema\":\"" + std::string(kSchemaFormation) +
-                                                     "\",\"leader\":1,\"slots\":[]}")),
-                         "formation.slots");
+        CHECK_SPEC_ERROR(
+            parse_formation(Json::parse("{\"schema\":\"" + std::string(kSchemaFormation) +
+                                        "\",\"leader\":1,\"slots\":[]}")),
+            "formation.slots");
     }
 
-    // -- 失败模式 --------------------------------------------------------------------
     CHECK(parses(kMinimalProblem));
 
     std::string wrong_schema(kMinimalProblem);
@@ -273,11 +279,13 @@ int main() {
     CHECK_SPEC_ERROR(parse_problem(Json::parse(wrong_schema)), "problem.schema");
 
     std::string wrong_times(kMinimalProblem);
-    CHECK(replace_all(wrong_times, "\"skill_times_ms\": [1000]", "\"skill_times_ms\": [1000, 2000, 3000, 4000]"));
+    CHECK(replace_all(wrong_times, "\"skill_times_ms\": [1000]",
+                      "\"skill_times_ms\": [1000, 2000, 3000, 4000]"));
     CHECK_SPEC_ERROR(parse_problem(Json::parse(wrong_times)), "chart.skill_times_ms");
 
     std::string missing_op(kMinimalProblem);
-    CHECK(replace_all(missing_op, "{\"op\": 1, \"score_percent\": 100}", "{\"op\": 2, \"score_percent\": 100}"));
+    CHECK(replace_all(missing_op, "{\"op\": 1, \"score_percent\": 100}",
+                      "{\"op\": 2, \"score_percent\": 100}"));
     CHECK_SPEC_ERROR(parse_problem(Json::parse(missing_op)), "catalog.note_parameters");
 
     std::string unknown_key(kMinimalProblem);
