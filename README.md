@@ -34,7 +34,13 @@ make test   # 跑单元测试
 
 ## 输入输出
 
-字段定义见 [docs/design.md](docs/design.md)，计分模型见 [docs/model.md](docs/model.md)。`index` 只用于在同一份 problem 内排序，不是游戏结算分。
+字段定义见 [docs/design.md](docs/design.md)，计分模型见 [docs/model.md](docs/model.md)。
+
+现在只算组卡的出分指数和单曲预计分数，不算活动 pt：
+
+- `index` = `综合力 × (1 + Σ 技能收益)`，只在同一份 problem 内排序用，不是游戏结算分
+- `estimated_score` 只有 problem 给出 `settings.score_model.level_alpha` 时才算，且没和游戏结算核对过
+- 活动加成只作为属性加成进入综合力；活动 pt、道具掉落加成、撃奏真人排名都不计算
 
 ## 生成 problem
 
