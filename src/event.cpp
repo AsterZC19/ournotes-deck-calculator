@@ -215,56 +215,73 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
     };
     auto retain = [&](Formation formation, double pt, double drop) {
         ++stats.complete_formations;
-        const Yield fixed_yield = reward_models[rank - 2].calculate(pt, drop);
-        if (fixed_rank && std::any_of(pool.begin(), pool.end(), [&](const Candidate &other) {
-                return dominates(other.yield, fixed_yield);
-            })) {
+        auto yield_dominated = [&](const PhaseRewards &model) {
+            const Yield possible = model.calculate(pt, drop);
+            return std::any_of(pool.begin(), pool.end(), [&](const Candidate &other) {
+                return dominates(other.yield, possible);
+            });
+        };
+        if (fixed_rank ? yield_dominated(reward_models[rank - 2])
+                       : std::all_of(reward_models.begin(), reward_models.end(), yield_dominated)) {
             ++stats.dominated_before_evaluation;
             return;
         }
+        auto retain_score = [&](Evaluation score, Formation scored_formation) {
+            if (score.index < min_index)
+                return;
+            for (auto &slot : scored_formation.slots)
+                for (const auto &evaluated : score.slots)
+                    if (slot.member == evaluated.member)
+                        slot.trigger = evaluated.trigger;
+            int result_rank = rank;
+            if (!fixed_rank) {
+                double total = num_field(score.estimated_score, "total");
+                result_rank = 2;
+                for (const auto &row : rank_rows->items())
+                    if (total >= num_field(row, "required_score") &&
+                        int_field(row, "rank") > result_rank)
+                        result_rank = int_field(row, "rank");
+            }
+            Yield realized = reward_models[result_rank - 2].calculate(pt, drop);
+            Candidate c{scored_formation, std::move(score), realized, result_rank};
+            bool dominated = false;
+            for (const auto &other : pool)
+                if (dominates(other.yield, c.yield)) {
+                    dominated = true;
+                    break;
+                }
+            if (dominated)
+                return;
+            pool.erase(
+                std::remove_if(pool.begin(), pool.end(),
+                               [&](const Candidate &o) { return dominates(c.yield, o.yield); }),
+                pool.end());
+
+            auto equal = std::find_if(pool.begin(), pool.end(), [&](const Candidate &o) {
+                return o.yield.cp == c.yield.cp && o.yield.pt == c.yield.pt &&
+                       o.yield.shop == c.yield.shop;
+            });
+            if (equal == pool.end())
+                pool.push_back(std::move(c));
+            else if (c.score.index > equal->score.index)
+                *equal = std::move(c);
+        };
         EvalOptions evaluation_options;
         evaluation_options.calculate_score = !fixed_rank;
-        Evaluation score = engine.evaluate(formation, evaluation_options);
-        ++stats.index_evaluations;
-        if (score.has_estimated)
-            ++stats.absolute_score_evaluations;
-        if (score.index < min_index)
+        if (fixed_rank) {
+            ++stats.index_evaluations;
+            retain_score(engine.evaluate(formation, evaluation_options), formation);
             return;
-        for (auto &slot : formation.slots)
-            for (const auto &evaluated : score.slots)
-                if (slot.member == evaluated.member)
-                    slot.trigger = evaluated.trigger;
-        int result_rank = rank;
-        if (rank_mode == "estimated_score") {
-            double total = num_field(score.estimated_score, "total");
-            result_rank = 2;
-            for (const auto &row : rank_rows->items())
-                if (total >= num_field(row, "required_score") &&
-                    int_field(row, "rank") > result_rank)
-                    result_rank = int_field(row, "rank");
         }
-        Yield realized = reward_models[result_rank - 2].calculate(pt, drop);
-        Candidate c{formation, std::move(score), realized, result_rank};
-        bool dominated = false;
-        for (const auto &other : pool)
-            if (dominates(other.yield, c.yield)) {
-                dominated = true;
-                break;
-            }
-        if (dominated)
-            return;
-        pool.erase(std::remove_if(pool.begin(), pool.end(),
-                                  [&](const Candidate &o) { return dominates(c.yield, o.yield); }),
-                   pool.end());
-
-        auto equal = std::find_if(pool.begin(), pool.end(), [&](const Candidate &o) {
-            return o.yield.cp == c.yield.cp && o.yield.pt == c.yield.pt &&
-                   o.yield.shop == c.yield.shop;
-        });
-        if (equal == pool.end())
-            pool.push_back(std::move(c));
-        else if (c.score.index > equal->score.index)
-            *equal = std::move(c);
+        if (!engine.for_each_score_order(formation, [&](const Evaluation &score) {
+                if (expired())
+                    return false;
+                ++stats.index_evaluations;
+                ++stats.absolute_score_evaluations;
+                retain_score(score, formation);
+                return true;
+            }))
+            complete = false;
     };
     if (options.method == "exact") {
         for (const Member *leader : leaders) {
@@ -590,8 +607,9 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     out.set("cycles", std::move(cycles));
     Json warnings = Json::array();
     warnings.push_back(
-        Json("exact 完成表示已枚举指定队长范围内的合法成员/Snapshot 组合；技能顺序按 AP index "
-             "优化。限时中断或 fast/auto 不证明全局最优。"));
+        Json("exact 完成表示已枚举指定队长范围内的合法成员/Snapshot 组合；fixed 按 AP index "
+             "优化技能顺序，"
+             "estimated_score 枚举全部技能顺序。限时中断或 fast/auto 不证明全局最优。"));
     warnings.push_back(Json("fixed 模式以输入档位为条件；estimated_score 按未校准的预测分数匹配 "
                             "Master 阈值。minimum_index 不证明实际档位。"));
     warnings.push_back(

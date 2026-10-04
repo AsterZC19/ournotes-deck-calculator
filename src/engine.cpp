@@ -2040,6 +2040,37 @@ void Engine::validate_theoretical_scope() const {
         throw SpecError("理论最高分的安全上界要求非负计分因子");
 }
 
+bool Engine::for_each_score_order(const Formation &formation,
+                                  const std::function<bool(const Evaluation &)> &visitor) const {
+    EvalOptions options;
+    options.order_search = "given";
+    options.calculate_score = false;
+    const Evaluation base = evaluate(formation, options);
+    const auto &grid = gains();
+    std::vector<int> order(base.slots.size());
+    std::iota(order.begin(), order.end(), 1);
+    std::vector<double> per_pair(base.slots.size());
+    do {
+        Evaluation result = base;
+        for (size_t i = 0; i < order.size(); ++i)
+            result.slots[i].trigger = order[i];
+        std::sort(result.slots.begin(), result.slots.end(),
+                  [](const SlotEval &a, const SlotEval &b) { return a.trigger < b.trigger; });
+        for (size_t i = 0; i < result.slots.size(); ++i) {
+            auto &slot = result.slots[i];
+            slot.weighted_skill_gain =
+                grid[member_pos(slot.member)][snapshot_pos(slot.snapshot)][i];
+            per_pair[i] = slot.weighted_skill_gain;
+        }
+        result.weight_factor = 1 + numpy_sum(per_pair.data(), per_pair.size());
+        result.index = static_cast<double>(result.power) * result.weight_factor;
+        populate_estimated_score(result);
+        if (!visitor(result))
+            return false;
+    } while (std::next_permutation(order.begin(), order.end()));
+    return true;
+}
+
 Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail) const {
     validate_theoretical_scope();
     formation.validate(problem_);

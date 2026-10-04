@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -170,6 +171,8 @@ public:
     Evaluation evaluate(const Formation &formation, const EvalOptions &options) const;
     void populate_estimated_score(Evaluation &evaluation) const;
     void validate_theoretical_scope() const;
+    bool for_each_score_order(const Formation &formation,
+                              const std::function<bool(const Evaluation &)> &visitor) const;
     Evaluation evaluate_theoretical(const Formation &formation, bool detail = false) const;
     double theoretical_upper_bound(double power_bound, const std::vector<float> &live_bound) const;
 

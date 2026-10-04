@@ -75,6 +75,29 @@ int main() {
     CHECK(deferred.has_estimated == evaluation.has_estimated);
     CHECK(deferred.estimated_score.dump(0) == evaluation.estimated_score.dump(0));
 
+    int order_count = 0;
+    bool order_outputs_match = true;
+    CHECK(engine.for_each_score_order(formation, [&](const Evaluation &ordered) {
+        Formation replay = formation;
+        for (auto &slot : replay.slots)
+            for (const auto &scored : ordered.slots)
+                if (slot.member == scored.member)
+                    slot.trigger = scored.trigger;
+        const auto expected = engine.evaluate(replay, options);
+        order_outputs_match &=
+            ordered.to_json(false, false, 0).dump(0) == expected.to_json(false, false, 0).dump(0);
+        ++order_count;
+        return true;
+    }));
+    CHECK(order_count == 120);
+    CHECK(order_outputs_match);
+    order_count = 0;
+    CHECK(!engine.for_each_score_order(formation, [&](const Evaluation &) {
+        ++order_count;
+        return false;
+    }));
+    CHECK(order_count == 1);
+
     CHECK(evaluation.power == 3124510);
     CHECK_NEAR(evaluation.weight_factor, 1.6301943540873203, 1e-12);
     CHECK_NEAR(evaluation.index, 5093558.561289373, 1e-12);

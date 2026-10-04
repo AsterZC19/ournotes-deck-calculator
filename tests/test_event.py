@@ -5,6 +5,8 @@ import copy
 import importlib.util
 import itertools
 import json
+import math
+import random
 from pathlib import Path
 import subprocess
 import struct
@@ -114,6 +116,135 @@ def problem():
             },
         },
     }
+
+
+def check_event_oracle():
+    base = problem()
+    base["constraints"] = {"distinct_snapshots": False}
+    records = []
+    for members in ((1, 2), (1, 3)):
+        for snapshots in itertools.product(range(1, 4), repeat=2):
+            for order in ((1, 2), (2, 1)):
+                formation = {
+                    "schema": "ournotes-deck-formation@1",
+                    "leader": 1,
+                    "slots": [
+                        {"member": m, "snapshot": snap, "trigger": trigger}
+                        for m, snap, trigger in zip(members, snapshots, order)
+                    ],
+                }
+                score = run("score", base, formation, order_search="given")["results"][0]
+                records.append(
+                    (members, snapshots, score["index"], score["estimated_score"]["total"])
+                )
+    rng = random.Random(28017)
+    for case in range(12):
+        p = copy.deepcopy(base)
+        p["constraints"]["distinct_snapshots"] = bool(case % 2)
+        assumptions = p["event"]["assumptions"]
+        mode = "fixed" if case % 4 == 0 else "estimated_score"
+        source = ("none", "pt", "drop")[case % 3]
+        minimum = sorted(x[2] for x in records)[len(records) // 2] if case % 3 == 0 else 0
+        assumptions.update(score_rank_mode=mode, cp_bonus_source=source, minimum_index=minimum)
+        p["event"]["score_ranks"] = [
+            {"rank": 2, "required_score": 0},
+            {"rank": 4, "required_score": 12000},
+            {"rank": 7, "required_score": 17000},
+        ]
+        for card in p["catalog"]["members"] + p["catalog"]["snapshots"]:
+            card["event_pt_bonus_bp"] = rng.randrange(5) * 1379
+            card["event_drop_bonus_bp"] = rng.randrange(5) * 1723
+        for phase in ("normal", "challenge"):
+            p["event"][phase]["pt"] = [
+                {"rank": rank, "value": rng.randrange(1, 100)} for rank in (2, 4, 7)
+            ]
+            p["event"][phase]["rewards"] = [
+                {
+                    "rank": rank,
+                    "resource_type": 1,
+                    "resource_id": 43,
+                    "count": rng.randrange(1, 100),
+                    "probability_bp": 5000,
+                }
+                for rank in (2, 4, 7)
+            ]
+        p["event"]["normal"]["cp"] = [
+            {"rank": rank, "value": rng.randrange(1, 20)} for rank in (2, 4, 7)
+        ]
+        expected = {}
+        for phase in ("normal", "challenge"):
+            yields = set()
+            multiplier = 5 if phase == "normal" else 1
+            for members, snapshots, index, score in records:
+                if index < minimum or (
+                    p["constraints"]["distinct_snapshots"] and len(set(snapshots)) < 2
+                ):
+                    continue
+                cards = [p["catalog"]["members"][m - 1] for m in members] + [
+                    p["catalog"]["snapshots"][snap - 1] for snap in snapshots
+                ]
+                pt = sum(card["event_pt_bonus_bp"] for card in cards) / 10000
+                drop = sum(card["event_drop_bonus_bp"] for card in cards) / 10000
+                rank = (
+                    7
+                    if mode == "fixed"
+                    else max(
+                        row["rank"]
+                        for row in p["event"]["score_ranks"]
+                        if score >= row["required_score"]
+                    )
+                )
+                reward = p["event"][phase]
+                cp = 0
+                if phase == "normal":
+                    cp_bonus = {"none": 0, "pt": pt, "drop": drop}[source]
+                    cp = math.floor(
+                        next(row["value"] for row in reward["cp"] if row["rank"] == rank)
+                        * 5
+                        * (1 + cp_bonus)
+                    )
+                points = math.floor(
+                    next(row["value"] for row in reward["pt"] if row["rank"] == rank)
+                    * multiplier
+                    * (1 + pt)
+                )
+                shop = (
+                    math.floor(
+                        next(row["count"] for row in reward["rewards"] if row["rank"] == rank)
+                        * multiplier
+                        * (1 + drop)
+                    )
+                    * 0.5
+                )
+                yields.add((cp, points, shop))
+            expected[phase] = {
+                y
+                for y in yields
+                if not any(all(a >= b for a, b in zip(other, y)) and other != y for other in yields)
+            }
+        actual = run("event", p, method="exact", leaders="1", time_limit=0)
+        for phase in ("normal", "challenge"):
+            assert actual[f"{phase}_search_complete"]
+            observed = {
+                tuple(c["yield"][key] for key in ("cp", "pt", "shop_currency_expected"))
+                for c in actual[f"{phase}_frontier"]
+            }
+            assert observed == expected[phase], (case, phase, observed, expected[phase])
+        for name, axis in (("pt", 1), ("shop_currency_expected", 2)):
+            best = max(
+                n[axis] + n[0] / 200 * c[axis]
+                for n in expected["normal"]
+                for c in expected["challenge"]
+            )
+            assert math.isclose(
+                actual["recommended"][name]["amortized_per_normal_live"][name], best
+            )
+            finite = max(
+                3 * n[axis] + math.floor((51 + 3 * n[0]) / 200) * c[axis]
+                for n in expected["normal"]
+                for c in expected["challenge"]
+            )
+            assert actual["recommended_finite_budget"][name][name] == finite
 
 
 def main():
@@ -307,6 +438,44 @@ def main():
     assert candidate["yield"]["pt"] == 750
     assert candidate["yield"]["cp"] == 50
     assert ranked_yields["score_rank_verified"] is False
+    inversion = json.loads(
+        (ROOT / "tests/fixtures/theoretical-rounding-inversion.json").read_text()
+    )
+    inversion["event"] = copy.deepcopy(predicted["event"])
+    native = run("rank", inversion, objective="score", method="exact", leaders="40", time_limit=0)[
+        "results"
+    ][0]
+    indexed = run("rank", inversion, objective="index", method="exact", leaders="40", time_limit=0)[
+        "results"
+    ][0]
+    assert native["ranking_score"] > indexed["estimated_score"]["total"]
+    inversion["event"]["score_ranks"][1]["required_score"] = native["ranking_score"]
+    for row in inversion["event"]["normal"]["cp"]:
+        row["value"] = 100 if row["rank"] == 2 else 10
+    orders = run("event", inversion, method="exact", leaders="40", time_limit=0)
+    assert orders["normal_search_complete"] and orders["challenge_search_complete"]
+    assert {x["score_rank"] for x in orders["normal_frontier"]} == {2, 7}
+    assert orders["recommended"]["cp"]["yield"]["cp"] == 500
+    assert orders["challenge_frontier"][0]["score_rank"] == 7
+    for phase in ("normal", "challenge"):
+        audit = orders[f"{phase}_search_audit"]
+        assert audit["index_evaluations"] == audit["complete_formations"] * 6
+        for candidate in orders[f"{phase}_frontier"]:
+            replay = run("score", inversion, candidate["formation"], order_search="given")[
+                "results"
+            ][0]
+            assert replay["estimated_score"] == candidate["estimated_score"]
+    constrained = copy.deepcopy(inversion)
+    constrained["event"]["assumptions"]["minimum_index"] = indexed["index"]
+    filtered = run("event", constrained, method="exact", leaders="40", time_limit=0)
+    assert all(
+        x["score_rank"] == 2 for x in filtered["normal_frontier"] + filtered["challenge_frontier"]
+    )
+    assert all(
+        x["index"] >= indexed["index"]
+        for x in filtered["normal_frontier"] + filtered["challenge_frontier"]
+    )
+
     unknown_alpha = copy.deepcopy(predicted)
     unknown_alpha["settings"]["score_model"]["level_alpha"] = None
     try:
@@ -720,7 +889,8 @@ def main():
         ],
     }
     assert run("score", band, rescored)["results"][0]["power"] == changed_rank["power"]
-    print("Synthetic score/event integration checks passed")
+    check_event_oracle()
+    print("Synthetic score/event integration checks passed; 12 exhaustive reward-frontier cases")
 
 
 if __name__ == "__main__":
