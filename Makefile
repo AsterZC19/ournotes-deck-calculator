@@ -29,6 +29,7 @@ $(TEST_BINS): $(BUILD)/test_%: $(OBJ) $(BUILD)/test_%.o
 
 test: $(BUILD)/deckcalc $(TEST_BINS)
 	@for t in $(TESTS); do ./$(BUILD)/test_$$t || exit 1; done
+	python3 -m unittest discover -s tests -p test_account.py
 	python3 tests/test_event.py
 	python3 tests/test_search.py
 	python3 tests/test_theoretical.py

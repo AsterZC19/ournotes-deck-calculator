@@ -96,6 +96,7 @@ struct Snapshot {
 
 struct Fix {
     Triple character_rank_bonus{};
+    std::map<int, Triple> character_rank_bonus_by_character;
     Triple character_total_rank_bonus{};
     Triple band_item_bonus_bp{};
     std::map<int, Triple> band_item_bonus_bp_by_band;

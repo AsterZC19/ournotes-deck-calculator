@@ -29,6 +29,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    from .account import AccountError, apply_account_catalog, formation_for_deck, load_account
+except ImportError:
+    # Support direct execution and file-based imports without changing sys.path.
+    _account_spec = importlib.util.spec_from_file_location(
+        "ournotes_account", Path(__file__).with_name("account.py")
+    )
+    _account_module = importlib.util.module_from_spec(_account_spec)
+    _account_spec.loader.exec_module(_account_module)
+    AccountError = _account_module.AccountError
+    apply_account_catalog = _account_module.apply_account_catalog
+    formation_for_deck = _account_module.formation_for_deck
+    load_account = _account_module.load_account
+
 TOOL = "tools/compile_from_master.py"
 SCHEMA_PROBLEM = "ournotes-deck-problem@1"
 DIFFICULTIES = ("easy", "normal", "hard", "expert")
@@ -671,6 +685,8 @@ def _load_chart_runtime(charts_dir: Path, code: str) -> dict[str, Any]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise CompileError(f"原始谱面 {path} 不是合法 JSON: {exc}") from exc
+    if isinstance(raw, dict) and raw.get("format") == "nnnotes.live-score/1":
+        return raw
     try:
         return _load_convert_chart().convert(raw)
     except CompileError:
@@ -860,6 +876,7 @@ def compile_problem(
     validate: bool = True,
     generated_at: str | None = None,
     song_context: str = "auto",
+    account: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """编译一首歌的 problem JSON（纯函数：不做文件写入）。"""
     if difficulty not in DIFFICULTIES:
@@ -877,6 +894,14 @@ def compile_problem(
         ideal_rank=ideal_rank,
         ideal_awake=ideal_awake,
     )
+    account_info = None
+    if account is not None:
+        if any(value is not None for value in (ideal_level, ideal_rank, ideal_awake)):
+            raise CompileError("账号实际养成不能与 ideal 覆盖同时使用")
+        try:
+            account_info = apply_account_catalog(tables, catalog, account)
+        except AccountError as error:
+            raise CompileError(str(error)) from error
     tasks = _songs_for_event(tables, event_id).get(song_id, [])
     music = next((m for m in tables.table("MasterLiveMusic") if _int(m["_id"]) == song_id), None)
     if music is None:
@@ -920,6 +945,10 @@ def compile_problem(
         "catalog": catalog,
         "settings": copy.deepcopy(PROBLEM_SETTINGS),
     }
+
+    if account_info is not None:
+        problem["meta"].pop("ideal")
+        problem["meta"]["account"] = account_info
 
     if event_id:
         problem["event"] = build_event(tables, catalog, event_id, song_id)
@@ -1014,6 +1043,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="输出路径；多首歌时作为文件名模板（见下方说明）",
     )
     parser.add_argument(
+        "--account", help="ournotes-account@1 账号导出 JSON；只使用持有卡和实际养成"
+    )
+    parser.add_argument("--formation-output", help="同时导出账号保存编队为 formation JSON")
+    parser.add_argument("--deck-id", type=int, help="保存编队 ID；默认使用账号 main_deck")
+    parser.add_argument(
         "--ideal-level",
         type=int,
         default=None,
@@ -1034,7 +1068,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--band-item-bp",
         type=int,
-        default=2500,
+        default=None,
         help="乐队道具加成 bp（默认 2500 = 5 件 Lv50 合计 +25%%）",
     )
     parser.add_argument(
@@ -1053,6 +1087,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.account and any(
+        value is not None
+        for value in (args.ideal_level, args.ideal_rank, args.ideal_awake, args.band_item_bp)
+    ):
+        parser.error("--account 不能与 --ideal-* 或 --band-item-bp 同时使用")
+    if (args.formation_output or args.deck_id is not None) and not args.account:
+        parser.error("导出保存编队需要 --account")
 
     master_dir = Path(args.master_dir).expanduser().resolve()
     if not master_dir.is_dir():
@@ -1066,6 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = Path(args.output).expanduser()
 
     try:
+        account = load_account(Path(args.account)) if args.account else None
         tables = MasterTables(master_dir, latest_dir)
         tables.require(("MasterChallengeMusic", "MasterLiveMusic"))
         song_ids, _tasks = _resolve_song_ids(tables, args.songs, int(args.event_id))
@@ -1083,13 +1125,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ideal_level=args.ideal_level,
                 ideal_rank=args.ideal_rank,
                 ideal_awake=args.ideal_awake,
-                band_item_bp=args.band_item_bp,
+                band_item_bp=2500 if args.band_item_bp is None else args.band_item_bp,
+                account=account,
                 validate=not args.no_validate,
                 generated_at=generated_at,
                 song_context=args.song_context,
             )
             path = output_path_for(output, song_id, args.difficulty, multiple)
             write_problem(problem, path)
+            if account is not None:
+                path.chmod(0o600)
             written.append(path)
             if not args.quiet:
                 chart = problem["chart"]
@@ -1101,7 +1146,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"snapshots={len(problem['catalog']['snapshots'])} -> {path}",
                     file=sys.stderr,
                 )
-    except CompileError as exc:
+        if args.formation_output:
+            formation = formation_for_deck(account, args.deck_id)
+            formation_path = Path(args.formation_output).expanduser()
+            write_problem(formation, formation_path)
+            formation_path.chmod(0o600)
+    except (CompileError, AccountError) as exc:
         print(f"compile_from_master: 错误: {exc}", file=sys.stderr)
         return 2
     return 0
@@ -1121,7 +1171,11 @@ def build_event(
         for card in catalog[key]:
             characters = {card["character"]} if kind == 2 else set(card["characters"])
             bands = {card["band"]} if kind == 2 else set(card["bands"])
-            for bonus_type, field in ((0, "event_pt_bonus_bp"), (1, "event_drop_bonus_bp")):
+            for bonus_type, field in (
+                (0, "event_pt_bonus_bp"),
+                (1, "event_drop_bonus_bp"),
+                (2, "event_bonus_bp"),
+            ):
                 card[field] = _event_bonus_bp(
                     _event_bonus_index(tables, event_id, bonus_type)[kind],
                     kind,

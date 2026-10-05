@@ -384,16 +384,20 @@ const Triple &band_item_rate(const Fix &fix, const Member &member) {
     return found == fix.band_item_bonus_bp_by_band.end() ? fix.band_item_bonus_bp : found->second;
 }
 
-Triple flat_bonus(const Fix &fix) {
+Triple flat_bonus(const Fix &fix, const Member &member) {
+    const auto found = fix.character_rank_bonus_by_character.find(member.character);
+    const Triple &character_rank = found == fix.character_rank_bonus_by_character.end()
+                                       ? fix.character_rank_bonus
+                                       : found->second;
     Triple flat{};
     for (int d = 0; d < kDims; ++d) {
-        flat[d] = fix.character_rank_bonus[d] + fix.character_total_rank_bonus[d];
+        flat[d] = character_rank[d] + fix.character_total_rank_bonus[d];
     }
     return flat;
 }
 
 Triple member_common(const Member &member, const Fix &fix, bool float32_mode) {
-    const Triple flat = flat_bonus(fix);
+    const Triple flat = flat_bonus(fix, member);
     Triple common{};
     for (int d = 0; d < kDims; ++d) {
         const int64_t trained = member.trained[d];
@@ -1580,19 +1584,13 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
     const Fix &fix = problem_.catalog.fix;
     const bool float32_mode = power_uses_float32(settings);
     const Member &leader = *members_[leader_index];
-    const Triple flat = flat_bonus(fix);
-
     std::vector<Triple> common(member_count);
     std::vector<int64_t> music_type_rate(member_count, 0);
     std::vector<int64_t> music_tag_rate(member_count, 0);
     std::vector<Triple> leader_rate(member_count);
     for (size_t m = 0; m < member_count; ++m) {
         const Member &member = *members_[m];
-        const Triple trained = member.trained;
-        for (int d = 0; d < kDims; ++d) {
-            common[m][d] = trained[d] +
-                           power_floor(trained[d] * member.event_bonus_bp, float32_mode) + flat[d];
-        }
+        common[m] = member_common(member, fix, float32_mode);
         if (problem_.song.type == member.card_type) {
             music_type_rate[m] = fix.music_type_base_bp + member.card_rank_bonus_bp.music_type;
         }

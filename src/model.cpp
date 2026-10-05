@@ -829,6 +829,24 @@ Fix parse_fix(const Json *data, const Path &path) {
         as_triple(total_rank, child(path, "character_total_rank_bonus"), Triple{0, 0, 0}, true);
     fix.band_item_bonus_bp =
         as_triple(band_item, child(path, "band_item_bonus_bp"), Triple{0, 0, 0}, true);
+    if (const Json *by_character = member_ptr(object, "character_rank_bonus_by_character")) {
+        const Json character_map =
+            as_mapping(*by_character, child(path, "character_rank_bonus_by_character"));
+        for (const auto &entry : character_map.fields()) {
+            int character = 0;
+            try {
+                size_t used = 0;
+                character = std::stoi(entry.first, &used);
+                if (used != entry.first.size() || character < 1)
+                    throw std::invalid_argument("character");
+            } catch (const std::exception &) {
+                fail(child(path, "character_rank_bonus_by_character"), "角色 ID 必须为正整数");
+            }
+            fix.character_rank_bonus_by_character[character] = as_triple(
+                &entry.second, child(path, "character_rank_bonus_by_character." + entry.first),
+                Triple{0, 0, 0}, true);
+        }
+    }
     if (const Json *by_band = member_ptr(object, "band_item_bonus_bp_by_band")) {
         const Json band_map = as_mapping(*by_band, child(path, "band_item_bonus_bp_by_band"));
         for (const auto &entry : band_map.fields()) {
