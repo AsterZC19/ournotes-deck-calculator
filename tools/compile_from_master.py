@@ -952,6 +952,10 @@ def compile_problem(
 
     if event_id:
         problem["event"] = build_event(tables, catalog, event_id, song_id)
+        if effective_context == "normal":
+            for cards in (catalog["members"], catalog["snapshots"]):
+                for card in cards:
+                    card["event_bonus_bp"] = 0
 
     if validate:
         validate_problem(problem)
@@ -1263,7 +1267,7 @@ def build_event(
             for row in tables.table("MasterLiveScoreRank")
             if row["_group"] == music["_liveScoreRankGroup"]
         ]
-    result["assumptions"]["score_rank_mode"] = "fixed"
+    result["assumptions"]["score_rank_mode"] = "estimated_score"
     result["challenge_music_ids"] = sorted(
         {
             _int(row["_liveMusicId"])
