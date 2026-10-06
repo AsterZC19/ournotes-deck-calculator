@@ -19,6 +19,52 @@ namespace {
 constexpr int kMaxTeam = 8;
 constexpr double kEps = 1e-12;
 
+// Store only selected slots, so membership checks and keys do not depend on
+// the catalog size or on the numeric character IDs.
+struct SelectionSet {
+    std::array<int, kMaxTeam> values{};
+    int size = 0;
+
+    bool contains(int value) const {
+        return std::binary_search(values.begin(), values.begin() + size, value);
+    }
+    void insert(int value) {
+        auto end = values.begin() + size;
+        auto at = std::lower_bound(values.begin(), end, value);
+        if (at != end && *at == value)
+            return;
+        if (size == kMaxTeam)
+            throw SpecError("selected set exceeds team size");
+        std::move_backward(at, end, end + 1);
+        *at = value;
+        ++size;
+    }
+    SelectionSet with(int value) const {
+        auto result = *this;
+        result.insert(value);
+        return result;
+    }
+    static SelectionSet single(int value) {
+        SelectionSet result;
+        result.insert(value);
+        return result;
+    }
+    bool operator==(const SelectionSet &other) const {
+        return size == other.size &&
+               std::equal(values.begin(), values.begin() + size, other.values.begin());
+    }
+};
+
+struct SelectionHash {
+    size_t operator()(const SelectionSet &set) const {
+        size_t hash = 0;
+        for (int i = 0; i < set.size; ++i)
+            hash ^=
+                std::hash<int>{}(set.values[i]) + size_t{0x9e3779b9} + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
 using Clock = std::chrono::steady_clock;
 
 double wall_s() {
@@ -41,7 +87,8 @@ struct Shared {
     bool distinct_characters = true;
     bool distinct_snapshots = true;
     bool score_objective = false;
-    std::vector<uint64_t> excluded_member_masks;
+    bool average_objective = false;
+    std::vector<SelectionSet> excluded_member_sets;
     std::vector<float> score_live_bound;
     mutable int64_t score_evaluations = 0;
     bool linear_score_bound_enabled = false;
@@ -58,6 +105,8 @@ struct Shared {
     int team_size = 5;
     int member_count = 0;
     int snap_count = 0;
+    std::vector<int> character_groups;
+    int character_count = 0;
 
     bool kept(int pair, int trigger) const {
         return keep_at[static_cast<size_t>(pair) * static_cast<size_t>(team_size) +
@@ -179,7 +228,7 @@ struct Game {
 
 struct Solution {
     double index = 0.0;
-    uint64_t member_mask = 0;
+    SelectionSet member_set;
     std::vector<Pick> picks;
     Evaluation evaluation;
     bool found = false;
@@ -199,18 +248,18 @@ Evaluation evaluate_picks(const Game &game, const std::vector<Pick> &picks) {
     }
     if (shared.score_objective) {
         ++shared.score_evaluations;
-        return shared.engine->evaluate_theoretical(formation);
+        return shared.average_objective ? shared.engine->evaluate_mean(formation)
+                                        : shared.engine->evaluate_theoretical(formation);
     }
     EvalOptions options;
     options.calculate_score = false;
     return shared.engine->evaluate(formation, options);
 }
 
-uint64_t member_mask_of(const Shared &shared, const std::vector<Pick> &picks) {
-    uint64_t mask = 0;
+SelectionSet member_set_of(const Shared &shared, const std::vector<Pick> &picks) {
+    SelectionSet mask;
     for (const Pick &pick : picks) {
-        mask |= uint64_t{1} << static_cast<uint32_t>(
-                    shared.pairs[static_cast<size_t>(pick.pair)].member);
+        mask.insert(shared.pairs[static_cast<size_t>(pick.pair)].member);
     }
     return mask;
 }
@@ -231,10 +280,10 @@ bool legal_pairs(const Game &game, const std::vector<int> &pairs) {
         member_ids.insert(shared.members[pair.member]->id);
         snapshot_ids.insert(shared.snapshots[pair.snap]->id);
     }
-    uint64_t mask = 0;
+    SelectionSet mask;
     for (int member : members)
-        mask |= uint64_t{1} << member;
-    for (auto excluded : shared.excluded_member_masks)
+        mask.insert(member);
+    for (auto excluded : shared.excluded_member_sets)
         if (mask == excluded)
             return false;
     if (!members.count(game.leader_member))
@@ -264,7 +313,7 @@ Solution make_solution(const Game &game, const std::vector<int> &pairs, bool wit
             Pick{pair, triggers[i], slot,
                  shared.gains[static_cast<size_t>(pair)][static_cast<size_t>(triggers[i])]});
     }
-    solution.member_mask = member_mask_of(shared, solution.picks);
+    solution.member_set = member_set_of(shared, solution.picks);
     solution.index = static_cast<double>(power_sum) * (1.0 + gain);
     solution.found = true;
     if (with_evaluation) {
@@ -276,9 +325,9 @@ Solution make_solution(const Game &game, const std::vector<int> &pairs, bool wit
 
 struct BeamState {
     int depth = 0;
-    uint64_t member_mask = 0;
-    uint64_t snap_mask = 0;
-    uint64_t character_mask = 0;
+    SelectionSet member_set;
+    SelectionSet snapshot_set;
+    SelectionSet character_set;
     int trigger_mask = 0;
     int64_t power = 0;
     double gain = 0.0;
@@ -317,10 +366,10 @@ std::vector<BeamState> beam(const Game &game, int beam_width) {
         state.gain = best_gain;
         state.picks[0] = Pick{pair, best_trigger, state.power, best_gain};
         state.pairs[0] = pair;
-        state.member_mask = uint64_t{1} << static_cast<uint32_t>(leader);
-        state.snap_mask = uint64_t{1} << static_cast<uint32_t>(snap);
-        state.character_mask = uint64_t{1} << static_cast<uint32_t>(
-                                   shared.members[static_cast<size_t>(leader)]->character);
+        state.member_set = SelectionSet::single(leader);
+        state.snapshot_set = SelectionSet::single(snap);
+        state.character_set =
+            SelectionSet::single(shared.members[static_cast<size_t>(leader)]->character);
         state.trigger_mask = 1 << best_trigger;
         frontier.push_back(state);
     }
@@ -342,15 +391,14 @@ std::vector<BeamState> beam(const Game &game, int beam_width) {
             const BeamState &state = frontier[index];
             for (int pair : game.by_power) {
                 const Pair &item = shared.pairs[static_cast<size_t>(pair)];
-                const uint64_t member_bit = uint64_t{1} << static_cast<uint32_t>(item.member);
-                if (state.member_mask & member_bit)
+                const int member_index = item.member;
+                if (state.member_set.contains(member_index))
                     continue;
-                const uint64_t snap_bit = uint64_t{1} << static_cast<uint32_t>(item.snap);
-                if (shared.distinct_snapshots && (state.snap_mask & snap_bit))
+                const int snapshot_index = item.snap;
+                if (shared.distinct_snapshots && (state.snapshot_set.contains(snapshot_index)))
                     continue;
                 const int character = shared.members[static_cast<size_t>(item.member)]->character;
-                if (shared.distinct_characters &&
-                    (state.character_mask & (uint64_t{1} << static_cast<uint32_t>(character)))) {
+                if (shared.distinct_characters && (state.character_set.contains(character))) {
                     continue;
                 }
                 int best_trigger = -1;
@@ -381,7 +429,7 @@ std::vector<BeamState> beam(const Game &game, int beam_width) {
         std::stable_sort(children.begin(), children.end(),
                          [](const Child &a, const Child &b) { return a.score > b.score; });
         std::unordered_set<std::string> seen;
-        std::unordered_map<uint64_t, int> member_set_count;
+        std::unordered_map<SelectionSet, int, SelectionHash> member_set_count;
         std::vector<Child> unique;
         for (const auto &child : children) {
             const auto &state = frontier[child.parent];
@@ -397,8 +445,8 @@ std::vector<BeamState> beam(const Game &game, int beam_width) {
                 continue;
 
             if (depth + 1 == team_size) {
-                const uint64_t member_set =
-                    state.member_mask | (uint64_t{1} << shared.pairs[child.pair].member);
+                const SelectionSet member_set =
+                    state.member_set.with(shared.pairs[child.pair].member);
                 if (member_set_count[member_set] >= 4)
                     continue;
                 ++member_set_count[member_set];
@@ -418,11 +466,9 @@ std::vector<BeamState> beam(const Game &game, int beam_width) {
                 Pick{child.pair, child.trigger, child.power, child.gain};
             state.pairs[static_cast<size_t>(state.depth)] = child.pair;
             state.depth += 1;
-            state.member_mask |= uint64_t{1} << static_cast<uint32_t>(item.member);
-            state.snap_mask |= uint64_t{1} << static_cast<uint32_t>(item.snap);
-            state.character_mask |=
-                uint64_t{1} << static_cast<uint32_t>(
-                    shared.members[static_cast<size_t>(item.member)]->character);
+            state.member_set.insert(item.member);
+            state.snapshot_set.insert(item.snap);
+            state.character_set.insert(shared.members[static_cast<size_t>(item.member)]->character);
             state.trigger_mask |= 1 << child.trigger;
             state.power += child.power;
             state.gain += child.gain;
@@ -445,18 +491,17 @@ void local_improve(const Game &game, int rounds, Solution &solution) {
                 return;
             const bool leader_slot =
                 shared.pairs[solution.picks[position].pair].member == game.leader_member;
-            uint64_t member_mask = 0;
-            uint64_t snap_mask = 0;
-            uint64_t character_mask = 0;
+            SelectionSet member_set;
+            SelectionSet snapshot_set;
+            SelectionSet character_set;
             for (int i = 0; i < team_size; ++i) {
                 if (i == position)
                     continue;
                 const Pair &item =
                     shared.pairs[static_cast<size_t>(solution.picks[static_cast<size_t>(i)].pair)];
-                member_mask |= uint64_t{1} << static_cast<uint32_t>(item.member);
-                snap_mask |= uint64_t{1} << static_cast<uint32_t>(item.snap);
-                character_mask |= uint64_t{1} << static_cast<uint32_t>(
-                                      shared.members[static_cast<size_t>(item.member)]->character);
+                member_set.insert(item.member);
+                snapshot_set.insert(item.snap);
+                character_set.insert(shared.members[static_cast<size_t>(item.member)]->character);
             }
             for (int pair : game.by_power) {
                 if (pair == solution.picks[static_cast<size_t>(position)].pair)
@@ -466,14 +511,12 @@ void local_improve(const Game &game, int rounds, Solution &solution) {
                 const Pair &item = shared.pairs[static_cast<size_t>(pair)];
                 if (leader_slot && item.member != game.leader_member)
                     continue;
-                if (member_mask & (uint64_t{1} << static_cast<uint32_t>(item.member)))
+                if (member_set.contains(item.member))
                     continue;
-                if (shared.distinct_snapshots &&
-                    (snap_mask & (uint64_t{1} << static_cast<uint32_t>(item.snap))))
+                if (shared.distinct_snapshots && (snapshot_set.contains(item.snap)))
                     continue;
                 const int character = shared.members[static_cast<size_t>(item.member)]->character;
-                if (shared.distinct_characters &&
-                    (character_mask & (uint64_t{1} << static_cast<uint32_t>(character)))) {
+                if (shared.distinct_characters && (character_set.contains(character))) {
                     continue;
                 }
                 std::vector<int> pairs;
@@ -502,7 +545,7 @@ void local_improve(const Game &game, int rounds, Solution &solution) {
                     solution.picks = std::move(picks);
                     solution.evaluation = evaluation;
                     solution.index = evaluation.index;
-                    solution.member_mask = member_mask_of(shared, solution.picks);
+                    solution.member_set = member_set_of(shared, solution.picks);
                     improved = true;
                     break;
                 }
@@ -711,7 +754,7 @@ double completed_linear_gain(const Shared &shared, const std::vector<int> &pairs
 
 struct Bnb {
     const Game *game = nullptr;
-    const std::vector<uint64_t> *excluded = nullptr;
+    const std::vector<SelectionSet> *excluded = nullptr;
     double deadline = 0.0;
     bool timed_out = false;
     double best = 0.0;
@@ -722,8 +765,8 @@ struct Bnb {
 };
 
 double relaxed_joint(const Bnb &ctx, const std::vector<int> &trial,
-                     const std::array<std::array<double, kMaxTeam>, 64> &rows, uint64_t available,
-                     int64_t power) {
+                     const std::vector<std::array<double, kMaxTeam>> &rows,
+                     const std::vector<char> &available, int64_t power) {
     const auto &shared = *ctx.game->shared;
     const int count = 1 << shared.team_size;
     std::array<double, 1 << kMaxTeam> dp;
@@ -741,8 +784,8 @@ double relaxed_joint(const Bnb &ctx, const std::vector<int> &trial,
                             dp[mask] + ctx.lambda * shared.score_gain_coefficients[pair][k]);
         dp = next;
     }
-    for (int row = 0; row < 64; ++row)
-        if (available & (uint64_t{1} << row))
+    for (size_t row = 0; row < rows.size(); ++row)
+        if (available[row])
             for (int mask = count - 1; mask >= 0; --mask)
                 if (std::isfinite(dp[mask]))
                     for (int k = 0; k < shared.team_size; ++k)
@@ -761,8 +804,9 @@ double relaxed_joint(const Bnb &ctx, const std::vector<int> &trial,
     return std::nextafter(result, std::numeric_limits<double>::infinity());
 }
 
-void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t snap_mask,
-             uint64_t character_mask, int64_t power, std::vector<int> &trial) {
+void bnb_dfs(Bnb &ctx, int level, int min_pair, const SelectionSet &member_set,
+             const SelectionSet &snapshot_set, const SelectionSet &character_set, int64_t power,
+             std::vector<int> &trial) {
     const Shared &shared = *ctx.game->shared;
     const int team_size = shared.team_size;
     if (ctx.timed_out)
@@ -790,7 +834,9 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t s
         std::vector<int> triggers;
         const double gain = assign_triggers(shared, trial, triggers);
         const double value = shared.score_objective ? make_solution(*ctx.game, trial, true).index
-                                                    : static_cast<double>(power) * (1.0 + gain);
+                             : shared.engine->rules().formation_leader_conditions()
+                                 ? make_solution(*ctx.game, trial, true).index
+                                 : static_cast<double>(power) * (1.0 + gain);
         if (shared.score_objective ? value > ctx.best : value > ctx.best * (1.0 + 1e-12)) {
             ctx.best = value;
             ctx.best_pairs = trial;
@@ -800,41 +846,45 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t s
 
     const int remaining = team_size - level;
 
-    std::array<double, 64> group_power{}, group_gain{};
-    uint64_t allowed_members = 0;
+    const int group_count =
+        shared.distinct_characters ? shared.character_count : shared.member_count;
+    std::vector<double> group_power(group_count), group_gain(group_count);
+    std::vector<char> allowed_members(shared.member_count);
     for (int m = min_pair + 1; m < shared.member_count; ++m) {
-        if (member_mask & (uint64_t{1} << m))
+        if (member_set.contains(m))
             continue;
         const int c = shared.members[m]->character;
-        if (shared.distinct_characters && (character_mask & (uint64_t{1} << c)))
+        if (shared.distinct_characters && (character_set.contains(c)))
             continue;
-        allowed_members |= uint64_t{1} << m;
+        allowed_members[m] = 1;
     }
     std::array<double, kMaxTeam> trigger_max{};
-    std::array<double, 64> snapshot_power{}, snapshot_gain{};
-    std::array<std::array<double, kMaxTeam>, 64> joint_groups{}, joint_snapshots{};
-    uint64_t group_available = 0, snapshot_available = 0;
+    std::vector<double> snapshot_power(shared.snap_count), snapshot_gain(shared.snap_count);
+    std::vector<std::array<double, kMaxTeam>> joint_groups(ctx.lambda > 0 ? group_count : 0),
+        joint_snapshots(ctx.lambda > 0 ? shared.snap_count : 0);
+    std::vector<char> group_available(group_count), snapshot_available(shared.snap_count);
     for (int p : trial)
         for (int k = 0; k < team_size; ++k)
             trigger_max[k] = std::max(trigger_max[k], shared.bound_gain(p, k));
     for (int pair : ctx.game->by_power) {
         const auto &item = shared.pairs[pair];
-        if (!(allowed_members & (uint64_t{1} << item.member)))
+        if (!allowed_members[item.member])
             continue;
-        if (shared.distinct_snapshots && (snap_mask & (uint64_t{1} << item.snap)))
+        if (shared.distinct_snapshots && (snapshot_set.contains(item.snap)))
             continue;
         const int character = shared.members[item.member]->character;
-        if (shared.distinct_characters && (character_mask & (uint64_t{1} << character)))
+        if (shared.distinct_characters && (character_set.contains(character)))
             continue;
-        const int key = shared.distinct_characters ? character : item.member;
+        const int key =
+            shared.distinct_characters ? shared.character_groups[item.member] : item.member;
         const double pair_power = static_cast<double>(ctx.game->slot_power(pair)),
                      pair_gain = shared.max_gain(pair);
         group_power[key] = std::max(group_power[key], pair_power);
         group_gain[key] = std::max(group_gain[key], pair_gain);
         snapshot_power[item.snap] = std::max(snapshot_power[item.snap], pair_power);
         snapshot_gain[item.snap] = std::max(snapshot_gain[item.snap], pair_gain);
-        group_available |= uint64_t{1} << key;
-        snapshot_available |= uint64_t{1} << item.snap;
+        group_available[key] = 1;
+        snapshot_available[item.snap] = 1;
         for (int k = 0; k < team_size; ++k) {
             trigger_max[k] = std::max(trigger_max[k], shared.bound_gain(pair, k));
             if (ctx.lambda > 0) {
@@ -844,7 +894,7 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t s
             }
         }
     }
-    if (__builtin_popcountll(group_available) < remaining)
+    if (std::count(group_available.begin(), group_available.end(), char{1}) < remaining)
         return;
     std::sort(group_power.begin(), group_power.end(), std::greater<double>());
     std::sort(group_gain.begin(), group_gain.end(), std::greater<double>());
@@ -890,26 +940,25 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t s
         return;
 
     for (int pair : ctx.game->by_power) {
-        if (!(allowed_members & (uint64_t{1} << shared.pairs[pair].member)))
+        if (!allowed_members[shared.pairs[pair].member])
             continue;
         if (!shared.any_kept(pair))
             continue;
         const Pair &item = shared.pairs[static_cast<size_t>(pair)];
-        const uint64_t member_bit = uint64_t{1} << static_cast<uint32_t>(item.member);
-        if (member_mask & member_bit)
+        const int member_index = item.member;
+        if (member_set.contains(member_index))
             continue;
-        const uint64_t snap_bit = uint64_t{1} << static_cast<uint32_t>(item.snap);
-        if (shared.distinct_snapshots && (snap_mask & snap_bit))
+        const int snapshot_index = item.snap;
+        if (shared.distinct_snapshots && (snapshot_set.contains(snapshot_index)))
             continue;
         const int character = shared.members[static_cast<size_t>(item.member)]->character;
-        if (shared.distinct_characters &&
-            (character_mask & (uint64_t{1} << static_cast<uint32_t>(character)))) {
+        if (shared.distinct_characters && (character_set.contains(character))) {
             continue;
         }
         if (level == team_size - 1 && ctx.excluded != nullptr) {
-            const uint64_t mask = member_mask | member_bit;
+            const SelectionSet mask = member_set.with(member_index);
             bool banned = false;
-            for (uint64_t item_mask : *ctx.excluded) {
+            for (const SelectionSet &item_mask : *ctx.excluded) {
                 if (item_mask == mask) {
                     banned = true;
                     break;
@@ -919,8 +968,8 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t s
                 continue;
         }
         trial.push_back(pair);
-        bnb_dfs(ctx, level + 1, item.member, member_mask | member_bit, snap_mask | snap_bit,
-                character_mask | (uint64_t{1} << static_cast<uint32_t>(character)),
+        bnb_dfs(ctx, level + 1, item.member, member_set.with(member_index),
+                snapshot_set.with(snapshot_index), character_set.with(character),
                 power + ctx.game->slot_power(pair), trial);
         trial.pop_back();
         if (ctx.timed_out)
@@ -932,9 +981,10 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, uint64_t member_mask, uint64_t s
 
 RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     const Problem &problem = engine.problem();
-    const bool theoretical = options.objective == "theoretical_score";
+    const bool theoretical =
+        options.objective == "theoretical_score" || options.objective == "mean_score";
     if (!theoretical && options.objective != "index")
-        throw SpecError("objective 必须为 theoretical_score/index");
+        throw SpecError("objective 必须为 mean_score/theoretical_score/index");
     if (theoretical)
         engine.validate_theoretical_scope();
     const int team_size = engine.team_size();
@@ -945,6 +995,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
 
     Shared shared;
     shared.engine = &engine;
+    shared.average_objective = options.objective == "mean_score";
     shared.members = engine.members();
     shared.snapshots = engine.snapshots();
     shared.team_size = team_size;
@@ -955,26 +1006,31 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     shared.required_members = problem.constraints.required_members;
     shared.required_snapshots = problem.constraints.required_snapshots;
     shared.deadline = deadline;
-    if (shared.member_count > 64 || shared.snap_count > 64 || team_size > kMaxTeam)
-        throw SpecError("搜索支持最多 64 成员、64 Snapshot、8 人队伍");
-    for (auto m : shared.members)
-        if (m->character < 0 || m->character >= 64)
-            throw SpecError("搜索角色编号必须为 0..63");
+    if (team_size > kMaxTeam)
+        throw SpecError("搜索支持最多 8 人队伍");
+    std::map<int, int> character_groups;
+    for (auto m : shared.members) {
+        if (m->character < 0)
+            throw SpecError("搜索角色编号必须非负");
+        auto [it, added] = character_groups.try_emplace(m->character, shared.character_count);
+        if (added)
+            ++shared.character_count;
+        shared.character_groups.push_back(it->second);
+    }
 
     for (const auto &ids : options.excluded_member_sets) {
         if (static_cast<int>(ids.size()) != team_size)
             throw SpecError("排除组合必须恰有 team_size 张不同成员卡");
-        uint64_t mask = 0;
+        SelectionSet mask;
         for (auto id : ids) {
             const int member = engine.member_pos(id);
             if (member < 0)
                 throw SpecError("排除组合含不可用成员 " + std::to_string(id));
-            const uint64_t bit = uint64_t{1} << member;
-            if (mask & bit)
+            if (mask.contains(member))
                 throw SpecError("排除组合不能含重复成员");
-            mask |= bit;
+            mask.insert(member);
         }
-        shared.excluded_member_masks.push_back(mask);
+        shared.excluded_member_sets.push_back(mask);
     }
     const std::vector<std::vector<std::vector<double>>> &gains = engine.gains();
     shared.pairs.resize(static_cast<size_t>(shared.member_count) *
@@ -1081,7 +1137,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
         exact_mode = static_cast<int64_t>(shared.member_count) * shared.snap_count <= 1024;
     }
 
-    std::unordered_map<uint64_t, Solution> pool;
+    std::unordered_map<SelectionSet, Solution, SelectionHash> pool;
     std::unordered_map<int64_t, Solution> best_by_leader;
     std::mt19937_64 rng(static_cast<uint64_t>(problem.search.seed));
     AnnealStats anneal_stats;
@@ -1102,7 +1158,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             game.flat_power.insert(game.flat_power.end(), row.begin(), row.end());
         game.leader_id = leader_id;
         game.leader_member = leader_member;
-        if (use_index_pruning)
+        if (use_index_pruning && !engine.rules().formation_leader_conditions())
             prune(shared, matrix);
         else
             shared.keep_at.assign(shared.pairs.size() * static_cast<size_t>(team_size), 1);
@@ -1134,9 +1190,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
         Solution candidate = make_solution(game, pairs, true);
         ++accepted_seeds;
         verified_seed_solutions.push_back(candidate);
-        auto it = pool.find(candidate.member_mask);
+        auto it = pool.find(candidate.member_set);
         if (it == pool.end() || it->second.index < candidate.index)
-            pool[candidate.member_mask] = candidate;
+            pool[candidate.member_set] = candidate;
         auto leader = best_by_leader.find(formation.leader);
         if (leader == best_by_leader.end() || leader->second.index < candidate.index)
             best_by_leader[formation.leader] = candidate;
@@ -1183,19 +1239,19 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                 candidates.begin(), candidates.end(),
                 [](const Solution &a, const Solution &b) { return a.index > b.index; });
 
-            std::unordered_set<uint64_t> raw_member_sets;
+            std::unordered_set<SelectionSet, SelectionHash> raw_member_sets;
             for (const auto &raw : candidates) {
                 if (static_cast<int>(raw_member_sets.size()) >=
                     std::max(8, std::min(24, options.top * 2)))
                     break;
-                if (!raw_member_sets.insert(raw.member_mask).second)
+                if (!raw_member_sets.insert(raw.member_set).second)
                     continue;
                 Solution candidate = raw;
                 candidate.evaluation = evaluate_picks(game, candidate.picks);
                 candidate.index = candidate.evaluation.index;
-                auto it = pool.find(candidate.member_mask);
+                auto it = pool.find(candidate.member_set);
                 if (it == pool.end() || it->second.index < candidate.index)
-                    pool[candidate.member_mask] = std::move(candidate);
+                    pool[candidate.member_set] = std::move(candidate);
             }
             const size_t improve_count = std::min<size_t>(16, candidates.size());
             for (size_t i = 0; i < improve_count; ++i)
@@ -1208,9 +1264,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             for (size_t i = 0; i < evaluate_count; ++i) {
                 candidates[i].evaluation = evaluate_picks(game, candidates[i].picks);
                 candidates[i].index = candidates[i].evaluation.index;
-                auto existing = pool.find(candidates[i].member_mask);
+                auto existing = pool.find(candidates[i].member_set);
                 if (existing == pool.end() || existing->second.index < candidates[i].index) {
-                    pool[candidates[i].member_mask] = candidates[i];
+                    pool[candidates[i].member_set] = candidates[i];
                 }
             }
 
@@ -1221,9 +1277,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                 seed = make_solution(game, random_team(game, rng), false);
             Solution strengthened = anneal(game, seed, options, rng, anneal_stats);
             if (strengthened.found) {
-                auto existing = pool.find(strengthened.member_mask);
+                auto existing = pool.find(strengthened.member_set);
                 if (existing == pool.end() || existing->second.index < strengthened.index)
-                    pool[strengthened.member_mask] = strengthened;
+                    pool[strengthened.member_set] = strengthened;
                 best_by_leader[leader_id] = strengthened;
             }
 
@@ -1259,14 +1315,14 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             auto incumbent = best_by_leader.find(game.leader_id);
             if (incumbent == best_by_leader.end() || incumbent->second.index < candidate.index)
                 best_by_leader[game.leader_id] = candidate;
-            pool[candidate.member_mask] = std::move(candidate);
+            pool[candidate.member_set] = std::move(candidate);
         }
     }
 
     for (const auto &seed : verified_seed_solutions) {
-        auto existing = pool.find(seed.member_mask);
+        auto existing = pool.find(seed.member_set);
         if (existing == pool.end() || existing->second.index < seed.index)
-            pool[seed.member_mask] = seed;
+            pool[seed.member_set] = seed;
         auto leader = best_by_leader.find(seed.evaluation.leader);
         if (leader == best_by_leader.end() || leader->second.index < seed.index)
             best_by_leader[seed.evaluation.leader] = seed;
@@ -1284,7 +1340,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             Game game = build_game(leader_id, !theoretical);
             Bnb ctx;
             ctx.game = &game;
-            ctx.excluded = &shared.excluded_member_masks;
+            ctx.excluded = &shared.excluded_member_sets;
             ctx.deadline = deadline;
             ctx.best = incumbent == best_by_leader.end() ? -std::numeric_limits<double>::infinity()
                                                          : incumbent->second.index;
@@ -1311,9 +1367,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                 if (!shared.any_kept(pair))
                     continue;
                 trial.push_back(pair);
-                bnb_dfs(ctx, 1, -1, uint64_t{1} << static_cast<uint32_t>(game.leader_member),
-                        uint64_t{1} << static_cast<uint32_t>(snap),
-                        uint64_t{1} << static_cast<uint32_t>(
+                bnb_dfs(ctx, 1, -1, SelectionSet::single(game.leader_member),
+                        SelectionSet::single(snap),
+                        SelectionSet::single(
                             shared.members[static_cast<size_t>(game.leader_member)]->character),
                         game.slot_power(pair), trial);
                 trial.pop_back();
@@ -1328,9 +1384,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             dfs_nodes += ctx.nodes;
             if (ctx.best_pairs.size() == static_cast<size_t>(team_size)) {
                 Solution solution = make_solution(game, ctx.best_pairs, true);
-                auto existing = pool.find(solution.member_mask);
+                auto existing = pool.find(solution.member_set);
                 if (existing == pool.end() || existing->second.index < solution.index) {
-                    pool[solution.member_mask] = std::move(solution);
+                    pool[solution.member_set] = std::move(solution);
                 }
             }
             if (ctx.timed_out) {
@@ -1379,8 +1435,11 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
         excluded.push_back(std::move(row));
     }
     audit.set("excluded_member_sets", std::move(excluded));
-    audit.set("theoretical_max_certified",
-              Json(theoretical && certified && !result.results.empty()));
+    audit.set("theoretical_max_certified", Json(options.objective == "theoretical_score" &&
+                                                certified && !result.results.empty()));
+    audit.set("mean_score_certified",
+              Json(shared.average_objective && certified && !result.results.empty()));
+    audit.set("input_mode", Json(problem.input_mode));
     audit.set("infeasible_proven", Json(certified && result.results.empty()));
     audit.set("score_dfs_pruning",
               Json(theoretical ? "native_float32_monotone_and_linear_envelope" : "index_bound"));
@@ -1393,12 +1452,16 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
               Json(seeded_exact ? "validated_prior_formations" : "beam_annealing"));
     audit.set("complete_beam_variants_per_member_set", Json(4));
     audit.set("index_snapshot_pruning_used_in_score_dfs", Json(false));
-    audit.set("certified_scope",
-              Json(theoretical ? "maximum rounded AP model score over all legal formations and all "
-                                 "skill permutations within requested leaders/card pool after "
-                                 "excluded member sets; other top entries are candidates"
-                               : "best index within requested leaders and card constraints; "
-                                 "remaining top entries are candidates"));
+    audit.set(
+        "certified_scope",
+        Json(shared.average_objective
+                 ? "maximum mean rounded AP model score over uniformly random skill permutations "
+                   "within requested leaders/card pool; other top entries are candidates"
+             : theoretical ? "maximum rounded AP model score over all legal formations and all "
+                             "skill permutations within requested leaders/card pool after "
+                             "excluded member sets; other top entries are candidates"
+                           : "best index within requested leaders and card constraints; "
+                             "remaining top entries are candidates"));
     audit.set("warm_start_objective", Json("index"));
     audit.set("score_model_calibrated", Json(false));
     audit.set("score_formations_evaluated", Json(shared.score_evaluations));

@@ -113,6 +113,7 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
             "band": int(_field(row, "_bandID", 0)),
             "card_type": int(_field(row, "_cardType", 0)),
             "tag": int(_field(row, "_tagID", 0)),
+            "music_type": int(_field(row, "_liveMusicType", 0)),
             "gekisou_mission_type": int(_field(row, "_gekisouMissionType", 0)),
             "live_skill_categories": [
                 int(v) for v in (_field(row, "_liveSkillCategories", []) or [])
@@ -291,7 +292,7 @@ def build_problem_document(
             "base_duration_ms": 5000,
             "duration_extension_effect_type": 15000,
             "type_link_bonus_source": "snapshot",
-            "leader_unmapped_effect_types": "ignore",
+            "leader_unmapped_effect_types": "error",
         },
     }
     check_document(document)

@@ -120,6 +120,7 @@ def main():
         for card in p["catalog"]["members"] + p["catalog"]["snapshots"]:
             card["event_pt_bonus_bp"] = rng.randrange(6) * 1723 + (0.1 if case % 2 else 0)
             card["event_drop_bonus_bp"] = rng.randrange(6) * 2131 + (0.2 if case % 2 else 0)
+        p["settings"]["leader_effect_axes"] = {"3000": "all"}
         p["catalog"]["leader_skills"] = [
             {"id": m["id"], "effects": [{"level": 5, "effect_type": 3000, "value": m["id"] * 1250}]}
             for m in p["catalog"]["members"]

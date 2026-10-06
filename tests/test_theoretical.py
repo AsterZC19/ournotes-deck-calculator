@@ -57,6 +57,7 @@ def oracle(p, leader_id=40, excluded=()):
         combos.append(native)
         weights.append(percentages[n["op"]] / 100 * (1 + combo))
     baseweight = math.fsum(weights)
+    maxmean = -1
     maxscore = -1
     maxindex = -1
     score_at_index = -1
@@ -84,6 +85,7 @@ def oracle(p, leader_id=40, excluded=()):
                 for m, s in zip(members, snaps)
             )
             formation_index = -1
+            order_scores = []
             formation_score = -1
             score_for_best_index = -1
             for order in itertools.permutations(range(p["settings"]["team_size"])):
@@ -146,7 +148,9 @@ def oracle(p, leader_id=40, excluded=()):
                 if index > formation_index:
                     formation_index = index
                     score_for_best_index = score
+                order_scores.append(score)
                 formation_score = max(formation_score, score)
+            maxmean = max(maxmean, sum(order_scores) / len(order_scores))
             order_diff |= formation_score > score_for_best_index
             if formation_index > maxindex:
                 maxindex = formation_index
@@ -158,6 +162,7 @@ def oracle(p, leader_id=40, excluded=()):
                 best = ([m["id"] for m in members], sid)
     return {
         "score": maxscore,
+        "mean_score": maxmean,
         "index": maxindex,
         "score_at_index": score_at_index,
         "best": best,
@@ -172,6 +177,7 @@ def run(p, objective=None, detail=False, seconds=10, leaders="40", excluded=()):
         args = [
             str(ROOT / "build/deckcalc"),
             "rank",
+            "--experimental",
             "-p",
             str(f),
             "--method",
@@ -309,6 +315,7 @@ def main():
             [
                 str(ROOT / "build/deckcalc"),
                 "score",
+                "--experimental",
                 "-p",
                 str(path),
                 "-f",
@@ -327,12 +334,14 @@ def main():
             [
                 str(ROOT / "build/deckcalc"),
                 "score",
+                "--experimental",
                 "-p",
                 str(path),
                 "-f",
                 str(f),
                 "--objective",
                 "score",
+                "--experimental",
             ],
             capture_output=True,
             text=True,

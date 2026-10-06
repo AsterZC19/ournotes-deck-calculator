@@ -52,7 +52,14 @@ def main():
                 path = Path(folder) / f"{i}.json"
                 path.write_text(json.dumps(p))
                 paths.append(path)
-            args = [str(BINARY), "event", "--quiet", "--challenge-problem", str(paths[-1])]
+            args = [
+                str(BINARY),
+                "event",
+                "--experimental",
+                "--quiet",
+                "--challenge-problem",
+                str(paths[-1]),
+            ]
             for path in paths[:-1]:
                 args += ["-p", str(path)]
             for flag, value in flags.items():
@@ -87,7 +94,7 @@ def main():
                 len(inputs) - 1 if method == "exact" else 0
             )
             bad = subprocess.run(
-                [str(BINARY), "rank", "-p", str(paths[0]), "-p", str(paths[1])],
+                [str(BINARY), "rank", "--experimental", "-p", str(paths[0]), "-p", str(paths[1])],
                 text=True,
                 capture_output=True,
             )

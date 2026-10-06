@@ -20,6 +20,7 @@ def main():
         cmd = [
             "python3",
             str(ROOT / "tools/prove_top_k.py"),
+            "--experimental",
             "-p",
             str(source),
             "-o",

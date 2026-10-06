@@ -92,7 +92,7 @@ PROBLEM_SETTINGS: dict[str, Any] = {
     "base_duration_ms": 5000,
     "duration_extension_effect_type": 15000,
     "type_link_bonus_source": "snapshot",
-    "leader_unmapped_effect_types": "ignore",
+    "leader_unmapped_effect_types": "error",
 }
 
 
@@ -598,6 +598,7 @@ def build_catalog(
             "band": _int(row.get("_bandID")),
             "card_type": _int(row.get("_cardType")),
             "tag": _int(row.get("_tagID")),
+            "music_type": _int(row.get("_liveMusicType")),
             "gekisou_mission_type": _int(row.get("_gekisouMissionType")),
             "live_skill_categories": _int_list(row.get("_liveSkillCategories")),
             "gekisou_skill_categories": _int_list(row.get("_gekisouSkillCategories")),

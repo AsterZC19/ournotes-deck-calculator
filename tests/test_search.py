@@ -38,6 +38,7 @@ def fixture(seed, reuse=False):
     ]
     return {
         "schema": "ournotes-deck-problem@1",
+        "input_mode": "experimental",
         "song": {"id": 1, "type": 1},
         "chart": {
             "difficulty": "expert",
@@ -138,6 +139,7 @@ def run(p, method="exact", leaders="40", seconds=10, beam=64, restarts=4):
             [
                 str(ROOT / "build/deckcalc"),
                 "rank",
+                "--experimental",
                 "-p",
                 str(file),
                 "--method",

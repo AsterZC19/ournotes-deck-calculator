@@ -995,10 +995,86 @@ double Rules::live_boost(const Member &member) const {
     return value;
 }
 
-Triple Rules::leader_bonus_bp(const Member &leader, const Member &member) const {
+bool Rules::formation_leader_conditions() const {
+    if (!problem_.settings.power.leader)
+        return false;
+    for (const auto &skill : problem_.catalog.leader_skills)
+        for (const auto &effect : skill.effects) {
+            auto group = index_.condition_group_by_group.find(effect.condition_group);
+            if (group == index_.condition_group_by_group.end())
+                continue;
+            for (const auto &row : group->second->rows)
+                for (auto id : row) {
+                    const auto condition = index_.condition_by_id.find(id);
+                    if (condition != index_.condition_by_id.end() &&
+                        (condition->second->type == 3000 || condition->second->type == 3001))
+                        return true;
+                }
+        }
+    return false;
+}
+
+bool Rules::leader_condition_matches(int group_id, const Member &member,
+                                     const std::vector<const Member *> *team) const {
+    if (group_id == 0)
+        return true;
+    const auto group = index_.condition_group_by_group.find(group_id);
+    if (group == index_.condition_group_by_group.end())
+        throw SpecError("未知队长技能条件组 " + std::to_string(group_id));
+    // The static leader controller requires all referenced conditions. Unlike
+    // support target conditions, these include whole-formation predicates.
+    bool result = true;
+    for (const auto &row : group->second->rows)
+        for (auto id : row) {
+            const auto found = index_.condition_by_id.find(id);
+            if (found == index_.condition_by_id.end())
+                throw SpecError("未知队长技能条件 " + std::to_string(id));
+            const auto &condition = *found->second;
+            if (condition.type != 0 && condition.type != 5000 && condition.type != 3000 &&
+                condition.type != 3001 && condition.type != 4012)
+                throw SpecError("队长技能条件类型未支持: " + std::to_string(condition.type));
+            auto matches = [&](const Member &candidate) {
+                if (condition.targets.empty())
+                    return true;
+                bool matched = false;
+                for (auto target : condition.targets)
+                    matched |= target_matches(require_target(index_, target), candidate);
+                return matched;
+            };
+            bool value = true;
+            if (condition.type == 5000)
+                value = matches(member);
+            else if (condition.type == 3000 || condition.type == 3001) {
+                // Unknown future members are relaxed for search upper bounds.
+                // Both positive and negated predicates may eventually be true.
+                if (!team) {
+                    for (auto id : condition.targets)
+                        require_target(index_, id);
+                    continue;
+                }
+                value = condition.type == 3000 ? std::any_of(team->begin(), team->end(),
+                                                             [&](auto m) { return matches(*m); })
+                                               : std::all_of(team->begin(), team->end(),
+                                                             [&](auto m) { return matches(*m); });
+            } else if (condition.type == 4012 && !condition.targets.empty()) {
+                value = false;
+                for (auto target : condition.targets) {
+                    const int music_type = require_target(index_, target).music_type;
+                    if (music_type == 0)
+                        throw SpecError("队长歌曲属性条件缺少 music_type");
+                    value |= music_type == problem_.song.type;
+                }
+            }
+            result &= condition.positive ? value : !value;
+        }
+    return result;
+}
+
+Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
+                              const std::vector<const Member *> *team) const {
     const uint64_t cache_key = pack_ids(leader.id, member.id);
     const auto cached = leader_cache_.find(cache_key);
-    if (cached != leader_cache_.end()) {
+    if (!team && cached != leader_cache_.end()) {
         return cached->second;
     }
     Triple out{0, 0, 0};
@@ -1007,6 +1083,12 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member) const 
         const Skill &skill = *found->second;
         for (const SkillEffect *effect : select_effects(
                  skill, leader.leader_skill_level.value_or(leader_level_), std::nullopt)) {
+            if (!leader_condition_matches(effect->condition_group, member, team))
+                continue;
+            const int64_t value =
+                !team && formation_leader_conditions() && effect->condition_group != 0
+                    ? std::max<int64_t>(0, effect->value)
+                    : effect->value;
             if (!effect->targets.empty()) {
                 bool any = false;
                 for (int64_t target_id : effect->targets) {
@@ -1037,7 +1119,7 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member) const 
             }
             if (axis->second == "all") {
                 for (int d = 0; d < kDims; ++d) {
-                    out[d] += effect->value;
+                    out[d] += value;
                 }
             } else {
                 int index = 0;
@@ -1046,11 +1128,12 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member) const 
                                     std::to_string(effect->effect_type) + " 未知属性轴 " +
                                     quote(axis->second));
                 }
-                out[index] += effect->value;
+                out[index] += value;
             }
         }
     }
-    leader_cache_.emplace(cache_key, out);
+    if (!team)
+        leader_cache_.emplace(cache_key, out);
     return out;
 }
 
@@ -1355,7 +1438,8 @@ double Engine::live_boost(int member_index) const {
     return boosts()[static_cast<size_t>(member_index)];
 }
 
-int64_t Engine::slot_power(size_t leader_index, size_t member_index, size_t snapshot_index) const {
+int64_t Engine::slot_power(size_t leader_index, size_t member_index, size_t snapshot_index,
+                           const std::vector<const Member *> *team) const {
     require_index(leader_index, members_.size(), "队长");
     require_index(member_index, members_.size(), "成员");
     require_index(snapshot_index, snapshots_.size(), "Snapshot");
@@ -1408,7 +1492,7 @@ int64_t Engine::slot_power(size_t leader_index, size_t member_index, size_t snap
         }
     }
     if (settings.power.leader) {
-        const Triple rate = rules_.leader_bonus_bp(leader, member);
+        const Triple rate = rules_.leader_bonus_bp(leader, member, team);
         for (int d = 0; d < kDims; ++d) {
             total += power_floor(common[d] * rate[d], float32_mode);
         }
@@ -1443,7 +1527,8 @@ int64_t Engine::slot_power(size_t leader_index, size_t member_index, size_t snap
     return total;
 }
 
-Json Engine::slot_breakdown(size_t leader_index, size_t member_index, size_t snapshot_index) const {
+Json Engine::slot_breakdown(size_t leader_index, size_t member_index, size_t snapshot_index,
+                            const std::vector<const Member *> *team) const {
     require_index(leader_index, members_.size(), "队长");
     require_index(member_index, members_.size(), "成员");
     require_index(snapshot_index, snapshots_.size(), "Snapshot");
@@ -1505,7 +1590,7 @@ Json Engine::slot_breakdown(size_t leader_index, size_t member_index, size_t sna
         add_scalar("music_tag", rate);
     }
     if (settings.power.leader) {
-        add_part("leader", rules_.leader_bonus_bp(leader, member));
+        add_part("leader", rules_.leader_bonus_bp(leader, member, team));
     }
     if (settings.power.vip) {
         add_part("vip", fix.vip_bonus_bp);
@@ -1601,9 +1686,14 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
     std::vector<int64_t> music_type_rate(member_count, 0);
     std::vector<int64_t> music_tag_rate(member_count, 0);
     std::vector<Triple> leader_rate(member_count);
+    const bool formation_conditions = rules_.formation_leader_conditions();
     for (size_t m = 0; m < member_count; ++m) {
         const Member &member = *members_[m];
         common[m] = member_common(member, fix, float32_mode);
+        if (formation_conditions &&
+            std::any_of(common[m].begin(), common[m].end(), [](int64_t value) { return value < 0; })) {
+            throw SpecError("编队条件搜索要求成员基础综合力各项非负，无法为负值建立安全上界");
+        }
         if (problem_.song.type == member.card_type) {
             music_type_rate[m] = fix.music_type_base_bp + member.card_rank_bonus_bp.music_type;
         }
@@ -1827,6 +1917,7 @@ Json Engine::model_block() const {
     }
     Json out = Json::object();
     out.set("id", Json(kModelId));
+    out.set("input_mode", Json(problem_.input_mode));
     out.set("calibrated", Json(false));
     out.set("assumptions", std::move(assumptions));
     return out;
@@ -1959,7 +2050,12 @@ Evaluation Engine::evaluate(const Formation &formation, const EvalOptions &optio
     if (leader_pos < 0) {
         throw SpecError("队长 " + std::to_string(formation.leader) + " 不在可用成员中");
     }
-    const std::vector<std::vector<int64_t>> &matrix = power_matrix(static_cast<size_t>(leader_pos));
+    const auto *matrix = rules_.formation_leader_conditions()
+                             ? nullptr
+                             : &power_matrix(static_cast<size_t>(leader_pos));
+    std::vector<const Member *> team;
+    for (const auto &slot : formation.slots)
+        team.push_back(members_[member_pos(slot.member)]);
     const std::vector<std::vector<int64_t>> &duration_matrix = durations();
     const std::vector<double> &boost_values = boosts();
 
@@ -1972,7 +2068,9 @@ Evaluation Engine::evaluate(const Formation &formation, const EvalOptions &optio
         const size_t snapshot_index = static_cast<size_t>(pairs[static_cast<size_t>(i)].second);
         const Member &member = *members_[member_index];
         const Snapshot &snapshot = *snapshots_[snapshot_index];
-        const int64_t slot_power_value = matrix[member_index][snapshot_index];
+        const int64_t slot_power_value = matrix ? (*matrix)[member_index][snapshot_index]
+                                                : slot_power(static_cast<size_t>(leader_pos),
+                                                             member_index, snapshot_index, &team);
         total_power += slot_power_value;
 
         SlotEval slot;
@@ -1984,8 +2082,8 @@ Evaluation Engine::evaluate(const Formation &formation, const EvalOptions &optio
         slot.live_boost = boost_values[member_index];
         slot.weighted_skill_gain = per_pair[static_cast<size_t>(i)];
         if (options.detail) {
-            slot.breakdown =
-                slot_breakdown(static_cast<size_t>(leader_pos), member_index, snapshot_index);
+            slot.breakdown = slot_breakdown(static_cast<size_t>(leader_pos), member_index,
+                                            snapshot_index, &team);
             slot.has_breakdown = true;
         }
         evaluation.slots.push_back(std::move(slot));
@@ -2206,6 +2304,15 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
     best.warnings.push_back(
         "ranking_score 是 AP 且随机技能顺序最有利时的模型最高分，不是每局保证得分。");
     return best;
+}
+
+Evaluation Engine::evaluate_mean(const Formation &formation, bool detail) const {
+    auto result = evaluate_theoretical(formation, detail);
+    result.ranking_objective = "mean_score";
+    result.ranking_score = num_field(result.order_analysis, "mean_score");
+    result.warnings.back() =
+        "ranking_score 是 AP、恒定生命条件下随机技能顺序的模型平均分；不是每局保证得分。";
+    return result;
 }
 
 NativeScoreBound Engine::linear_score_bound(const std::vector<float> &live_bound) const {

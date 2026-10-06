@@ -39,12 +39,13 @@ void usage() {
            "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
            "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--time-limit S]\n"
            "                    [--method auto|fast|exact] [--leaders 61,62] [--detail] [--quiet]\n"
-           "                    [--objective score|index] [--beam-width 64] [--restarts 4] "
+           "                    [--objective mean|score|index] [--beam-width 64] [--restarts 4] "
            "[--anneal-steps 3000] [--seed 0]\n"
            "                    [--warm-start previous-results.json]\n"
            "                    [--exclude-member-sets excluded.json] "
            "(逐名证明时排除已证明成员组合)\n"
            "\n"
+           "实验输入必须标记 input_mode=experimental，并显式传 --experimental。\n"
            "-p/-f 传 \"-\" 表示从 stdin 读取，-o 省略表示写到 stdout。\n";
 }
 
@@ -61,6 +62,7 @@ struct Args {
     std::string method = "auto";
     std::string objective = "theoretical_score";
     bool objective_explicit = false;
+    bool experimental = false;
     std::string leaders;
     int top = 0;
     int beam_width = 64, restarts = 4, anneal_steps = 3000;
@@ -97,6 +99,8 @@ Args parse_args(int argc, char **argv) {
         if (flag == "-p" || flag == "--problem") {
             args.problems.push_back(need_value(argc, argv, i, "--problem"));
             args.problem = args.problems.front();
+        } else if (flag == "--experimental") {
+            args.experimental = true;
         } else if (flag == "--warm-start") {
             args.warm_start = need_value(argc, argv, i, "--warm-start");
         } else if (flag == "--exclude-member-sets") {
@@ -112,6 +116,8 @@ Args parse_args(int argc, char **argv) {
         } else if (flag == "--objective") {
             args.objective_explicit = true;
             args.objective = need_value(argc, argv, i, "--objective");
+            if (args.objective == "mean")
+                args.objective = "mean_score";
             if (args.objective == "score")
                 args.objective = "theoretical_score";
         } else if (flag == "--method") {
@@ -149,8 +155,9 @@ Args parse_args(int argc, char **argv) {
         throw SpecError("stdin 只能读取一个输入");
     if (args.beam_width < 1 || args.restarts < 0 || args.anneal_steps < 0)
         throw SpecError("beam-width 必须 >=1，restarts/anneal-steps 必须 >=0");
-    if (args.objective != "theoretical_score" && args.objective != "index")
-        throw SpecError("objective 必须为 score/index");
+    if (args.objective != "theoretical_score" && args.objective != "index" &&
+        args.objective != "mean_score")
+        throw SpecError("objective 必须为 mean/score/index");
     if (args.method != "auto" && args.method != "fast" && args.method != "exact")
         throw SpecError("method 必须为 auto/fast/exact");
     return args;
@@ -201,11 +208,14 @@ Json score_document(const Problem &problem, const Engine &engine, const Formatio
     options.order_search =
         args.order_search.empty() ? problem.search.order_search : args.order_search;
     options.detail = args.detail;
-    if (args.objective_explicit && args.objective == "theoretical_score" &&
+    if (args.objective_explicit &&
+        (args.objective == "theoretical_score" || args.objective == "mean_score") &&
         options.order_search == "given")
         throw SpecError("理论最高分会搜索技能顺序，不能同时使用 --order-search given");
     Evaluation evaluation = args.objective_explicit && args.objective == "theoretical_score"
                                 ? engine.evaluate_theoretical(formation, args.detail)
+                            : args.objective_explicit && args.objective == "mean_score"
+                                ? engine.evaluate_mean(formation, args.detail)
                                 : engine.evaluate(formation, options);
 
     Json results = Json::array();
@@ -214,6 +224,7 @@ Json score_document(const Problem &problem, const Engine &engine, const Formatio
     Json document = Json::object();
     document.set("schema", Json(deckcalc::kSchemaResult));
     document.set("kind", Json("score"));
+    document.set("input_mode", Json(problem.input_mode));
     Json tool = Json::object();
     tool.set("name", Json(deckcalc::kToolName));
     tool.set("version", Json(deckcalc::kToolVersion));
@@ -246,6 +257,8 @@ Json rank_document(const Problem &problem, const Engine &engine, const deckcalc:
             options.detail = true;
             evaluation = candidate.ranking_objective == "theoretical_score"
                              ? engine.evaluate_theoretical(formation, true)
+                         : candidate.ranking_objective == "mean_score"
+                             ? engine.evaluate_mean(formation, true)
                              : engine.evaluate(formation, options);
         }
         results.push_back(evaluation.to_json(args.detail, true, ++rank));
@@ -263,6 +276,7 @@ Json rank_document(const Problem &problem, const Engine &engine, const deckcalc:
     Json document = Json::object();
     document.set("schema", Json(deckcalc::kSchemaResult));
     document.set("kind", Json("rank"));
+    document.set("input_mode", Json(problem.input_mode));
     Json tool = Json::object();
     tool.set("name", Json(deckcalc::kToolName));
     tool.set("version", Json(deckcalc::kToolVersion));
@@ -317,6 +331,15 @@ int main(int argc, char **argv) {
         }
 
         Problem problem = deckcalc::parse_problem(Json::read(args.problem));
+        auto check_mode = [&](const Problem &input) {
+            if (input.input_mode == "experimental" && !args.experimental)
+                throw SpecError("实验输入需要显式传 --experimental");
+        };
+        check_mode(problem);
+        if (!args.objective_explicit && problem.input_mode == "game")
+            args.objective = "mean_score";
+        if (args.objective == "index" && problem.input_mode == "game")
+            throw SpecError("index 是实验代理目标；游戏推荐请使用 mean 或 score");
         if (args.seed)
             problem.search.seed = *args.seed;
 
@@ -396,6 +419,9 @@ int main(int argc, char **argv) {
             std::unique_ptr<Engine> challenge_engine;
             if (!args.challenge_problem.empty()) {
                 challenge.emplace(deckcalc::parse_problem(Json::read(args.challenge_problem)));
+                check_mode(*challenge);
+                if (challenge->input_mode != problem.input_mode)
+                    throw SpecError("普通曲与课题曲的输入模式必须一致");
                 challenge_engine = std::make_unique<Engine>(*challenge, &engine_cache);
             }
             deckcalc::EventSearchCache phase_cache;
@@ -415,6 +441,9 @@ int main(int argc, char **argv) {
             plans.push_back(std::move(first));
             for (size_t i = 1; i < args.problems.size(); ++i) {
                 Problem next = deckcalc::parse_problem(Json::read(args.problems[i]));
+                check_mode(next);
+                if (next.input_mode != problem.input_mode)
+                    throw SpecError("批量输入的模式必须一致");
                 if (args.seed)
                     next.search.seed = *args.seed;
                 Engine model(next, &engine_cache);

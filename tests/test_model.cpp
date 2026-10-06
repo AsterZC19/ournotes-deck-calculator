@@ -103,6 +103,7 @@ std::string formation_text(int64_t leader, const std::vector<Slot> &slots, bool 
 
 const char *kMinimalProblem = R"JSON({
   "schema": "ournotes-deck-problem@1",
+  "input_mode": "experimental",
   "song": {"id": 1, "title": "t", "type": 1},
   "chart": {"difficulty": "expert", "level": 20, "notes": [{"t": 0, "op": 1}], "skill_times_ms": [1000]},
   "catalog": {

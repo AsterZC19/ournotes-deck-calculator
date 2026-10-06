@@ -457,11 +457,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 stats.score_bound_enabled = score_bound.enabled;
             }
         }
-        if (score_bound.enabled && engine.members().size() <= 64 &&
-            engine.snapshots().size() <= 64 &&
-            std::all_of(engine.members().begin(), engine.members().end(),
-                        [](const Member *m) { return m->character >= 0 && m->character < 64; }) &&
-            !expired()) {
+        if (score_bound.enabled && engine.team_size() <= 8 && !expired()) {
             RankOptions bound_options = options;
             bound_options.method = "exact";
             bound_options.objective = "theoretical_score";
@@ -956,10 +952,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
         retain(state.f, state.pt, state.drop);
     };
     const bool seed_scope =
-        engine.members().size() <= 64 && engine.snapshots().size() <= 64 &&
-        engine.team_size() <= 8 &&
-        std::all_of(engine.members().begin(), engine.members().end(),
-                    [](const Member *m) { return m->character >= 0 && m->character < 64; });
+        engine.team_size() <= 8 && std::all_of(engine.members().begin(), engine.members().end(),
+                                               [](const Member *m) { return m->character >= 0; });
     if (!fixed_rank && seed_scope && !expired()) {
         RankOptions seed_options = options;
         seed_options.method = "fast";
@@ -1188,6 +1182,7 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         throw SpecError("活动搜索未找到满足约束的完整组队，请增加 time-limit 或检查约束");
     Json out = Json::object();
     out.set("schema", Json("ournotes-event-plan@1"));
+    out.set("input_mode", Json(engine.problem().input_mode));
     Json normal_assumptions = na;
     if (!na.find("cp_boost_rate"))
         normal_assumptions.set(

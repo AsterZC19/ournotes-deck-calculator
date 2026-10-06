@@ -363,7 +363,7 @@ const Json &settings_defaults() {
         out.set("support_level", Json(5));
         out.set("duration_extension_effect_type", Json(static_cast<int64_t>(15000)));
         out.set("type_link_bonus_source", Json("snapshot"));
-        out.set("leader_unmapped_effect_types", Json("ignore"));
+        out.set("leader_unmapped_effect_types", Json("error"));
         out.set("leader_effect_axes", axes);
         out.set("skill", skill);
         out.set("power_model", power);
@@ -390,8 +390,8 @@ Json deep_defaults(const Json *value, const Json &defaults, const Path &path, bo
             if (raw != nullptr && raw->is_null()) {
                 raw = nullptr;
             }
-            out.set(entry.first,
-                    deep_defaults(raw, entry.second, child(path, entry.first), allow_extra));
+            out.set(entry.first, deep_defaults(raw, entry.second, child(path, entry.first),
+                                               allow_extra || entry.first == "leader_effect_axes"));
         }
         if (!allow_extra) {
             for (const auto &entry : data.fields()) {
@@ -920,6 +920,8 @@ Target parse_target(const Json &data, const Path &path) {
     target.band = static_cast<int>(int_default(object, "band", 0, child(path, "band")));
     target.card_type =
         static_cast<int>(int_default(object, "card_type", 0, child(path, "card_type")));
+    target.music_type =
+        static_cast<int>(int_default(object, "music_type", 0, child(path, "music_type")));
     target.tag = static_cast<int>(int_default(object, "tag", 0, child(path, "tag")));
     target.gekisou_mission_type = static_cast<int>(
         int_default(object, "gekisou_mission_type", 0, child(path, "gekisou_mission_type")));
@@ -1280,6 +1282,9 @@ Problem parse_problem(const Json &document) {
              "不支持的版本 " + json_repr(*schema) + "，需要 " + std::string(kSchemaProblem) + "");
     }
     Problem problem;
+    problem.input_mode = str_or(data, "input_mode", "game", "input_mode");
+    if (problem.input_mode != "game" && problem.input_mode != "experimental")
+        fail("input_mode", "必须为 game/experimental");
     problem.song = parse_song(object_or_empty(member_ptr(data, "song")), "song");
     problem.chart = parse_chart(member_ptr(data, "chart"), "chart");
     problem.catalog = parse_catalog(member_ptr(data, "catalog"), "catalog");
@@ -1293,6 +1298,49 @@ Problem parse_problem(const Json &document) {
 
 void Problem::validate() const {
     const int team_size = settings.team_size;
+    if (input_mode == "game") {
+        if (team_size != 5)
+            fail("settings.team_size", "游戏编队必须恰好 5 人；模拟输入需使用 experimental 模式");
+        if (!constraints.distinct_characters || !constraints.distinct_snapshots)
+            fail("constraints", "游戏编队不能关闭角色或 Snapshot 去重");
+        if (settings.power.rounding != "float32_floor" ||
+            settings.score.rounding != "float32_floor" || !settings.score.level_alpha ||
+            *settings.score.level_alpha != 0.005 || settings.score.level_base != 5 ||
+            settings.score.adjustment_factor != 3 || settings.base_duration_ms != 5000 ||
+            settings.type_link_bonus_source != "snapshot" ||
+            settings.duration_extension_effect_type != 15000 ||
+            !settings.power.extra_sources.empty() || !settings.power.snapshot ||
+            !settings.power.type_link || !settings.power.band_item || !settings.power.music_type ||
+            !settings.power.music_tag || !settings.power.leader || !settings.power.vip ||
+            settings.skill.live_effect_type || settings.skill.live_effect_branch != "max" ||
+            settings.leader_unmapped_effect_types != "error" || settings.live_level > 5 ||
+            settings.leader_level > 5 || settings.support_level > 5)
+            fail("settings", "自定义计分、加成来源或技能规则只允许 experimental 模式");
+        const std::map<std::string, double> factors{{"perfect", 1}, {"great", 0.8}, {"good", 0.5},
+                                                    {"bad", 0},     {"miss", 0},    {"just", 2.3},
+                                                    {"secret", 3}};
+        if (settings.judgement.factors != factors || settings.judgement.default_factor != 0 ||
+            settings.life.onus_factor != 0.3 || settings.life.mode != "constant" ||
+            settings.gekisou.enabled || settings.assist.score_percent != 90)
+            fail("settings", "自定义判定倍率或尚未完整支持的生命/激奏模型需要 experimental 模式");
+        for (const auto &member : catalog.members) {
+            for (auto value : member.trained)
+                if (value < 0)
+                    fail("catalog.members", "成员属性必须非负");
+            if ((member.live_skill_level && *member.live_skill_level > 5) ||
+                (member.leader_skill_level && *member.leader_skill_level > 5))
+                fail("catalog.members", "技能等级必须在 1..5");
+        }
+        for (const auto &snapshot : catalog.snapshots)
+            for (const auto &[id, level] : snapshot.support_skill_levels)
+                if (level > 5)
+                    fail("catalog.snapshots", "支援技能等级必须在 1..5");
+        const std::map<int, std::string> axes{
+            {1000, "all"}, {1001, "technique"}, {1002, "visual"}, {1003, "performance"}};
+        for (const auto &[type, axis] : settings.leader_effect_axes)
+            if (!axes.count(type) || axes.at(type) != axis)
+                fail("settings.leader_effect_axes", "自定义队长效果映射只允许 experimental 模式");
+    }
     if (static_cast<int>(chart.skill_times_ms.size()) != team_size) {
         fail("chart.skill_times_ms", "长度必须是 team_size=" + std::to_string(team_size) +
                                          "，实际是 " + std::to_string(chart.skill_times_ms.size()));
@@ -1606,6 +1654,7 @@ Json Problem::describe() const {
 
     Json out = Json::object();
     out.set("song", song_json);
+    out.set("input_mode", Json(input_mode));
     out.set("chart", chart_json);
     out.set("catalog", catalog_json);
     out.set("available", available);
@@ -1690,7 +1739,8 @@ void Formation::validate(const Problem &problem) const {
     }
     std::set<int64_t> members;
     for (const Slot &slot : slots) {
-        members.insert(slot.member);
+        if (!members.insert(slot.member).second)
+            fail("formation.slots", "编成中出现重复成员卡");
     }
     if (members.find(leader) == members.end()) {
         fail("formation.leader", "队长 " + std::to_string(leader) + " 不在编成中");

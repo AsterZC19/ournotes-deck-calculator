@@ -204,7 +204,16 @@ class AccountTests(unittest.TestCase):
             pp.write_text(json.dumps(p))
             ff.write_text(json.dumps(formation))
             scored = subprocess.run(
-                [str(ROOT / "build/deckcalc"), "score", "-p", str(pp), "-f", str(ff), "--detail"],
+                [
+                    str(ROOT / "build/deckcalc"),
+                    "score",
+                    "--experimental",
+                    "-p",
+                    str(pp),
+                    "-f",
+                    str(ff),
+                    "--detail",
+                ],
                 capture_output=True,
                 text=True,
                 check=True,

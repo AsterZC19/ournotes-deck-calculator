@@ -20,7 +20,7 @@ def run(command, problem, formation=None, challenge=None, **flags):
     with tempfile.TemporaryDirectory() as folder:
         path = Path(folder) / "problem.json"
         path.write_text(json.dumps(problem))
-        args = [str(BINARY), command, "-p", str(path), "--quiet"]
+        args = [str(BINARY), command, "--experimental", "-p", str(path), "--quiet"]
         if command == "rank" and "objective" not in flags:
             args += ["--objective", "index"]
         if challenge is not None:
@@ -72,6 +72,7 @@ def problem():
     ]
     return {
         "schema": "ournotes-deck-problem@1",
+        "input_mode": "experimental",
         "song": {"id": 1, "type": 1},
         "chart": {
             "difficulty": "expert",

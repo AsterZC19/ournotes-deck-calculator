@@ -22,7 +22,7 @@ inline constexpr const char *kSchemaFormation = "ournotes-deck-formation@1";
 inline constexpr const char *kSchemaResult = "ournotes-deck-result@1";
 inline constexpr const char *kModelId = "ournotes-index@1";
 inline constexpr const char *kToolName = "ournotes-deck-calculator";
-inline constexpr const char *kToolVersion = "0.2.0";
+inline constexpr const char *kToolVersion = "0.3.0";
 
 using Triple = std::array<int64_t, 3>;
 
@@ -128,6 +128,7 @@ struct Target {
     int card_type = 0;
     int tag = 0;
     int gekisou_mission_type = 0;
+    int music_type = 0;
     std::vector<int> live_skill_categories;
     std::vector<int> gekisou_skill_categories;
 };
@@ -250,7 +251,7 @@ struct Settings {
     int support_level = 5;
     int duration_extension_effect_type = 15000;
     std::string type_link_bonus_source = "snapshot";
-    std::string leader_unmapped_effect_types = "ignore";
+    std::string leader_unmapped_effect_types = "error";
     std::map<int, std::string> leader_effect_axes;
     SkillSettings skill;
     PowerModel power;
@@ -287,6 +288,7 @@ struct SearchSettings {
 };
 
 struct Problem {
+    std::string input_mode = "game";
     Song song;
     ChartSpec chart;
     Catalog catalog;

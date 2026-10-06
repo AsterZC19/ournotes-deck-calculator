@@ -26,6 +26,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("-p", "--problem", type=Path, required=True)
     parser.add_argument("-o", "--output-dir", type=Path, required=True)
+    parser.add_argument("--experimental", action="store_true")
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument(
         "--warm-start", type=Path, help="Prior rank/topk results, always revalidated and rescored"
@@ -107,6 +108,8 @@ def main():
                 "-o",
                 str(proof),
             ]
+            if args.experimental:
+                command += ["--experimental"]
             if candidate_bank:
                 seeds = out / f"warm-before-{rank:02d}.json"
                 save(seeds, {"results": candidate_bank})
@@ -156,6 +159,7 @@ def main():
                     str(fp),
                     "--order-search",
                     "given",
+                    *(["--experimental"] if args.experimental else []),
                 ],
                 text=True,
             )

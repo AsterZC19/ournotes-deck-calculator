@@ -19,6 +19,7 @@ def calculate(p, warm=None, excluded=(), method="exact", top=1):
         cmd = [
             str(ROOT / "build/deckcalc"),
             "rank",
+            "--experimental",
             "-p",
             str(problem),
             "--method",

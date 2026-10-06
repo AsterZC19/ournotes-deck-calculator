@@ -37,7 +37,11 @@ public:
     bool target_matches(const Target &target, const Member &member) const;
     bool condition_group_matches(int group, const Member &member) const;
     double live_boost(const Member &member) const;
-    Triple leader_bonus_bp(const Member &leader, const Member &member) const;
+    Triple leader_bonus_bp(const Member &leader, const Member &member,
+                           const std::vector<const Member *> *team = nullptr) const;
+    bool formation_leader_conditions() const;
+    bool leader_condition_matches(int group, const Member &member,
+                                  const std::vector<const Member *> *team) const;
     int64_t duration_ms(const Member &member, const Snapshot &snapshot) const;
 
     const std::map<std::pair<int64_t, int>, std::pair<int, int64_t>> &
@@ -183,8 +187,10 @@ public:
     int64_t duration_ms(int member_index, int snapshot_index) const;
     double live_boost(int member_index) const;
 
-    int64_t slot_power(size_t leader_index, size_t member_index, size_t snapshot_index) const;
-    Json slot_breakdown(size_t leader_index, size_t member_index, size_t snapshot_index) const;
+    int64_t slot_power(size_t leader_index, size_t member_index, size_t snapshot_index,
+                       const std::vector<const Member *> *team = nullptr) const;
+    Json slot_breakdown(size_t leader_index, size_t member_index, size_t snapshot_index,
+                        const std::vector<const Member *> *team = nullptr) const;
 
     const std::vector<std::vector<int64_t>> &power_matrix(size_t leader_index) const;
     const std::vector<std::vector<int64_t>> &durations() const;
@@ -201,6 +207,7 @@ public:
     bool for_each_score_order(const Formation &formation,
                               const std::function<bool(const Evaluation &)> &visitor) const;
     Evaluation evaluate_theoretical(const Formation &formation, bool detail = false) const;
+    Evaluation evaluate_mean(const Formation &formation, bool detail = false) const;
     double theoretical_upper_bound(double power_bound, const std::vector<float> &live_bound) const;
     NativeScoreBound linear_score_bound(const std::vector<float> &live_bound) const;
 
