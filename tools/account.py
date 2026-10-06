@@ -287,7 +287,7 @@ def formation_for_deck(account: dict, deck_id: int | None = None) -> dict:
         raise AccountError("保存编队不完整或引用了未持有的卡牌")
     return {
         "schema": "ournotes-deck-formation@1",
-        "leader": slots[0]["member_id"],
+        "leader": slots[2]["member_id"],
         "slots": [
             {
                 "member": row["member_id"],

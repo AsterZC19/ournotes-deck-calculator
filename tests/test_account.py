@@ -162,8 +162,10 @@ class AccountTests(unittest.TestCase):
             }
         ]
         f = formation_for_deck(a)
-        self.assertEqual(f["leader"], 1)
+        self.assertEqual(f["leader"], 3)
         self.assertEqual([s["trigger"] for s in f["slots"]], [5, 4, 3, 2, 1])
+        a["decks"][0]["slots"].reverse()
+        self.assertEqual(formation_for_deck(a), f)
         a["decks"][0]["slots"][0]["member_id"] = 0
         with self.assertRaises(AccountError):
             formation_for_deck(a)
