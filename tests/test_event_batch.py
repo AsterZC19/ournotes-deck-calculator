@@ -38,14 +38,24 @@ def main():
     repeated = copy.deepcopy(base)
     repeated["song"]["id"] = 7
     inputs.append(repeated)
-    for method, rank_mode in (("exact", "fixed"), ("fast", "fixed"), ("exact", "estimated_score")):
+    for method, rank_mode, objective in (
+        ("exact", "fixed", "score"),
+        ("fast", "fixed", "score"),
+        ("exact", "estimated_score", "score"),
+        ("exact", "estimated_score", "mean"),
+    ):
         for p in inputs + [base]:
             p["event"]["assumptions"]["score_rank_mode"] = rank_mode
             p["event"]["score_ranks"] = [
                 {"rank": 2, "required_score": 0},
                 {"rank": 7, "required_score": 15000},
             ]
-        flags = dict(method=method, time_limit=0 if method == "exact" else 0.1, leaders="1")
+        flags = dict(
+            method=method,
+            time_limit=0 if method == "exact" else 0.1,
+            leaders="1",
+            objective=objective,
+        )
         with tempfile.TemporaryDirectory() as folder:
             paths = []
             for i, p in enumerate(inputs + [base]):

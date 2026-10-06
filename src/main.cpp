@@ -35,6 +35,7 @@ void usage() {
            "                    [--order-search exact|given]\n"
            "  deckcalc event    -p problem.json [-o out.json] [--time-limit S] [--method "
            "fast|exact]\n"
+           "                    [--objective mean|score] (默认平均收益，score 为最佳顺序收益)\n"
            "                    [--challenge-problem challenge.json] [--leaders 61,62]\n"
            "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
            "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--time-limit S]\n"
@@ -211,10 +212,10 @@ Json score_document(const Problem &problem, const Engine &engine, const Formatio
     if (args.objective_explicit &&
         (args.objective == "theoretical_score" || args.objective == "mean_score") &&
         options.order_search == "given")
-        throw SpecError("理论最高分会搜索技能顺序，不能同时使用 --order-search given");
+        throw SpecError("平均分或理论最高分需要枚举技能顺序，不能同时使用 --order-search given");
     Evaluation evaluation = args.objective_explicit && args.objective == "theoretical_score"
                                 ? engine.evaluate_theoretical(formation, args.detail)
-                            : args.objective_explicit && args.objective == "mean_score"
+                            : args.objective == "mean_score" && options.order_search != "given"
                                 ? engine.evaluate_mean(formation, args.detail)
                                 : engine.evaluate(formation, options);
 
@@ -336,7 +337,7 @@ int main(int argc, char **argv) {
                 throw SpecError("实验输入需要显式传 --experimental");
         };
         check_mode(problem);
-        if (!args.objective_explicit && problem.input_mode == "game")
+        if (!args.objective_explicit && (problem.input_mode == "game" || args.command == "event"))
             args.objective = "mean_score";
         if (args.objective == "index" && problem.input_mode == "game")
             throw SpecError("index 是实验代理目标；游戏推荐请使用 mean 或 score");

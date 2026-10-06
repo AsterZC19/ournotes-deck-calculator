@@ -58,6 +58,7 @@ struct Candidate {
     Evaluation score;
     Yield yield;
     int score_rank = 0;
+    Json rank_distribution;
 };
 double positive(const Json &j, const char *key, double fallback) {
     double n = num_field(j, key, fallback);
@@ -149,6 +150,8 @@ Json candidate_json(const Candidate &c) {
     j.set("formation", dump_formation(c.formation));
     j.set("yield", yield_json(c.yield));
     j.set("score_rank", Json(c.score_rank));
+    if (!c.rank_distribution.is_null())
+        j.set("score_rank_distribution", c.rank_distribution);
     return j;
 }
 bool dominates(const Yield &a, const Yield &b) {
@@ -247,6 +250,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
     };
     std::set<FormationKey> evaluated;
     const bool fixed_rank = rank_mode == "fixed";
+    const bool mean_rewards = options.objective == "mean_score";
     auto finalize = [&]() {
         for (auto &candidate : pool) {
             if (!candidate.score.has_estimated &&
@@ -268,12 +272,25 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 return dominates(other.yield, possible);
             });
         };
+        Yield envelope;
+        for (const auto &model : reward_models) {
+            const Yield possible = model.calculate(pt, drop);
+            envelope.cp = std::max(envelope.cp, possible.cp);
+            envelope.pt = std::max(envelope.pt, possible.pt);
+            envelope.shop = std::max(envelope.shop, possible.shop);
+        }
+        const bool envelope_dominated =
+            std::any_of(pool.begin(), pool.end(),
+                        [&](const Candidate &other) { return dominates(other.yield, envelope); });
         if (fixed_rank ? yield_dominated(reward_models[rank - 2])
-                       : std::all_of(reward_models.begin(), reward_models.end(), yield_dominated)) {
+            : mean_rewards
+                ? envelope_dominated
+                : std::all_of(reward_models.begin(), reward_models.end(), yield_dominated)) {
             ++stats.dominated_before_evaluation;
             return;
         }
-        auto retain_score = [&](Evaluation score, Formation scored_formation) {
+        auto retain_score = [&](Evaluation score, Formation scored_formation,
+                                const Yield *expected = nullptr, Json distribution = Json()) {
             if (score.index < min_index)
                 return;
             for (auto &slot : scored_formation.slots)
@@ -289,8 +306,10 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                         int_field(row, "rank") > result_rank)
                         result_rank = int_field(row, "rank");
             }
-            Yield realized = reward_models[result_rank - 2].calculate(pt, drop);
-            Candidate c{scored_formation, std::move(score), realized, result_rank};
+            Yield realized =
+                expected ? *expected : reward_models[result_rank - 2].calculate(pt, drop);
+            Candidate c{scored_formation, std::move(score), realized, expected ? 0 : result_rank,
+                        std::move(distribution)};
             bool dominated = false;
             for (const auto &other : pool)
                 if (dominates(other.yield, c.yield)) {
@@ -318,6 +337,70 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
         if (fixed_rank) {
             ++stats.index_evaluations;
             retain_score(engine.evaluate(formation, evaluation_options), formation);
+            return;
+        }
+        if (mean_rewards) {
+            Yield sum;
+            int count = 0;
+            double score_sum = 0;
+            double maximum = -std::numeric_limits<double>::infinity();
+            double minimum = std::numeric_limits<double>::infinity();
+            bool feasible = true;
+            std::map<int, int> ranks;
+            Evaluation representative;
+            const bool finished =
+                engine.for_each_score_order(formation, [&](const Evaluation &score) {
+                    if (expired())
+                        return false;
+                    ++stats.index_evaluations;
+                    ++stats.absolute_score_evaluations;
+                    if (score.index < min_index)
+                        feasible = false;
+                    const double total = num_field(score.estimated_score, "total");
+                    int achieved = 2;
+                    for (const auto &row : rank_rows->items())
+                        if (total >= num_field(row, "required_score"))
+                            achieved = std::max(achieved, static_cast<int>(int_field(row, "rank")));
+                    const Yield y = reward_models[achieved - 2].calculate(pt, drop);
+                    sum.cp += y.cp;
+                    sum.pt += y.pt;
+                    sum.shop += y.shop;
+                    score_sum += total;
+                    ++ranks[achieved];
+                    if (total > maximum)
+                        representative = score;
+                    maximum = std::max(maximum, total);
+                    minimum = std::min(minimum, total);
+                    ++count;
+                    return true;
+                });
+            if (!finished) {
+                complete = false;
+                return;
+            }
+            if (count == 0 || !feasible)
+                return;
+            sum.cp /= count;
+            sum.pt /= count;
+            sum.shop /= count;
+            representative.ranking_objective = "mean_score";
+            representative.ranking_score = score_sum / count;
+            representative.order_analysis = Json::object();
+            representative.order_analysis.set("activation_order", Json("random_permutation"));
+            representative.order_analysis.set("best_order_is_controllable", Json(false));
+            representative.order_analysis.set("mean_score", Json(score_sum / count));
+            representative.order_analysis.set("best_score", Json(maximum));
+            representative.order_analysis.set("worst_score", Json(minimum));
+            representative.order_analysis.set("score_permutations", Json(count));
+            representative.order_analysis.set("order_search_complete", Json(true));
+            Json distribution = Json::array();
+            for (const auto &[achieved, occurrences] : ranks) {
+                Json row = Json::object();
+                row.set("rank", Json(achieved));
+                row.set("probability", Json(double(occurrences) / count));
+                distribution.push_back(std::move(row));
+            }
+            retain_score(std::move(representative), formation, &sum, std::move(distribution));
             return;
         }
         if (!engine.for_each_score_order(formation, [&](const Evaluation &score) {
@@ -364,6 +447,18 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             if (fixed_rank)
                 return covered(reward_models[rank - 2].calculate(pt, drop));
             upper_score = std::min(upper_score, stats.score_ceiling);
+            if (mean_rewards) {
+                Yield envelope;
+                for (const auto &[rank, threshold] : reward_thresholds) {
+                    if (threshold > upper_score)
+                        continue;
+                    const Yield y = reward_models[rank - 2].calculate(pt, drop);
+                    envelope.cp = std::max(envelope.cp, y.cp);
+                    envelope.pt = std::max(envelope.pt, y.pt);
+                    envelope.shop = std::max(envelope.shop, y.shop);
+                }
+                return covered(envelope);
+            }
             for (const auto &[rank, threshold] : reward_thresholds)
                 if (threshold <= upper_score &&
                     !covered(reward_models[rank - 2].calculate(pt, drop)))
@@ -659,6 +754,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             const double upper_score = score_upper(completion_gain(future_gain));
             if (covered_score(upper_score))
                 return true;
+            if (mean_rewards)
+                return false;
             if (remaining < 2 || depth > 2)
                 return false;
             ++stats.coupled_bound_nodes;
@@ -1101,6 +1198,7 @@ struct EventSearchCache::Impl {
     struct Entry {
         std::weak_ptr<const int> identity;
         std::string phase;
+        std::string objective;
         std::vector<int64_t> leaders;
         std::vector<Candidate> candidates;
         PhaseSearchStats proof;
@@ -1126,6 +1224,8 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         throw SpecError("event 需要 problem.event，使用 Master 导入器生成");
     if (options.method != "fast" && options.method != "auto" && options.method != "exact")
         throw SpecError("未知活动 method");
+    if (options.objective != "mean_score" && options.objective != "theoretical_score")
+        throw SpecError("活动 objective 必须为 mean/score");
     if (!std::isfinite(options.time_limit_s) || options.time_limit_s < 0)
         throw SpecError("活动 time-limit 必须为非负数");
     const Engine &challenge_model = challenge_engine ? *challenge_engine : engine;
@@ -1155,7 +1255,7 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         const auto identity = model.cache_identity().lock();
         for (const auto &entry : entries) {
             if (entry.identity.lock() == identity && entry.phase == phase &&
-                entry.leaders == leaders) {
+                entry.objective == options.objective && entry.leaders == leaders) {
                 ++cache->impl_->hits;
                 complete = true;
                 stats.phase_cache_hit = true;
@@ -1170,8 +1270,8 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         if (complete) {
             if (entries.size() >= 64)
                 entries.erase(entries.begin());
-            entries.push_back(
-                {model.cache_identity(), phase, std::move(leaders), candidates, stats});
+            entries.push_back({model.cache_identity(), phase, options.objective, std::move(leaders),
+                               candidates, stats});
         }
         return candidates;
     };
@@ -1183,6 +1283,8 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     Json out = Json::object();
     out.set("schema", Json("ournotes-event-plan@1"));
     out.set("input_mode", Json(engine.problem().input_mode));
+    out.set("reward_objective",
+            Json(options.objective == "mean_score" ? "mean_reward" : "best_order_reward"));
     Json normal_assumptions = na;
     if (!na.find("cp_boost_rate"))
         normal_assumptions.set(
@@ -1252,7 +1354,24 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
             best_cp = &x;
     recommended.set("cp", best_cp ? candidate_json(*best_cp) : Json());
     out.set("recommended", std::move(recommended));
-    if (na.find("normal_runs")) {
+    bool deterministic_cp = true;
+    for (const auto &candidate : normal) {
+        if (candidate.rank_distribution.is_null())
+            continue;
+        const auto &rows = candidate.rank_distribution.items();
+        double first = -1;
+        // CP depends only on rank and the selected cards. Recover each rank's CP
+        // from the expectation only when all supported ranks share the same base CP.
+        for (const auto &row : rows) {
+            const double cp = value(engine.problem().raw.at("event").at("normal").at("cp"),
+                                    int_field(row, "rank"), "value");
+            if (first < 0)
+                first = cp;
+            else if (first != cp)
+                deterministic_cp = false;
+        }
+    }
+    if (na.find("normal_runs") && deterministic_cp) {
         double count = positive(na, "normal_runs", 0), initial = positive(na, "initial_cp", 0);
         if (count != std::floor(count) || initial != std::floor(initial))
             throw SpecError("normal_runs/initial_cp 必须为非负整数");
@@ -1288,6 +1407,12 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     }
     out.set("cycles", std::move(cycles));
     Json warnings = Json::array();
+    if (na.find("normal_runs") && !deterministic_cp)
+        warnings.push_back(Json("平均模式下 CP 随技能顺序变化；暂不提供有限预算计划，避免对平均 CP "
+                                "取整导致错误。cycles 提供长期期望收益。"));
+    if (options.objective == "mean_score")
+        warnings.push_back(Json("平均收益按每种技能顺序分别确定分数档位、取整奖励，再求平均；单局收"
+                                "益可能不同。score_rank=0 表示档位分布。"));
     warnings.push_back(
         Json("exact 完成表示已搜索或通过安全上界排除指定范围内的合法成员/Snapshot 组合；fixed 按 "
              "AP index "

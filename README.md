@@ -37,7 +37,7 @@ python3 tools/compile_from_master.py \
   --formation-output output/main-deck.json
 ```
 
-省略 `--songs` 时生成该期全部课题曲。`--formation-output` 可选，默认转换当前编队；`--deck-id 7` 可选择其他保存编队。技能序号会从游戏的 0–4 转换为计算器的 1–5。
+省略 `--songs` 时生成该期全部课题曲。`--formation-output` 可选，默认转换当前编队；`--deck-id 7` 可选择其他保存编队。队长取中间的第 3 个槽位（游戏 index=2）；技能序号会从游戏的 0–4 转换为计算器的 1–5。
 
 普通曲使用 `--song-context normal`；课题曲使用 `--song-context challenge`，应用活动综合力加成。账号模式需要匹配的 Master 和谱面，不能与 `--ideal-*`、`--band-item-bp` 混用。账号文件和计算结果可分别放在已忽略的 `imports/`、`output/` 目录。
 
@@ -81,9 +81,11 @@ python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10
   --challenge-problem challenge.json --method exact --time-limit 0 -o batch.json
 ```
 
-活动精确搜索使用 `--method exact --time-limit 0`；`optimality_certified` 表示输入歌曲、卡池和队长范围内的收益最优已证明，限时未完成时为 `false`。收益按最佳技能顺序比较。
+活动推荐默认优化随机技能顺序的平均收益：每种顺序分别计算分数档位和取整后的活动点、CP、道具奖励，再求平均，不以平均分直接换算奖励。输出 `reward_objective: mean_reward`，并提供 `score_rank_distribution`（此时 `score_rank=0`）；`yield` 表示期望收益，单局可能不同。`fixed` 档位模式仍以输入指定档位为条件，奖励不随技能顺序改变。
 
-`--objective mean` 优化全部 120 种技能顺序的算术平均分；`--objective score` 优化其中的最高分。正常输入的 `rank` 默认使用 `mean`。两者都保留 `mean_score`、`best_score` 和 `worst_score`，技能顺序随机、最佳顺序不可控制。
+活动精确搜索使用 `--method exact --time-limit 0`；`optimality_certified` 表示输入歌曲、卡池和队长范围内的当前收益目标最优已证明，限时未完成时为 `false`。显式传 `--objective score` 可比较最佳技能顺序收益，输出 `reward_objective: best_order_reward`。`cycles` 表示长期平均收益；平均模式中若 CP 随顺序变化，暂不输出有限预算计划，以免对平均 CP 取整造成错误。
+
+`rank`/`score` 的 `--objective mean` 计算全部 120 种技能顺序的算术平均分；`--objective score` 计算其中的理论最高分。正常输入默认使用 `mean`；`score --order-search given` 可复算指定顺序。两者都保留 `mean_score`、`best_score` 和 `worst_score`，技能顺序随机、最佳顺序不可控制。
 
 `ranking_score` 对应当前目标。精确搜索完成后，`audit.mean_score_certified` 或 `audit.theoretical_max_certified` 标记模型内第一名已证明；普通 `--top 10` 的其他名次仍是候选。平均分使用最高分的安全上界剪枝，可能需要更长时间证明最优；限时中断和快速搜索只提供候选。
 
@@ -103,7 +105,7 @@ python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10
 
 实验模式允许 1–8 人、自定义计分和去重设置，但始终禁止同一张成员卡重复。小规模穷举测试已迁入实验模式；输出标明 `input_mode`。`--experimental` 不会放宽标记为 `game` 的输入。旧输入如有 `leader_unmapped_effect_types: "ignore"`，游戏模式需改为 `"error"`；其他实验设置需显式迁移。使用实验输入运行 `prove_top_k.py` 时也必须传 `--experimental`。
 
-生命变化、竞技激奏和 CP 奖励的未校准部分没有因本次修改变成完整客户端模型；活动收益仍按最佳技能顺序比较。新增平均分目标用于 `rank` 和显式 `score --objective mean`，不代表已实现活动奖励的期望值优化。
+生命变化、竞技激奏和奖励的未校准部分没有因本次修改变成完整客户端模型。平均分及活动平均收益仍基于 AP、恒定生命和技能顺序等概率的假设。
 
 ## 许可证
 

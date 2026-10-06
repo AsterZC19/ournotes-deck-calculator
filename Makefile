@@ -32,6 +32,7 @@ test: $(BUILD)/deckcalc $(TEST_BINS)
 	python3 -m unittest discover -s tests -p test_account.py
 	python3 -m unittest discover -s tests -p test_normal_context.py
 	python3 tests/test_event.py
+	python3 tests/test_event_mean.py
 	python3 tests/test_event_bounds.py
 	python3 tests/test_event_batch.py
 	python3 tests/test_event_coupling.py

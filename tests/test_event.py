@@ -23,6 +23,8 @@ def run(command, problem, formation=None, challenge=None, **flags):
         args = [str(BINARY), command, "--experimental", "-p", str(path), "--quiet"]
         if command == "rank" and "objective" not in flags:
             args += ["--objective", "index"]
+        if command == "event" and "objective" not in flags:
+            args += ["--objective", "score"]
         if challenge is not None:
             other = Path(folder) / "challenge.json"
             other.write_text(json.dumps(challenge))
@@ -32,6 +34,8 @@ def run(command, problem, formation=None, challenge=None, **flags):
             f.write_text(json.dumps(formation))
             args += ["-f", str(f)]
         for key, value in flags.items():
+            if value is None:
+                continue
             args += ["--" + key.replace("_", "-")]
             if value is not True:
                 args += [str(value)]
