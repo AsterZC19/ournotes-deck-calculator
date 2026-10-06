@@ -1360,8 +1360,7 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
             continue;
         const auto &rows = candidate.rank_distribution.items();
         double first = -1;
-        // CP depends only on rank and the selected cards. Recover each rank's CP
-        // from the expectation only when all supported ranks share the same base CP.
+        // Finite budgets require CP to be constant across reachable ranks.
         for (const auto &row : rows) {
             const double cp = value(engine.problem().raw.at("event").at("normal").at("cp"),
                                     int_field(row, "rank"), "value");

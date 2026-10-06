@@ -1,28 +1,7 @@
 # Vendored from https://github.com/empty-sekai/nnnotes @ cc43e132875206d02d8665b19c06b27255ab0037 (MIT).
 # Original filename: chart_converter.py. Full license text: nnnotes-LICENSE (same directory).
-# Everything below this header is a byte-identical copy of that file.
-# Adapted from empty-sekai/nnnotes, commit cc43e132875206d02d8665b19c06b27255ab0037.
 # Copyright (c) 2026 MetaMiku, emptysekai; MIT license in nnnotes-LICENSE.
-"""Live chart (MusicScore) extraction and a re-implementation of the game's chart converter.
-
-Each function follows the game method named in its docstring. The pipeline,
-as in the game:
-
-    MusicScoreLoader.Load            (gunzip when the bytes start 1F 8B)
-      SsRootDeserializer             (JSON -> SsRoot, field defaults)          -> parse()
-      SsTickConverter                (tick -> bar position / ms)               -> TickConverter
-      SsMusicScoreConverter          (SsNote -> NoteInfoData, merges, lines)   -> _build_note_infos()
-      MusicScoreNoteCreator          (NoteInfoData -> notes, slide combo ticks)-> _Creator
-      MusicScoreUtility.GetTimeMsFromBar (note time, float32)                  -> time_ms_from_bar()
-
-`convert()` returns the runtime note list (the notes the game puts in
-MusicScore.NoteDictionary, including SlideComboNote ticks), the note lines and
-the events. `extract()` writes the shipped chart, the converted notes, the
-master rows and the decoded song for one music/difficulty.
-
-Game resources are only read from the user's own catalog/cache and written to
-the user's output directory.
-"""
+"""Convert shipped MusicScore charts to runtime notes and events."""
 from __future__ import annotations
 
 import gzip
@@ -77,7 +56,7 @@ GUIDE_BEGIN_OPS = {100, 101, 102, 104}
 GUIDE_END_OPS = {103, 105}
 
 
-# --------------------------------------------------------------------------- numeric helpers
+# numeric helpers
 def net_round(x: float) -> float:
     """System.Math.Round(double) (MidpointRounding.ToEven) exactly as the inlined IL2CPP code does it."""
     x = float(x)
@@ -138,7 +117,7 @@ def mathf_approximately(a: float, b: float) -> bool:
     return bool(abs(f32(b - a)) < tol)
 
 
-# --------------------------------------------------------------------------- SsRoot (ReadNote/ReadEvents)
+# SsRoot (ReadNote/ReadEvents)
 @dataclass
 class SsNote:
     type: int = 0            # SsNoteType, default Tap
@@ -256,7 +235,7 @@ def parse(root: dict) -> tuple[SsEvents, list[SsNote]]:
     return ev, notes
 
 
-# --------------------------------------------------------------------------- SsTickConverter
+# SsTickConverter
 @dataclass(frozen=True)
 class BarPos:
     bar: int
@@ -337,7 +316,7 @@ class TickConverter:
         return seg[0] + (bar - seg[1]) * seg[2]
 
 
-# --------------------------------------------------------------------------- runtime positions/events
+# runtime positions/events
 @dataclass
 class Pos:
     """MusicScorePosition."""
@@ -448,7 +427,7 @@ def overlap_key(t: int, pos, size) -> tuple:
     return (t, net_round_int(float(pos)), net_round_int(float(size)))
 
 
-# --------------------------------------------------------------------------- NoteInfoData
+# NoteInfoData
 @dataclass
 class NoteInfo:
     bar: int
@@ -662,7 +641,7 @@ def _priority(op: int) -> int:
     return 10
 
 
-# --------------------------------------------------------------------------- MusicScoreNoteCreator
+# MusicScoreNoteCreator
 @dataclass(eq=False)
 class Note:
     id: int
@@ -888,7 +867,7 @@ def lane_position(pos: Pos, a: Note, b: Note) -> tuple:
             f32(a.lane_end_f + f32(e * f32(b.lane_end_f - a.lane_end_f))))
 
 
-# --------------------------------------------------------------------------- convert
+# convert
 def convert(root: dict, mirror: bool = False, start_note_id: int = 0) -> dict:
     """SsMusicScoreConverter.Load -> plain dict of the runtime score."""
     ev, notes = parse(root)

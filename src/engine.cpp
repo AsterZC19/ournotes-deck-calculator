@@ -1021,8 +1021,7 @@ bool Rules::leader_condition_matches(int group_id, const Member &member,
     const auto group = index_.condition_group_by_group.find(group_id);
     if (group == index_.condition_group_by_group.end())
         throw SpecError("未知队长技能条件组 " + std::to_string(group_id));
-    // The static leader controller requires all referenced conditions. Unlike
-    // support target conditions, these include whole-formation predicates.
+    // Static leader conditions use conjunction, including formation predicates.
     bool result = true;
     for (const auto &row : group->second->rows)
         for (auto id : row) {
@@ -1045,8 +1044,7 @@ bool Rules::leader_condition_matches(int group_id, const Member &member,
             if (condition.type == 5000)
                 value = matches(member);
             else if (condition.type == 3000 || condition.type == 3001) {
-                // Unknown future members are relaxed for search upper bounds.
-                // Both positive and negated predicates may eventually be true.
+                // Relax either polarity until the formation is known, for safe bounds.
                 if (!team) {
                     for (auto id : condition.targets)
                         require_target(index_, id);

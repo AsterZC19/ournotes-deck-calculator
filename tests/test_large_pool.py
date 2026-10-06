@@ -91,8 +91,7 @@ def main():
 
     small = event_problem()
     p = expand(small, 65)
-    # Require the useful cards/photos to keep this event proof tiny while its
-    # rank-seed and score-ceiling searches still see the full selected catalog.
+    # Keep event enumeration small while seed/bound searches retain the full pool.
     for model in (small, p):
         model.setdefault("constraints", {"distinct_characters": True, "distinct_snapshots": True})
         model["constraints"]["required_members"] = [1, 3]

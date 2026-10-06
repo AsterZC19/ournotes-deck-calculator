@@ -19,8 +19,7 @@ namespace {
 constexpr int kMaxTeam = 8;
 constexpr double kEps = 1e-12;
 
-// Store only selected slots, so membership checks and keys do not depend on
-// the catalog size or on the numeric character IDs.
+// Selected slots only: independent of catalog size and character IDs.
 struct SelectionSet {
     std::array<int, kMaxTeam> values{};
     int size = 0;

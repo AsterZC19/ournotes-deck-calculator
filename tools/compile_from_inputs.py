@@ -1,9 +1,4 @@
-"""把编译好的 ``inputs.json`` 转成 problem JSON。
-
-    python3 tools/compile_from_inputs.py \
-        --inputs /path/to/inputs.json --song 100109 --difficulty expert \
-        --output problem.json
-"""
+"""把 inputs.json 转成 problem JSON。"""
 
 from __future__ import annotations
 

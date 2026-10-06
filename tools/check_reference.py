@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""核对参考榜单首位配队的数值。
-
-    python3 tools/check_reference.py \
-        --reference-dir /path/to/our-notes-event-20260930 \
-        --binary build/deckcalc
-
-参考目录里需要 inputs.json 与 results-<song>-<difficulty>.json。缺少就跳过并返回 0。
-"""
+"""核对参考榜单首位配队；缺少参考文件时跳过。"""
 
 from __future__ import annotations
 

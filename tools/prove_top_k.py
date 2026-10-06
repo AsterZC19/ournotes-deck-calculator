@@ -186,13 +186,11 @@ def main():
             flush=True,
         )
     lines = [
-        f'# {problem["song"].get("title",problem["song"]["id"])}：全图鉴全局前 {args.count} 名证明',
+        f'# {problem["song"].get("title",problem["song"]["id"])}：理论最高分前 {args.count} 名',
         "",
-        f'谱面：{problem["chart"]["difficulty"]} Lv.{problem["chart"]["level"]}；导入成员卡 {len(members)} 张、Snapshot {len(snaps)} 张。养成、加成及合法性约束以同目录 problem.json 为准。计分目标为 AP、恒定生命、无竞技击奏的完整理论最高分。',
+        f'{problem["chart"]["difficulty"]} Lv.{problem["chart"]["level"]}；成员 {len(members)} 张、Snapshot {len(snaps)} 张。输入见 problem.json。',
         "",
-        f"已完成 {args.count} 名逐名证明：每轮搜索全部可用队长，排除之前已证明的成员组合，在剩余卡池中证明完整取整分数最大值。不同名次按成员组合区分；同一组合内同时优化队长、Snapshot 配对和全部 120 种技能顺序。",
-        "",
-        "证明限定于输入卡池、养成、合法性规则与当前计分模型；不代表客户端所有行为均已实测校准。技能顺序随机，不能通过站位保证。",
+        "按成员组合区分名次，在输入范围内逐名证明。AP、恒定生命；技能顺序随机。",
         "",
         "| 全局名次 | 理论最高分 | 队长 | 配对与技能顺序（从左到右；★为队长） |",
         "|---:|---:|---|---|",

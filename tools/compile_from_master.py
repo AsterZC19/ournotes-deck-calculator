@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""从解包后的 Master 数据表生成 problem JSON。
-
-    python3 tools/compile_from_master.py \
-        --master-dir /path/to/master-decrypted/<CURRENT> \
-        --charts-dir /path/to/charts \
-        --event-id 1 --songs 100109 --difficulty expert \
-        --output problem.json
-
-``--charts-dir`` 放原始谱面，代码 ``0109/0109_03`` 对应 ``<charts-dir>/0109/0109_03.json``。
-``--songs`` 给多首歌时按 ``OUT-<id>-<难度>.json`` 分别写出，单首歌精确写 ``--output``。
-``--latest-dir`` 是可选表覆盖，``--event-id 0`` 关闭活动加成，
-``--ideal-level`` / ``--ideal-rank`` / ``--ideal-awake`` 指定养成档位。
-需要转换谱面时才会 import numpy。
-"""
+"""从 Master 数据表和谱面生成 problem JSON。"""
 
 from __future__ import annotations
 
@@ -204,11 +191,7 @@ def _group_row_at(
     value_key: str,
     value: int,
 ) -> Mapping[str, Any]:
-    """取某 group 下 ``value_key == value`` 的行；缺失时退回该 group 的最大行。
-
-    用于 ``--ideal-level`` / ``--ideal-rank`` / ``--ideal-awake``：覆盖值应当换成
-    *该等级对应的那一行比率*，而不是把最大行的比率按比例缩放。
-    """
+    """取某 group 下 ``value_key == value`` 的行；缺失时退回该 group 的最大行。"""
     matched = [r for r in rows if r.get(group_key) == group]
     if not matched:
         raise CompileError(f"{group_key}={group!r} 在表中没有任何行")
@@ -653,11 +636,7 @@ def build_catalog(
 
 
 def _load_convert_chart() -> Any:
-    """import 同目录下 vendored 的 convert_chart.py（MIT, empty-sekai/nnnotes）。
-
-    convert_chart 依赖 numpy，所以只有真的要转换谱面时才 import；这样本模块本身
-    保持「标准库即可 import」并且没有 import 期副作用。
-    """
+    """延迟加载谱面转换器，避免无须转换时依赖 NumPy。"""
     path = Path(__file__).resolve().parent / "convert_chart.py"
     if not path.is_file():
         raise CompileError(f"找不到谱面转换器 {path}")
@@ -751,10 +730,7 @@ def build_chart(score: Mapping[str, Any], charts_dir: Path, difficulty: str) -> 
 
 
 def _songs_for_event(tables: MasterTables, event_id: int) -> dict[int, list[Mapping[str, Any]]]:
-    """返回 {liveMusicId: [MasterChallengeMusic 行...]}。
-
-    ``event_id == 0`` 表示没有活动：收录所有被 MasterChallengeMusic 引用到的曲子。
-    """
+    """按歌曲分组课题曲；event_id=0 时包含全部活动。"""
     grouped: dict[int, list[Mapping[str, Any]]] = {}
     for task in tables.table("MasterChallengeMusic"):
         if event_id != 0 and _int(task.get("_eventId")) != event_id:
@@ -984,22 +960,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="compile_from_master.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "从本地解密的 Master 表 + 原始谱面编译 ournotes-deck-problem@1 problem JSON。\n"
-            "运行时不联网，只读用户自己的数据目录。"
-        ),
-        epilog=(
-            "输出文件规则：\n"
-            "  * --songs 只有一个 id 时，精确写入 --output；\n"
-            "  * --songs 有多个 id 时，每首歌写一个文件，在扩展名前插入歌曲 id 与难度，\n"
-            "    例如 --output OUT.json 会得到 OUT-100109-expert.json、OUT-100056-expert.json ……\n"
-            "\n"
-            "示例：\n"
-            "  python3 tools/compile_from_master.py --master-dir /path/master \\\n"
-            "      --latest-dir /path/latest --charts-dir /path/charts \\\n"
-            "      --event-id 1 --songs 100109,100056,100063 --difficulty expert \\\n"
-            "      --output OUT.json\n"
-        ),
+        description="从 Master 表和谱面生成 ournotes-deck-problem@1 JSON。",
+        epilog=("单曲写入 --output；多曲在扩展名前添加 -<song>-<difficulty>。"),
     )
     parser.add_argument(
         "--master-dir",
