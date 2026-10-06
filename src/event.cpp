@@ -17,12 +17,34 @@ struct PhaseSearchStats {
     int64_t index_evaluations = 0;
     int64_t absolute_score_evaluations = 0;
     int64_t dominated_before_evaluation = 0;
+    int64_t duplicate_formations = 0;
+    int64_t leaders_seeded = 0;
+    int64_t score_seeds = 0;
+    int64_t bound_nodes = 0, reward_pruned_branches = 0, infeasible_branches = 0;
+    int64_t seed_formations = 0, cached_snapshot_nodes = 0;
+    int64_t member_groups = 0, bounded_member_groups = 0, pruned_member_prefixes = 0;
+    bool score_bound_enabled = false;
+    double score_ceiling = std::numeric_limits<double>::infinity();
     Json to_json() const {
         Json out = Json::object();
         out.set("complete_formations", Json(complete_formations));
         out.set("index_evaluations", Json(index_evaluations));
         out.set("absolute_score_evaluations", Json(absolute_score_evaluations));
         out.set("dominated_before_evaluation", Json(dominated_before_evaluation));
+        out.set("duplicate_formations", Json(duplicate_formations));
+        out.set("leaders_seeded", Json(leaders_seeded));
+        out.set("score_seeds", Json(score_seeds));
+        out.set("bound_nodes", Json(bound_nodes));
+        out.set("reward_pruned_branches", Json(reward_pruned_branches));
+        out.set("infeasible_branches", Json(infeasible_branches));
+        out.set("seed_formations", Json(seed_formations));
+        out.set("cached_snapshot_nodes", Json(cached_snapshot_nodes));
+        out.set("member_groups", Json(member_groups));
+        out.set("bounded_member_groups", Json(bounded_member_groups));
+        out.set("pruned_member_prefixes", Json(pruned_member_prefixes));
+        out.set("score_bound_enabled", Json(score_bound_enabled));
+        out.set("score_ceiling_certified", Json(std::isfinite(score_ceiling)));
+        out.set("score_ceiling", std::isfinite(score_ceiling) ? Json(score_ceiling) : Json());
         return out;
     }
 };
@@ -190,19 +212,35 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
     }
     const auto member_bonuses = card_bonuses(engine, "members");
     const auto snapshot_bonuses = card_bonuses(engine, "snapshots");
+    const std::set<int64_t> required_member_ids(
+        engine.problem().constraints.required_members.begin(),
+        engine.problem().constraints.required_members.end());
+    const std::set<int64_t> required_snapshot_ids(
+        engine.problem().constraints.required_snapshots.begin(),
+        engine.problem().constraints.required_snapshots.end());
     std::vector<Candidate> pool;
 
     auto leaders = engine.problem().leader_candidates();
+    leaders.erase(std::remove_if(leaders.begin(), leaders.end(),
+                                 [&](const Member *m) {
+                                     return !options.leaders.empty() &&
+                                            std::find(options.leaders.begin(),
+                                                      options.leaders.end(),
+                                                      m->id) == options.leaders.end();
+                                 }),
+                  leaders.end());
     std::stable_sort(leaders.begin(), leaders.end(), [&](const Member *l, const Member *r) {
-        const auto &rows = engine.problem().raw.at("catalog").at("members");
-        auto bonus = [&](int64_t id) {
-            for (const auto &row : rows.items())
-                if (int_field(row, "id") == id)
-                    return num_field(row, "event_pt_bonus_bp");
-            return 0.0;
-        };
-        return bonus(l->id) > bonus(r->id);
+        return member_bonuses.at(l->id).pt > member_bonuses.at(r->id).pt;
     });
+    using FormationKey = std::pair<int64_t, std::vector<std::pair<int64_t, int64_t>>>;
+    auto formation_key = [](const Formation &f) {
+        FormationKey key{f.leader, {}};
+        for (const auto &slot : f.slots)
+            key.second.emplace_back(slot.member, slot.snapshot);
+        std::sort(key.second.begin(), key.second.end());
+        return key;
+    };
+    std::set<FormationKey> evaluated;
     const bool fixed_rank = rank_mode == "fixed";
     auto finalize = [&]() {
         for (auto &candidate : pool) {
@@ -214,6 +252,10 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
         }
     };
     auto retain = [&](Formation formation, double pt, double drop) {
+        if (options.method != "exact" && !evaluated.insert(formation_key(formation)).second) {
+            ++stats.duplicate_formations;
+            return;
+        }
         ++stats.complete_formations;
         auto yield_dominated = [&](const PhaseRewards &model) {
             const Yield possible = model.calculate(pt, drop);
@@ -284,174 +326,658 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             complete = false;
     };
     if (options.method == "exact") {
-        for (const Member *leader : leaders) {
-            if (!options.leaders.empty() &&
-                std::find(options.leaders.begin(), options.leaders.end(), leader->id) ==
-                    options.leaders.end())
-                continue;
-            Formation formation;
-            formation.leader = leader->id;
-            std::function<void(size_t, double, double)> visit;
-            visit = [&](size_t first, double pt, double drop) {
-                if (expired()) {
-                    complete = false;
-                    return;
+        if (engine.members().size() < static_cast<size_t>(engine.team_size()) ||
+            engine.snapshots().empty() ||
+            (engine.problem().constraints.distinct_snapshots &&
+             engine.snapshots().size() < static_cast<size_t>(engine.team_size())))
+            return pool;
+        if (engine.members().size() * engine.snapshots().size() > 64 && !expired()) {
+            RankOptions seed_options = options;
+            seed_options.method = "fast";
+            seed_options.verbose = false;
+            seed_options.progress = {};
+            PhaseSearchStats seed_stats;
+            bool seed_complete = false;
+            pool = search(engine, seed_options, phase, std::min(0.5, seconds * 0.1), seed_complete,
+                          seed_stats);
+            stats.seed_formations = seed_stats.complete_formations;
+            const auto seeds = pool;
+            for (const auto &candidate : seeds) {
+                double pt = 0, drop = 0;
+                for (const auto &slot : candidate.formation.slots) {
+                    pt += member_bonuses.at(slot.member).pt + snapshot_bonuses.at(slot.snapshot).pt;
+                    drop += member_bonuses.at(slot.member).drop +
+                            snapshot_bonuses.at(slot.snapshot).drop;
                 }
-                if (formation.slots.size() == static_cast<size_t>(engine.team_size())) {
-                    try {
-                        formation.validate(engine.problem());
-                    } catch (const SpecError &) {
-                        return;
-                    }
-                    retain(formation, pt, drop);
-                    return;
-                }
-                const bool anchor = formation.slots.empty();
-                for (size_t i = first; i < engine.members().size(); ++i) {
-                    const Member *m = engine.members()[i];
-                    if (anchor && m->id != leader->id)
-                        continue;
-                    bool legal = true;
-                    for (const auto &used : formation.slots)
-                        if (used.member == m->id ||
-                            (engine.problem().constraints.distinct_characters &&
-                             engine.index().member_by_id.at(used.member)->character ==
-                                 m->character))
-                            legal = false;
-                    if (!legal)
-                        continue;
+                for (size_t slot = 0; slot < candidate.formation.slots.size(); ++slot) {
+                    const auto &before =
+                        snapshot_bonuses.at(candidate.formation.slots[slot].snapshot);
                     for (const Snapshot *snap : engine.snapshots()) {
-                        bool free = true;
-                        for (const auto &used : formation.slots)
-                            if (engine.problem().constraints.distinct_snapshots &&
-                                used.snapshot == snap->id)
-                                free = false;
-                        if (!free)
+                        if (expired())
+                            break;
+                        const auto &after = snapshot_bonuses.at(snap->id);
+                        if (after.pt < before.pt || after.drop < before.drop ||
+                            (after.pt == before.pt && after.drop == before.drop))
                             continue;
-                        const auto &mb = member_bonuses.at(m->id);
-                        const auto &sb = snapshot_bonuses.at(snap->id);
-                        formation.slots.push_back(
-                            Slot{m->id, snap->id, static_cast<int>(formation.slots.size()) + 1});
-                        visit(anchor ? 0 : i + 1, pt + mb.pt + sb.pt, drop + mb.drop + sb.drop);
-                        formation.slots.pop_back();
-                        if (!complete)
-                            return;
+                        Formation f = candidate.formation;
+                        f.slots[slot].snapshot = snap->id;
+                        try {
+                            f.validate(engine.problem());
+                        } catch (const SpecError &) {
+                            continue;
+                        }
+                        retain(f, pt - before.pt + after.pt, drop - before.drop + after.drop);
                     }
                 }
-            };
-            visit(0, 0, 0);
-            if (!complete)
-                break;
+            }
         }
+        NativeScoreBound score_bound;
+        if (!fixed_rank) {
+            bool supported = true;
+            try {
+                engine.validate_theoretical_scope();
+            } catch (const SpecError &) {
+                supported = false;
+            }
+            if (supported) {
+                double live = 0;
+                for (double v : engine.boosts())
+                    live += v;
+                live *= 1 + (engine.members().size() + 2) * std::numeric_limits<float>::epsilon();
+                std::vector<float> live_bound(
+                    engine.chart().times.size(),
+                    std::nextafter(static_cast<float>(live),
+                                   std::numeric_limits<float>::infinity()));
+                score_bound = engine.linear_score_bound(live_bound);
+                stats.score_bound_enabled = score_bound.enabled;
+            }
+        }
+        if (score_bound.enabled && engine.members().size() <= 64 &&
+            engine.snapshots().size() <= 64 &&
+            std::all_of(engine.members().begin(), engine.members().end(),
+                        [](const Member *m) { return m->character >= 0 && m->character < 64; }) &&
+            !expired()) {
+            RankOptions bound_options = options;
+            bound_options.method = "exact";
+            bound_options.objective = "theoretical_score";
+            bound_options.top = 1;
+            bound_options.restarts = 0;
+            bound_options.anneal_steps = 0;
+            bound_options.beam_width = std::min(16, options.beam_width);
+            bound_options.verbose = false;
+            bound_options.progress = {};
+            bound_options.excluded_member_sets.clear();
+            bound_options.initial_formations.clear();
+            for (const auto &candidate : pool)
+                bound_options.initial_formations.push_back(candidate.formation);
+            bound_options.time_limit_s = std::min(0.5, seconds * 0.1);
+            const auto ceiling = rank_formations(engine, bound_options);
+            if (!ceiling.results.empty() && ceiling.audit.at("theoretical_max_certified").as_bool())
+                stats.score_ceiling = *ceiling.results[0].ranking_score;
+        }
+        auto upwards = [&](double v) {
+            return std::nextafter(
+                v * (1 + (2 * engine.team_size() + 8) * std::numeric_limits<double>::epsilon()),
+                std::numeric_limits<double>::infinity());
+        };
+        auto top_sum = [&](std::vector<double> values, int count) {
+            std::sort(values.begin(), values.end(), std::greater<double>());
+            double total = 0;
+            for (int i = 0; i < count; ++i)
+                total += values[i];
+            return upwards(total);
+        };
+        auto covered = [&](const Yield &y) {
+            return std::any_of(pool.begin(), pool.end(), [&](const Candidate &c) {
+                return c.yield.cp >= y.cp && c.yield.pt >= y.pt && c.yield.shop >= y.shop;
+            });
+        };
+        std::vector<std::pair<int, double>> reward_thresholds;
+        if (!fixed_rank)
+            for (const auto &row : rank_rows->items())
+                reward_thresholds.emplace_back(int_field(row, "rank"),
+                                               num_field(row, "required_score"));
+        auto reward_covered = [&](double pt, double drop, double upper_score) {
+            if (pool.empty())
+                return false;
+            if (fixed_rank)
+                return covered(reward_models[rank - 2].calculate(pt, drop));
+            upper_score = std::min(upper_score, stats.score_ceiling);
+            for (const auto &[rank, threshold] : reward_thresholds)
+                if (threshold <= upper_score &&
+                    !covered(reward_models[rank - 2].calculate(pt, drop)))
+                    return false;
+            return true;
+        };
+        Formation formation;
+        const Member *leader = nullptr;
+        const std::vector<std::vector<int64_t>> *power_matrix = nullptr;
+        std::vector<size_t> scoped_members;
+        std::vector<double> snapshot_pt, snapshot_drop;
+        for (const Snapshot *snap : engine.snapshots()) {
+            snapshot_pt.push_back(snapshot_bonuses.at(snap->id).pt);
+            snapshot_drop.push_back(snapshot_bonuses.at(snap->id).drop);
+        }
+        auto maximum_snapshot_sum = [&](const std::vector<double> &values) {
+            return engine.problem().constraints.distinct_snapshots
+                       ? top_sum(values, engine.team_size())
+                       : upwards(*std::max_element(values.begin(), values.end()) *
+                                 engine.team_size());
+        };
+        const double max_pt = maximum_snapshot_sum(snapshot_pt),
+                     max_drop = maximum_snapshot_sum(snapshot_drop);
+        std::vector<std::vector<double>> member_gains;
+        if (score_bound.enabled) {
+            member_gains.assign(engine.members().size(), std::vector<double>(engine.team_size()));
+            for (size_t m = 0; m < engine.members().size(); ++m)
+                for (size_t snap = 0; snap < engine.snapshots().size(); ++snap)
+                    for (int k = 0; k < engine.team_size(); ++k)
+                        member_gains[m][k] =
+                            std::max(member_gains[m][k],
+                                     score_bound.gains[m * engine.snapshots().size() + snap][k]);
+        }
+        std::vector<std::vector<double>> max_power;
+        if (score_bound.enabled) {
+            max_power.assign(leaders.size(), std::vector<double>(engine.members().size()));
+            for (size_t l = 0; l < leaders.size(); ++l) {
+                const auto &matrix = engine.power_matrix(engine.member_pos(leaders[l]->id));
+                for (size_t m = 0; m < engine.members().size(); ++m)
+                    max_power[l][m] = *std::max_element(matrix[m].begin(), matrix[m].end());
+            }
+        }
+        const size_t snapshot_count = engine.snapshots().size();
+        auto descending = [&](const auto &value) {
+            std::vector<size_t> order(snapshot_count);
+            for (size_t snap = 0; snap < snapshot_count; ++snap)
+                order[snap] = snap;
+            std::stable_sort(order.begin(), order.end(),
+                             [&](size_t a, size_t b) { return value(a) > value(b); });
+            return order;
+        };
+        const auto pt_order = descending([&](size_t snap) { return snapshot_pt[snap]; });
+        const auto drop_order = descending([&](size_t snap) { return snapshot_drop[snap]; });
+        std::vector<std::vector<std::vector<size_t>>> power_order, gain_order;
+        if (score_bound.enabled) {
+            power_order.resize(leaders.size());
+            gain_order.resize(engine.members().size());
+            for (size_t l = 0; l < leaders.size(); ++l) {
+                const auto &matrix = engine.power_matrix(engine.member_pos(leaders[l]->id));
+                for (size_t m = 0; m < engine.members().size(); ++m)
+                    power_order[l].push_back(
+                        descending([&](size_t snap) { return matrix[m][snap]; }));
+            }
+            for (size_t m = 0; m < engine.members().size(); ++m)
+                for (int k = 0; k < engine.team_size(); ++k)
+                    gain_order[m].push_back(descending([&](size_t snap) {
+                        return score_bound.gains[m * snapshot_count + snap][k];
+                    }));
+        }
+        std::vector<size_t> required_positions;
+        std::vector<unsigned> snapshot_uses(snapshot_count);
+        bool unavailable_required_snapshot = false;
+        for (int64_t id : required_snapshot_ids) {
+            auto found = std::find_if(engine.snapshots().begin(), engine.snapshots().end(),
+                                      [&](const Snapshot *snap) { return snap->id == id; });
+            if (found == engine.snapshots().end())
+                unavailable_required_snapshot = true;
+            else
+                required_positions.push_back(found - engine.snapshots().begin());
+        }
+        const size_t mask_count = score_bound.enabled ? size_t{1} << engine.team_size() : 0;
+        std::vector<std::vector<double>> selected_dp(
+            engine.team_size() + 1,
+            std::vector<double>(mask_count, -std::numeric_limits<double>::infinity()));
+        if (score_bound.enabled)
+            selected_dp[0][0] = 0;
+        std::vector<std::vector<size_t>> trigger_masks(engine.team_size() + 1);
+        for (size_t mask = 0; mask < mask_count; ++mask)
+            trigger_masks[__builtin_popcount(static_cast<unsigned>(mask))].push_back(mask);
+        std::vector<size_t> selected_snapshots(engine.team_size());
+        std::vector<double> group_pt(engine.team_size() + 1), group_drop(engine.team_size() + 1);
+        size_t selected_leader = 0;
+        double group_gain_upper = 0;
+        const bool distinct_snapshots = engine.problem().constraints.distinct_snapshots;
+        auto first_available = [&](const std::vector<size_t> &order) {
+            for (size_t snap : order)
+                if (!distinct_snapshots || !snapshot_uses[snap])
+                    return snap;
+            return snapshot_count;
+        };
+        auto snapshot_bonus = [&](const std::vector<size_t> &order,
+                                  const std::vector<double> &values, size_t remaining) {
+            if (!remaining)
+                return 0.0;
+            if (!distinct_snapshots)
+                return upwards(values[order.front()] * remaining);
+            double sum = 0;
+            for (size_t snap : order)
+                if (!snapshot_uses[snap]) {
+                    sum += values[snap];
+                    if (!--remaining)
+                        break;
+                }
+            return upwards(sum);
+        };
+        auto cached_prunable = [&](size_t depth, double pt, double drop, double selected_power) {
+            ++stats.bound_nodes;
+            ++stats.cached_snapshot_nodes;
+            const size_t remaining = engine.team_size() - depth;
+            const size_t missing_required =
+                std::count_if(required_positions.begin(), required_positions.end(),
+                              [&](size_t snap) { return !snapshot_uses[snap]; });
+            if (unavailable_required_snapshot || missing_required > remaining ||
+                (distinct_snapshots && snapshot_count - depth < remaining)) {
+                ++stats.infeasible_branches;
+                return true;
+            }
+            const double upper_pt =
+                upwards(pt + group_pt[depth] + snapshot_bonus(pt_order, snapshot_pt, remaining));
+            const double upper_drop = upwards(drop + group_drop[depth] +
+                                              snapshot_bonus(drop_order, snapshot_drop, remaining));
+            auto covered_score = [&](double score) {
+                if (!reward_covered(upper_pt, upper_drop, score))
+                    return false;
+                ++stats.reward_pruned_branches;
+                return true;
+            };
+            if (covered_score(stats.score_ceiling))
+                return true;
+            if (!score_bound.enabled)
+                return false;
+            double power = selected_power;
+            for (size_t i = depth; i < scoped_members.size(); ++i) {
+                const size_t m = scoped_members[i];
+                power += (*power_matrix)[m][first_available(power_order[selected_leader][m])];
+            }
+            const double upper_power = upwards(power);
+            auto score_upper = [&](double gain) {
+                return NativeScoreBound::upper(upper_power, upwards(gain), score_bound.base,
+                                               score_bound.max_power, engine.team_size(),
+                                               engine.chart().times.size());
+            };
+            if (covered_score(score_upper(group_gain_upper)))
+                return true;
+            auto &dp = selected_dp[depth];
+            std::fill(dp.begin(), dp.end(), -std::numeric_limits<double>::infinity());
+            const auto &last_gain = score_bound.gains[scoped_members[depth - 1] * snapshot_count +
+                                                      selected_snapshots[depth - 1]];
+            for (size_t mask : trigger_masks[depth - 1])
+                for (int k = 0; k < engine.team_size(); ++k)
+                    if (!(mask & (size_t{1} << k)))
+                        dp[mask | (size_t{1} << k)] =
+                            std::max(dp[mask | (size_t{1} << k)],
+                                     selected_dp[depth - 1][mask] + last_gain[k]);
+            std::vector<double> future_gain(engine.team_size(), 0);
+            for (size_t i = depth; i < scoped_members.size(); ++i) {
+                const size_t m = scoped_members[i];
+                for (int k = 0; k < engine.team_size(); ++k) {
+                    const size_t snap = first_available(gain_order[m][k]);
+                    future_gain[k] =
+                        std::max(future_gain[k], score_bound.gains[m * snapshot_count + snap][k]);
+                }
+            }
+            double gain = 0;
+            for (size_t mask : trigger_masks[depth]) {
+                double total = dp[mask];
+                for (int k = 0; k < engine.team_size(); ++k)
+                    if (!(mask & (size_t{1} << k)))
+                        total += future_gain[k];
+                gain = std::max(gain, total);
+            }
+            return covered_score(score_upper(gain));
+        };
+        std::function<void(size_t, double, double, double)> snapshots;
+        snapshots = [&](size_t depth, double pt, double drop, double power) {
+            if (expired()) {
+                complete = false;
+                return;
+            }
+            if (depth && cached_prunable(depth, pt, drop, power))
+                return;
+            if (depth == scoped_members.size()) {
+                formation.validate(engine.problem());
+                retain(formation, pt, drop);
+                return;
+            }
+            const size_t m = scoped_members[depth];
+            for (size_t snap = 0; snap < snapshot_count; ++snap) {
+                if (distinct_snapshots && snapshot_uses[snap])
+                    continue;
+                const auto &mb = member_bonuses.at(engine.members()[m]->id);
+                const auto &sb = snapshot_bonuses.at(engine.snapshots()[snap]->id);
+                formation.slots.push_back(Slot{engine.members()[m]->id,
+                                               engine.snapshots()[snap]->id,
+                                               static_cast<int>(depth) + 1});
+                selected_snapshots[depth] = snap;
+                ++snapshot_uses[snap];
+                snapshots(depth + 1, pt + mb.pt + sb.pt, drop + mb.drop + sb.drop,
+                          score_bound.enabled ? power + (*power_matrix)[m][snap] : 0);
+                --snapshot_uses[snap];
+                formation.slots.pop_back();
+                if (!complete)
+                    return;
+            }
+        };
+        std::vector<std::vector<double>> suffix_pt(engine.members().size() + 1),
+            suffix_drop(engine.members().size() + 1);
+        for (size_t first = 0; first <= engine.members().size(); ++first) {
+            std::vector<double> pt_values, drop_values;
+            for (size_t m = first; m < engine.members().size(); ++m) {
+                const auto &bonus = member_bonuses.at(engine.members()[m]->id);
+                pt_values.push_back(bonus.pt);
+                drop_values.push_back(bonus.drop);
+            }
+            int limit = std::min(static_cast<int>(pt_values.size()), engine.team_size());
+            for (int count = 0; count <= limit; ++count) {
+                suffix_pt[first].push_back(top_sum(pt_values, count));
+                suffix_drop[first].push_back(top_sum(drop_values, count));
+            }
+        }
+        std::function<void(size_t, double, double)> groups;
+        groups = [&](size_t first, double pt, double drop) {
+            if (expired()) {
+                complete = false;
+                return;
+            }
+            const size_t remaining = engine.team_size() - scoped_members.size();
+            if (remaining >= suffix_pt[first].size())
+                return;
+            if (remaining &&
+                reward_covered(upwards(pt + suffix_pt[first][remaining] + max_pt),
+                               upwards(drop + suffix_drop[first][remaining] + max_drop),
+                               stats.score_ceiling)) {
+                ++stats.pruned_member_prefixes;
+                return;
+            }
+            if (scoped_members.size() == static_cast<size_t>(engine.team_size())) {
+                ++stats.member_groups;
+                for (int64_t required : required_member_ids)
+                    if (std::none_of(scoped_members.begin(), scoped_members.end(),
+                                     [&](size_t m) { return engine.members()[m]->id == required; }))
+                        return;
+                std::vector<size_t> eligible_leaders;
+                for (size_t l = 0; l < leaders.size(); ++l)
+                    if (std::any_of(scoped_members.begin(), scoped_members.end(), [&](size_t m) {
+                            return engine.members()[m]->id == leaders[l]->id;
+                        }))
+                        eligible_leaders.push_back(l);
+                if (eligible_leaders.empty())
+                    return;
+                double upper_pt = upwards(pt + max_pt), upper_drop = upwards(drop + max_drop);
+                bool bounded = reward_covered(upper_pt, upper_drop, stats.score_ceiling);
+                if (!bounded && score_bound.enabled) {
+                    double power = 0;
+                    for (size_t l : eligible_leaders) {
+                        double sum = 0;
+                        for (size_t m : scoped_members)
+                            sum += max_power[l][m];
+                        power = std::max(power, sum);
+                    }
+                    std::vector<double> dp(size_t{1} << engine.team_size(),
+                                           -std::numeric_limits<double>::infinity());
+                    dp[0] = 0;
+                    for (size_t mask = 0; mask + 1 < dp.size(); ++mask) {
+                        size_t m = scoped_members[__builtin_popcount(static_cast<unsigned>(mask))];
+                        for (int k = 0; k < engine.team_size(); ++k)
+                            if (!(mask & (size_t{1} << k)))
+                                dp[mask | (size_t{1} << k)] = std::max(
+                                    dp[mask | (size_t{1} << k)], dp[mask] + member_gains[m][k]);
+                    }
+                    group_gain_upper = dp.back();
+                    const double score = NativeScoreBound::upper(
+                        upwards(power), upwards(group_gain_upper), score_bound.base,
+                        score_bound.max_power, engine.team_size(), engine.chart().times.size());
+                    bounded = reward_covered(upper_pt, upper_drop, score);
+                }
+                if (bounded) {
+                    ++stats.bounded_member_groups;
+                    return;
+                }
+                group_pt.back() = group_drop.back() = 0;
+                for (size_t i = scoped_members.size(); i-- > 0;) {
+                    const auto &bonus = member_bonuses.at(engine.members()[scoped_members[i]]->id);
+                    group_pt[i] = group_pt[i + 1] + bonus.pt;
+                    group_drop[i] = group_drop[i + 1] + bonus.drop;
+                }
+                for (size_t l : eligible_leaders) {
+                    selected_leader = l;
+                    leader = leaders[l];
+                    formation.leader = leader->id;
+                    power_matrix = score_bound.enabled
+                                       ? &engine.power_matrix(engine.member_pos(leader->id))
+                                       : nullptr;
+                    snapshots(0, 0, 0, 0);
+                    if (!complete)
+                        return;
+                }
+                return;
+            }
+            for (size_t m = first; m < engine.members().size(); ++m) {
+                bool legal = true;
+                if (engine.problem().constraints.distinct_characters)
+                    for (size_t selected : scoped_members)
+                        legal = legal && engine.members()[selected]->character !=
+                                             engine.members()[m]->character;
+                if (!legal)
+                    continue;
+                const auto &bonus = member_bonuses.at(engine.members()[m]->id);
+                scoped_members.push_back(m);
+                groups(m + 1, pt + bonus.pt, drop + bonus.drop);
+                scoped_members.pop_back();
+                if (!complete)
+                    return;
+            }
+        };
+        groups(0, 0, 0);
         finalize();
         return pool;
     }
+    struct State {
+        Formation f;
+        double power = 0, gain = 0, pt = 0, drop = 0;
+        Yield y;
+    };
+    auto metric = [](const State &s, int axis) {
+        const double index = s.power * (1 + s.gain);
+        switch (axis) {
+        case 0:
+            return s.y.cp;
+        case 1:
+            return s.y.pt;
+        case 2:
+            return s.y.shop;
+        case 3:
+            return index;
+        case 4:
+            return s.y.pt / 100 + s.y.shop / 120;
+        case 5:
+            return s.y.pt * s.y.shop;
+        case 6:
+            return index * (1 + s.pt / 10000);
+        case 7:
+            return index * (1 + s.drop / 10000);
+        default:
+            return index * (1 + s.pt / 10000) * (1 + s.drop / 10000);
+        }
+    };
+    auto extend = [&](const State &state, const Member *m, const Snapshot *snap, State &n) {
+        for (const auto &slot : state.f.slots) {
+            const Member *used = engine.index().member_by_id.at(slot.member);
+            if (slot.member == m->id ||
+                (engine.problem().constraints.distinct_characters &&
+                 used->character == m->character) ||
+                (engine.problem().constraints.distinct_snapshots && slot.snapshot == snap->id))
+                return false;
+        }
+        int missing_members = 0, missing_snapshots = 0;
+        for (int64_t id : required_member_ids) {
+            bool found = id == m->id;
+            for (const auto &slot : state.f.slots)
+                found = found || slot.member == id;
+            missing_members += !found;
+        }
+        for (int64_t id : required_snapshot_ids) {
+            bool found = id == snap->id;
+            for (const auto &slot : state.f.slots)
+                found = found || slot.snapshot == id;
+            missing_snapshots += !found;
+        }
+        int remaining = engine.team_size() - static_cast<int>(state.f.slots.size()) - 1;
+        if (missing_members > remaining || missing_snapshots > remaining)
+            return false;
+        n = state;
+        n.f.slots.push_back(Slot{m->id, snap->id, static_cast<int>(n.f.slots.size()) + 1});
+        int mi = engine.member_pos(m->id), si = engine.snapshot_pos(snap->id);
+        n.power += engine.slot_power(engine.member_pos(state.f.leader), mi, si);
+        const auto &gains = engine.gains()[mi][si];
+        n.gain += *std::max_element(gains.begin(), gains.end());
+        const auto &mb = member_bonuses.at(m->id);
+        const auto &sb = snapshot_bonuses.at(snap->id);
+        n.pt += mb.pt + sb.pt;
+        n.drop += mb.drop + sb.drop;
+        n.y = reward_model.calculate(n.pt, n.drop);
+        return true;
+    };
+    auto retain_valid = [&](const State &state) {
+        if (state.f.slots.size() != static_cast<size_t>(engine.team_size()))
+            return;
+        try {
+            state.f.validate(engine.problem());
+        } catch (const SpecError &) {
+            return;
+        }
+        retain(state.f, state.pt, state.drop);
+    };
+    const bool seed_scope =
+        engine.members().size() <= 64 && engine.snapshots().size() <= 64 &&
+        engine.team_size() <= 8 &&
+        std::all_of(engine.members().begin(), engine.members().end(),
+                    [](const Member *m) { return m->character >= 0 && m->character < 64; });
+    if (!fixed_rank && seed_scope && !expired()) {
+        RankOptions seed_options = options;
+        seed_options.method = "fast";
+        seed_options.verbose = false;
+        seed_options.progress = {};
+        seed_options.objective = "index";
+        seed_options.top = 4;
+        seed_options.beam_width = std::min(16, options.beam_width);
+        seed_options.restarts = 0;
+        seed_options.anneal_steps = 0;
+        seed_options.time_limit_s = std::min(0.25, seconds * 0.15);
+        auto seeds = rank_formations(engine, seed_options);
+        for (const auto &score : seeds.results) {
+            if (expired())
+                break;
+            State state;
+            state.f.leader = score.leader;
+            for (const auto &slot : score.slots) {
+                state.f.slots.push_back(Slot{slot.member, slot.snapshot, slot.trigger});
+                state.pt +=
+                    member_bonuses.at(slot.member).pt + snapshot_bonuses.at(slot.snapshot).pt;
+                state.drop +=
+                    member_bonuses.at(slot.member).drop + snapshot_bonuses.at(slot.snapshot).drop;
+            }
+            retain_valid(state);
+            ++stats.score_seeds;
+        }
+    }
+    for (int axis : {1, 2, 6, 3, 5, 7, 8}) {
+        if (expired())
+            break;
+        for (const Member *leader : leaders) {
+            if (expired())
+                break;
+            if (axis == 1)
+                ++stats.leaders_seeded;
+            State state;
+            state.f.leader = leader->id;
+            for (int depth = 0; depth < engine.team_size(); ++depth) {
+                State best;
+                double best_metric = -1, best_index = -1;
+                for (const Member *m : engine.members()) {
+                    if (depth == 0 && m->id != leader->id)
+                        continue;
+                    for (const Snapshot *snap : engine.snapshots()) {
+                        State next;
+                        if (!extend(state, m, snap, next))
+                            continue;
+                        double value = metric(next, axis), index = metric(next, 3);
+                        if (value > best_metric || (value == best_metric && index > best_index)) {
+                            best_metric = value;
+                            best_index = index;
+                            best = std::move(next);
+                        }
+                    }
+                }
+                if (best_metric < 0)
+                    break;
+                state = std::move(best);
+            }
+            retain_valid(state);
+            if (expired())
+                break;
+        }
+    }
+    size_t leaders_remaining = leaders.size();
     for (const Member *leader : leaders) {
         if (expired())
             break;
-        if (!options.leaders.empty() && std::find(options.leaders.begin(), options.leaders.end(),
-                                                  leader->id) == options.leaders.end())
-            continue;
-        struct State {
-            Formation f;
-            double power = 0, gain = 0, pt = 0, drop = 0;
-            Yield y;
+        double remaining =
+            seconds -
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const auto leader_start = std::chrono::steady_clock::now();
+        double leader_seconds = remaining / std::max(size_t{1}, leaders_remaining--);
+        auto leader_expired = [&] {
+            return expired() ||
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - leader_start)
+                           .count() >= leader_seconds;
         };
+        const int width = !std::isfinite(leader_seconds)
+                              ? options.beam_width
+                              : std::min(options.beam_width, leader_seconds < 0.1 ? 1 : 8);
         std::vector<State> beam;
+        State anchor;
+        anchor.f.leader = leader->id;
         for (const Snapshot *snap : engine.snapshots()) {
             State state;
-            state.f.leader = leader->id;
-            state.f.slots.push_back(Slot{leader->id, snap->id, 1});
-            int mi = engine.member_pos(leader->id), si = engine.snapshot_pos(snap->id);
-            state.power = engine.slot_power(mi, mi, si);
-            const auto &gains = engine.gains()[mi][si];
-            state.gain = *std::max_element(gains.begin(), gains.end());
-            const auto &mb = member_bonuses.at(leader->id);
-            const auto &sb = snapshot_bonuses.at(snap->id);
-            state.pt = mb.pt + sb.pt;
-            state.drop = mb.drop + sb.drop;
-            state.y = reward_model.calculate(state.pt, state.drop);
-            beam.push_back(std::move(state));
+            if (extend(anchor, leader, snap, state))
+                beam.push_back(std::move(state));
         }
         for (int depth = 1; depth < engine.team_size() && !beam.empty(); ++depth) {
             std::vector<State> next;
             auto trim = [&]() {
                 std::vector<State> selected;
-                std::set<std::string> seen;
-                int width = std::max(8, options.beam_width);
-                for (int axis = 0; axis < 6; ++axis) {
-                    auto metric = [&](const State &s) {
-                        return axis == 0   ? s.y.cp
-                               : axis == 1 ? s.y.pt
-                               : axis == 2 ? s.y.shop
-                               : axis == 3 ? s.power * (1 + s.gain)
-                               : axis == 4 ? s.y.pt / 100 + s.y.shop / 120
-                                           : s.y.pt * s.y.shop;
-                    };
-                    std::stable_sort(next.begin(), next.end(), [&](const State &l, const State &r) {
-                        double x = metric(l), y = metric(r);
-                        return x == y ? l.power * (1 + l.gain) > r.power * (1 + r.gain) : x > y;
-                    });
-                    for (size_t i = 0; i < std::min(next.size(), static_cast<size_t>(width)); ++i) {
-                        Formation canonical = next[i].f;
-                        std::sort(canonical.slots.begin(), canonical.slots.end(),
-                                  [](const Slot &a, const Slot &b) { return a.member < b.member; });
-                        for (size_t k = 0; k < canonical.slots.size(); ++k)
-                            canonical.slots[k].trigger = static_cast<int>(k) + 1;
-                        std::string key = dump_formation(canonical).dump(0);
-                        if (seen.insert(key).second)
-                            selected.push_back(next[i]);
+                std::set<FormationKey> seen;
+                std::vector<size_t> indices(next.size());
+                for (size_t i = 0; i < indices.size(); ++i)
+                    indices[i] = i;
+                const size_t count = std::min(next.size(), static_cast<size_t>(width));
+                for (int axis = 0; axis < 9; ++axis) {
+                    std::partial_sort(indices.begin(), indices.begin() + count, indices.end(),
+                                      [&](size_t l, size_t r) {
+                                          double x = metric(next[l], axis),
+                                                 y = metric(next[r], axis);
+                                          if (x != y)
+                                              return x > y;
+                                          double lx = metric(next[l], 3), rx = metric(next[r], 3);
+                                          return lx == rx ? l < r : lx > rx;
+                                      });
+                    for (size_t i = 0; i < count; ++i) {
+                        size_t at = indices[i];
+                        if (seen.insert(formation_key(next[at].f)).second)
+                            selected.push_back(next[at]);
                     }
                 }
                 next = std::move(selected);
             };
             for (const auto &state : beam) {
-                if (expired())
+                if (leader_expired())
                     break;
                 for (const Member *m : engine.members())
                     for (const Snapshot *s : engine.snapshots()) {
-                        bool legal = true;
-                        for (const auto &slot : state.f.slots) {
-                            const Member *used = engine.index().member_by_id.at(slot.member);
-                            if (slot.member == m->id ||
-                                (engine.problem().constraints.distinct_characters &&
-                                 used->character == m->character) ||
-                                (engine.problem().constraints.distinct_snapshots &&
-                                 slot.snapshot == s->id))
-                                legal = false;
-                        }
-                        if (!legal)
+                        State n;
+                        if (!extend(state, m, s, n))
                             continue;
-                        int missing_members = 0, missing_snapshots = 0;
-                        for (int64_t id : engine.problem().constraints.required_members) {
-                            bool found = id == m->id;
-                            for (const auto &slot : state.f.slots)
-                                found = found || slot.member == id;
-                            if (!found)
-                                ++missing_members;
-                        }
-                        for (int64_t id : engine.problem().constraints.required_snapshots) {
-                            bool found = id == s->id;
-                            for (const auto &slot : state.f.slots)
-                                found = found || slot.snapshot == id;
-                            if (!found)
-                                ++missing_snapshots;
-                        }
-                        int remaining = engine.team_size() - depth - 1;
-                        if (missing_members > remaining || missing_snapshots > remaining)
-                            continue;
-
-                        State n = state;
-                        n.f.slots.push_back(Slot{m->id, s->id, depth + 1});
-                        int mi = engine.member_pos(m->id), si = engine.snapshot_pos(s->id);
-                        n.power += engine.slot_power(engine.member_pos(leader->id), mi, si);
-                        const auto &gains = engine.gains()[mi][si];
-                        n.gain += *std::max_element(gains.begin(), gains.end());
-                        const auto &mb = member_bonuses.at(m->id);
-                        const auto &sb = snapshot_bonuses.at(s->id);
-                        n.pt += mb.pt + sb.pt;
-                        n.drop += mb.drop + sb.drop;
-                        n.y = reward_model.calculate(n.pt, n.drop);
                         next.push_back(std::move(n));
                         if (next.size() > 8192)
                             trim();
@@ -460,15 +986,10 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             trim();
             beam = std::move(next);
         }
-        for (auto &state : beam) {
-            if (state.f.slots.size() != static_cast<size_t>(engine.team_size()))
-                continue;
-            try {
-                state.f.validate(engine.problem());
-            } catch (const SpecError &) {
-                continue;
-            }
-            retain(state.f, state.pt, state.drop);
+        for (const auto &state : beam) {
+            if (expired())
+                break;
+            retain_valid(state);
         }
     }
     finalize();
@@ -526,6 +1047,8 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         scope.push_back(Json(id));
     out.set("requested_leaders", scope);
     out.set("certified", Json(false));
+    out.set("optimality_certified", Json(normal_complete && challenge_complete));
+    out.set("optimality_scope", Json("input_songs_card_pools_leaders_and_reward_assumptions"));
     out.set("score_rank_verified", Json(false));
     out.set("reward_formula_calibrated", Json(false));
     Json n = Json::array(), c = Json::array();
@@ -607,7 +1130,8 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     out.set("cycles", std::move(cycles));
     Json warnings = Json::array();
     warnings.push_back(
-        Json("exact 完成表示已枚举指定队长范围内的合法成员/Snapshot 组合；fixed 按 AP index "
+        Json("exact 完成表示已搜索或通过安全上界排除指定范围内的合法成员/Snapshot 组合；fixed 按 "
+             "AP index "
              "优化技能顺序，"
              "estimated_score 枚举全部技能顺序。限时中断或 fast/auto 不证明全局最优。"));
     warnings.push_back(Json("fixed 模式以输入档位为条件；estimated_score 按未校准的预测分数匹配 "

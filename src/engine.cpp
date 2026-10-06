@@ -2137,6 +2137,116 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
     return best;
 }
 
+NativeScoreBound Engine::linear_score_bound(const std::vector<float> &live_bound) const {
+    validate_theoretical_scope();
+    NativeScoreBound result;
+    const auto &e = *this;
+    const auto &chart = e.chart();
+    if (live_bound.size() != chart.times.size())
+        throw SpecError("理论分数上界形状错误");
+    const auto &settings = e.problem().settings;
+    float difficulty = static_cast<float>(e.problem().chart.level - settings.score.level_base);
+    difficulty *= static_cast<float>(*settings.score.level_alpha);
+    difficulty += 1.0f;
+    const float adjustment = static_cast<float>(settings.score.adjustment_factor);
+    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
+    const float life =
+        settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
+    const float assist =
+        settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100) : 1.0f;
+    const float denominator = static_cast<float>(chart.converted_note_count);
+    if (!std::isnormal(adjustment) || adjustment <= 0 || !std::isnormal(difficulty) ||
+        difficulty <= 0 || !std::isnormal(judgement) || judgement <= 0 || !std::isnormal(life) ||
+        life <= 0 || !std::isnormal(assist) || assist <= 0 || !std::isnormal(denominator) ||
+        denominator <= 0)
+        return result;
+    std::vector<long double> coefficients(chart.times.size());
+    long double base = 0;
+    for (size_t i = 0; i < chart.times.size(); ++i) {
+        const float weight = static_cast<float>(chart.note_weights[i]);
+        const float combo = chart.native_combo_bonuses[i] + 1.0f;
+        if (weight == 0)
+            continue;
+        if (weight < 0 || !std::isnormal(weight) || combo <= 0 || !std::isnormal(combo))
+            return result;
+        float check = adjustment;
+        for (float operand : {difficulty, weight, judgement, combo}) {
+            check *= operand;
+            if (!std::isnormal(check))
+                return result;
+        }
+        check /= denominator;
+        if (!std::isnormal(check))
+            return result;
+
+        check = life * assist;
+        if (!std::isnormal(check))
+            return result;
+        const long double coefficient = static_cast<long double>(adjustment) * difficulty * weight *
+                                        judgement * combo / denominator * life * assist;
+        coefficients[i] = coefficient;
+        base += coefficient;
+    }
+    const double inflation = 1 + (chart.times.size() + 32) * std::numeric_limits<double>::epsilon();
+    auto up = [&](long double v) {
+        return std::nextafter(static_cast<double>(v) * inflation,
+                              std::numeric_limits<double>::infinity());
+    };
+    result.base = up(base);
+    result.gains.assign(members().size() * snapshots().size(), std::vector<double>(team_size()));
+    for (size_t p = 0; p < result.gains.size(); ++p) {
+        const int member = p / snapshots().size(), snap = p % snapshots().size();
+        const float boost = static_cast<float>(e.live_boost(member));
+        if (boost < 0 || !std::isfinite(boost))
+            return result;
+        for (int k = 0; k < team_size(); ++k) {
+            const auto start = e.problem().chart.skill_times_ms[k];
+            const auto end = start + e.duration_ms(member, snap);
+            long double sum = 0;
+            for (size_t i = 0; i < chart.times.size(); ++i)
+                if (chart.times[i] >= start && chart.times[i] < end)
+                    sum += coefficients[i] * boost;
+            result.gains[p][k] = up(sum);
+        }
+    }
+    long double peak = 1;
+    float max_weight = 0, max_combo = 1, max_live = 0;
+    for (size_t i = 0; i < chart.times.size(); ++i) {
+        max_weight = std::max(max_weight, static_cast<float>(chart.note_weights[i]));
+        max_combo = std::max(max_combo, chart.native_combo_bonuses[i] + 1.0f);
+        max_live = std::max(max_live, live_bound[i]);
+    }
+    if (!std::isfinite(max_live))
+        return result;
+    for (long double f :
+         {static_cast<long double>(adjustment), static_cast<long double>(difficulty),
+          static_cast<long double>(max_weight), static_cast<long double>(judgement),
+          static_cast<long double>(max_combo), 1 + static_cast<long double>(max_live),
+          1 / static_cast<long double>(denominator), static_cast<long double>(life),
+          static_cast<long double>(assist)})
+        peak *= std::max(1.0L, f);
+    peak *= std::pow(1 + static_cast<long double>(std::numeric_limits<float>::epsilon()), 64);
+    result.max_power =
+        std::nextafter(static_cast<double>(std::numeric_limits<float>::max() / peak), 0.0);
+    result.enabled = true;
+    return result;
+}
+
+double NativeScoreBound::upper(double power, double gain, double base, double max_power,
+                               int team_size, size_t note_count) {
+    const double inflated =
+        std::nextafter(power * (1 + (team_size + 2) * std::numeric_limits<double>::epsilon()),
+                       std::numeric_limits<double>::infinity());
+    const float native_power =
+        std::nextafter(static_cast<float>(inflated), std::numeric_limits<float>::infinity());
+    if (!std::isfinite(native_power) || native_power > max_power)
+        return std::numeric_limits<double>::infinity();
+    const double rounding = std::pow(1 + std::numeric_limits<float>::epsilon(), 32 + team_size);
+    const double sums = 1 + (note_count + 32) * std::numeric_limits<double>::epsilon();
+    return std::nextafter(static_cast<double>(native_power) * (base + gain) * rounding * sums,
+                          std::numeric_limits<double>::infinity());
+}
+
 double Engine::theoretical_upper_bound(double power_bound,
                                        const std::vector<float> &live_bound) const {
     const auto &settings = problem_.settings;

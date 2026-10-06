@@ -1378,7 +1378,8 @@ void Problem::validate() const {
                                 " 少于 team_size=" + std::to_string(team_size));
     }
     const std::size_t available_snapshot_count = available_snapshots().size();
-    if (static_cast<int>(available_snapshot_count) < team_size) {
+    if (available_snapshot_count == 0 || (constraints.distinct_snapshots &&
+                                          static_cast<int>(available_snapshot_count) < team_size)) {
         fail("constraints", "可用 Snapshot " + std::to_string(available_snapshot_count) +
                                 " 少于 team_size=" + std::to_string(team_size));
     }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -124,6 +125,14 @@ struct ChartInfo {
     std::vector<int64_t> skill_times;
 };
 
+struct NativeScoreBound {
+    bool enabled = false;
+    double base = 0, max_power = 0;
+    std::vector<std::vector<double>> gains;
+    static double upper(double power, double gain, double base, double max_power, int team_size,
+                        size_t note_count);
+};
+
 class Engine {
 public:
     explicit Engine(const Problem &problem);
@@ -175,6 +184,7 @@ public:
                               const std::function<bool(const Evaluation &)> &visitor) const;
     Evaluation evaluate_theoretical(const Formation &formation, bool detail = false) const;
     double theoretical_upper_bound(double power_bound, const std::vector<float> &live_bound) const;
+    NativeScoreBound linear_score_bound(const std::vector<float> &live_bound) const;
 
 private:
     void build_chart();

@@ -230,6 +230,19 @@ def check_event_oracle():
                 for c in actual[f"{phase}_frontier"]
             }
             assert observed == expected[phase], (case, phase, observed, expected[phase])
+        fast = run("event", p, method="fast", leaders="1", time_limit=2)
+        assert not fast["optimality_certified"]
+        for phase in ("normal", "challenge"):
+            assert not fast[f"{phase}_search_complete"]
+            observed = {
+                tuple(c["yield"][key] for key in ("cp", "pt", "shop_currency_expected"))
+                for c in fast[f"{phase}_frontier"]
+            }
+            assert observed == expected[phase], ("fast", case, phase, observed, expected[phase])
+            for candidate in fast[f"{phase}_frontier"]:
+                replay = run("score", p, candidate["formation"], order_search="given")["results"][0]
+                assert replay["estimated_score"] == candidate["estimated_score"]
+                assert candidate["formation"]["leader"] == 1
         for name, axis in (("pt", 1), ("shop_currency_expected", 2)):
             best = max(
                 n[axis] + n[0] / 200 * c[axis]
@@ -314,6 +327,36 @@ def main():
     )
     fast = run("event", p, method="fast", time_limit=5)
     assert fast["normal_search_complete"] is False and fast["challenge_search_complete"] is False
+    diverse = problem()
+    diverse["catalog"]["members"] = [
+        dict(
+            diverse["catalog"]["members"][0],
+            id=i,
+            character=i,
+            live_skill=0,
+            trained=[100000 if i == 20 else 1] * 3,
+            event_pt_bonus_bp=10000 if i < 20 else 0,
+        )
+        for i in range(1, 21)
+    ]
+    diverse["event"]["assumptions"]["score_rank_mode"] = "estimated_score"
+    diverse["event"]["score_ranks"] = [
+        {"rank": 2, "required_score": 0},
+        {"rank": 7, "required_score": 100000},
+    ]
+    diverse["event"]["normal"]["cp"].append({"rank": 2, "value": 1})
+    broad = run("event", diverse, method="fast", time_limit=2)
+    assert broad["recommended"]["cp"]["yield"]["cp"] == 50
+    for phase in ("normal", "challenge"):
+        assert broad[f"{phase}_search_audit"]["leaders_seeded"] == 20
+        assert broad[f"{phase}_search_audit"]["score_seeds"] > 0
+    constrained = copy.deepcopy(diverse)
+    constrained["constraints"] = {"required_members": [20], "required_snapshots": [1]}
+    limited_fast = run("event", constrained, method="fast", leaders="20", time_limit=2)
+    for candidate in limited_fast["normal_frontier"] + limited_fast["challenge_frontier"]:
+        assert candidate["formation"]["leader"] == 20
+        assert 20 in {slot["member"] for slot in candidate["formation"]["slots"]}
+        assert 1 in {slot["snapshot"] for slot in candidate["formation"]["slots"]}
     optimized = run("score", p, f)["results"][0]
     assert optimized["assignments"][1]["member"] == 3
     assert all(a["duration_ms"] == 100 for a in optimized["assignments"])
@@ -890,7 +933,9 @@ def main():
     }
     assert run("score", band, rescored)["results"][0]["power"] == changed_rank["power"]
     check_event_oracle()
-    print("Synthetic score/event integration checks passed; 12 exhaustive reward-frontier cases")
+    print(
+        "Synthetic score/event integration checks passed; 12 exact/fast exhaustive reward-frontier cases"
+    )
 
 
 if __name__ == "__main__":
