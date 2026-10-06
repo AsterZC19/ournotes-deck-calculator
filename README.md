@@ -74,6 +74,13 @@ python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10
   --method fast --time-limit 3 -o event.json
 ```
 
+批量比较普通曲并复用课题曲搜索结果：
+
+```sh
+./build/deckcalc event -p normal1.json -p normal2.json \
+  --challenge-problem challenge.json --method exact --time-limit 0 -o batch.json
+```
+
 活动精确搜索使用 `--method exact --time-limit 0`；`optimality_certified` 表示输入歌曲、卡池和队长范围内的收益最优已证明，限时未完成时为 `false`。收益按最佳技能顺序比较。
 
 `ranking_score` 为理论最高分，`order_analysis.best_score_order` 为对应技能顺序。实际技能顺序随机。精确搜索完成后，`audit.theoretical_max_certified` 标记模型内第一名已证明；普通 `--top 10` 的其他名次仍是候选。

@@ -1165,9 +1165,10 @@ void require_index(size_t position, size_t limit, const char *label) {
 
 }
 
-Engine::Engine(const Problem &problem)
-    : problem_(problem), index_(build_catalog_index(problem.catalog)), rules_(problem, index_),
-      members_(problem.available_members()), snapshots_(problem.available_snapshots()) {
+Engine::Engine(const Problem &problem, EngineCache *cache)
+    : problem_(problem), cache_(cache), index_(build_catalog_index(problem.catalog)),
+      rules_(problem, index_), members_(problem.available_members()),
+      snapshots_(problem.available_snapshots()) {
     if (problem_.settings.power.rounding == "none") {
         throw SpecError("settings.power_model.rounding 不支持 'none'（综合力必须是整数）");
     }
@@ -1562,10 +1563,20 @@ Json Engine::slot_breakdown(size_t leader_index, size_t member_index, size_t sna
     return out;
 }
 
+Json EngineCache::audit() const {
+    Json out = Json::object();
+    out.set("power_matrix_hits", Json(hits_));
+    out.set("power_matrix_misses", Json(misses_));
+    out.set("power_matrix_evictions", Json(evictions_));
+    out.set("power_matrix_entries", Json(int64_t(matrices_.size())));
+    out.set("power_matrix_bytes", Json(int64_t(bytes_)));
+    return out;
+}
+
 const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_index) const {
     const auto cached = power_matrices_.find(leader_index);
     if (cached != power_matrices_.end()) {
-        return cached->second;
+        return *cached->second;
     }
     require_index(leader_index, members_.size(), "队长");
 
@@ -1577,7 +1588,9 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
         row.assign(snapshot_count, 0);
     }
     if (member_count == 0 || snapshot_count == 0) {
-        return power_matrices_.emplace(leader_index, std::move(matrix)).first->second;
+        return *power_matrices_
+                    .emplace(leader_index, std::make_shared<const PowerMatrix>(std::move(matrix)))
+                    .first->second;
     }
 
     const Settings &settings = problem_.settings;
@@ -1610,6 +1623,47 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
             snapshot_rate[s][d] = snapshot.trained[d] + snapshot.event_bonus_bp;
         }
         snapshot_link[s] = snapshot.card_rank_bonus_bp.type_link;
+    }
+
+    std::vector<int64_t> cache_key;
+    if (cache_ && settings.power.extra_sources.empty()) {
+        cache_key = {int64_t(member_count),
+                     int64_t(snapshot_count),
+                     float32_mode,
+                     settings.power.snapshot,
+                     settings.power.type_link,
+                     settings.power.band_item,
+                     settings.power.music_type,
+                     settings.power.music_tag,
+                     settings.power.leader,
+                     settings.power.vip,
+                     settings.type_link_bonus_source == "snapshot",
+                     fix.type_link_base_bp};
+        cache_key.insert(cache_key.end(), fix.vip_bonus_bp.begin(), fix.vip_bonus_bp.end());
+        for (size_t m = 0; m < member_count; ++m) {
+            const auto &member = *members_[m];
+            cache_key.push_back(member.id);
+            cache_key.push_back(member.card_type);
+            cache_key.push_back(member.card_rank_bonus_bp.type_link);
+            cache_key.insert(cache_key.end(), common[m].begin(), common[m].end());
+            cache_key.push_back(music_type_rate[m]);
+            cache_key.push_back(music_tag_rate[m]);
+            cache_key.insert(cache_key.end(), leader_rate[m].begin(), leader_rate[m].end());
+            const Triple band_rate = band_item_rate(fix, member);
+            cache_key.insert(cache_key.end(), band_rate.begin(), band_rate.end());
+        }
+        for (size_t s = 0; s < snapshot_count; ++s) {
+            cache_key.push_back(snapshots_[s]->id);
+            cache_key.push_back(snapshots_[s]->card_type);
+            cache_key.insert(cache_key.end(), snapshot_rate[s].begin(), snapshot_rate[s].end());
+            cache_key.push_back(snapshot_link[s]);
+        }
+        const auto shared = cache_->matrices_.find(cache_key);
+        if (shared != cache_->matrices_.end()) {
+            ++cache_->hits_;
+            return *power_matrices_.emplace(leader_index, shared->second).first->second;
+        }
+        ++cache_->misses_;
     }
 
     struct ExtraPlan {
@@ -1700,7 +1754,24 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
             matrix[m][s] = total;
         }
     }
-    return power_matrices_.emplace(leader_index, std::move(matrix)).first->second;
+    auto shared = std::make_shared<const PowerMatrix>(std::move(matrix));
+    if (!cache_key.empty()) {
+        constexpr size_t capacity = 32 * 1024 * 1024;
+        const size_t bytes = member_count * snapshot_count * sizeof(int64_t);
+        if (bytes <= capacity) {
+            while (!cache_->matrices_.empty() &&
+                   (cache_->bytes_ + bytes > capacity || cache_->matrices_.size() >= 512)) {
+                const auto entry = cache_->matrices_.begin();
+                for (const auto &row : *entry->second)
+                    cache_->bytes_ -= row.size() * sizeof(int64_t);
+                cache_->matrices_.erase(entry);
+                ++cache_->evictions_;
+            }
+            cache_->matrices_.emplace(std::move(cache_key), shared);
+            cache_->bytes_ += bytes;
+        }
+    }
+    return *power_matrices_.emplace(leader_index, std::move(shared)).first->second;
 }
 
 ChartInfo Engine::chart_info() const {

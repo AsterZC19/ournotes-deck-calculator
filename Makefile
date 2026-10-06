@@ -4,7 +4,7 @@ BUILD    := build
 
 CORE      := json model engine solver event
 OBJ       := $(addprefix $(BUILD)/,$(addsuffix .o,$(CORE)))
-TESTS     := json model engine solver
+TESTS     := json model engine solver cache
 TEST_BINS := $(addprefix $(BUILD)/test_,$(TESTS))
 TEST_OBJ  := $(addsuffix .o,$(TEST_BINS))
 
@@ -33,6 +33,8 @@ test: $(BUILD)/deckcalc $(TEST_BINS)
 	python3 -m unittest discover -s tests -p test_normal_context.py
 	python3 tests/test_event.py
 	python3 tests/test_event_bounds.py
+	python3 tests/test_event_batch.py
+	python3 tests/test_event_coupling.py
 	python3 tests/test_search.py
 	python3 tests/test_theoretical.py
 	python3 tests/test_topk.py

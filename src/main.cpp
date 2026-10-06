@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -34,6 +36,7 @@ void usage() {
            "  deckcalc event    -p problem.json [-o out.json] [--time-limit S] [--method "
            "fast|exact]\n"
            "                    [--challenge-problem challenge.json] [--leaders 61,62]\n"
+           "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
            "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--time-limit S]\n"
            "                    [--method auto|fast|exact] [--leaders 61,62] [--detail] [--quiet]\n"
            "                    [--objective score|index] [--beam-width 64] [--restarts 4] "
@@ -48,6 +51,7 @@ void usage() {
 struct Args {
     std::string command;
     std::string problem;
+    std::vector<std::string> problems;
     std::string formation;
     std::string challenge_problem;
     std::string excluded_member_sets;
@@ -91,7 +95,8 @@ Args parse_args(int argc, char **argv) {
     for (int i = 2; i < argc; ++i) {
         std::string flag = argv[i];
         if (flag == "-p" || flag == "--problem") {
-            args.problem = need_value(argc, argv, i, "--problem");
+            args.problems.push_back(need_value(argc, argv, i, "--problem"));
+            args.problem = args.problems.front();
         } else if (flag == "--warm-start") {
             args.warm_start = need_value(argc, argv, i, "--warm-start");
         } else if (flag == "--exclude-member-sets") {
@@ -136,6 +141,12 @@ Args parse_args(int argc, char **argv) {
     if (args.problem.empty()) {
         throw SpecError("缺少 --problem");
     }
+    if (args.problems.size() > 1 && args.command != "event")
+        throw SpecError("多个 --problem 仅用于 event 批量计算");
+    if (std::count(args.problems.begin(), args.problems.end(), "-") +
+            (args.challenge_problem == "-") >
+        1)
+        throw SpecError("stdin 只能读取一个输入");
     if (args.beam_width < 1 || args.restarts < 0 || args.anneal_steps < 0)
         throw SpecError("beam-width 必须 >=1，restarts/anneal-steps 必须 >=0");
     if (args.objective != "theoretical_score" && args.objective != "index")
@@ -320,7 +331,8 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        Engine engine(problem);
+        deckcalc::EngineCache engine_cache;
+        Engine engine(problem, args.command == "event" ? &engine_cache : nullptr);
         if (args.command == "score") {
             if (args.formation.empty()) {
                 throw SpecError("score 需要 --formation");
@@ -380,14 +392,40 @@ int main(int argc, char **argv) {
             options.progress = [](const std::string &message) { std::cerr << message << "\n"; };
         }
         if (args.command == "event") {
+            std::optional<Problem> challenge;
+            std::unique_ptr<Engine> challenge_engine;
             if (!args.challenge_problem.empty()) {
-                Problem challenge = deckcalc::parse_problem(Json::read(args.challenge_problem));
-                Engine challenge_engine(challenge);
-                write_output(deckcalc::event_recommend(engine, options, &challenge_engine),
-                             args.output);
-            } else {
-                write_output(deckcalc::event_recommend(engine, options), args.output);
+                challenge.emplace(deckcalc::parse_problem(Json::read(args.challenge_problem)));
+                challenge_engine = std::make_unique<Engine>(*challenge, &engine_cache);
             }
+            deckcalc::EventSearchCache phase_cache;
+            auto calculate = [&](const Problem &input, const Engine &model) {
+                auto per_song = options;
+                per_song.time_limit_s =
+                    args.time_limit >= 0 ? args.time_limit : input.search.time_limit_s;
+                return deckcalc::event_recommend(model, per_song, challenge_engine.get(),
+                                                 &phase_cache);
+            };
+            Json first = calculate(problem, engine);
+            if (args.problems.size() == 1) {
+                write_output(first, args.output);
+                return 0;
+            }
+            Json plans = Json::array();
+            plans.push_back(std::move(first));
+            for (size_t i = 1; i < args.problems.size(); ++i) {
+                Problem next = deckcalc::parse_problem(Json::read(args.problems[i]));
+                if (args.seed)
+                    next.search.seed = *args.seed;
+                Engine model(next, &engine_cache);
+                plans.push_back(calculate(next, model));
+            }
+            Json out = Json::object();
+            out.set("schema", Json("ournotes-event-batch@1"));
+            out.set("plans", std::move(plans));
+            out.set("engine_cache", engine_cache.audit());
+            out.set("search_cache", phase_cache.audit());
+            write_output(out, args.output);
             return 0;
         }
         deckcalc::RankResult ranked = deckcalc::rank_formations(engine, options);

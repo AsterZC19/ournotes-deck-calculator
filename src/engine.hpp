@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -133,9 +134,26 @@ struct NativeScoreBound {
                         size_t note_count);
 };
 
+using PowerMatrix = std::vector<std::vector<int64_t>>;
+
+class EngineCache {
+public:
+    Json audit() const;
+
+private:
+    friend class Engine;
+    std::map<std::vector<int64_t>, std::shared_ptr<const PowerMatrix>> matrices_;
+    size_t bytes_ = 0;
+    int64_t hits_ = 0, misses_ = 0, evictions_ = 0;
+};
+
 class Engine {
 public:
-    explicit Engine(const Problem &problem);
+    explicit Engine(const Problem &problem, EngineCache *cache = nullptr);
+
+    std::weak_ptr<const int> cache_identity() const {
+        return cache_identity_;
+    }
 
     const Problem &problem() const {
         return problem_;
@@ -190,6 +208,8 @@ private:
     void build_chart();
 
     const Problem &problem_;
+    EngineCache *cache_;
+    std::shared_ptr<const int> cache_identity_ = std::make_shared<const int>(0);
     CatalogIndex index_;
     Rules rules_;
     std::vector<const Member *> members_;
@@ -204,7 +224,7 @@ private:
     mutable bool durations_ready_ = false;
     mutable bool boosts_ready_ = false;
     mutable bool gains_ready_ = false;
-    mutable std::unordered_map<size_t, std::vector<std::vector<int64_t>>> power_matrices_;
+    mutable std::unordered_map<size_t, std::shared_ptr<const PowerMatrix>> power_matrices_;
 };
 
 }
