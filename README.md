@@ -45,7 +45,7 @@ python3 tools/compile_from_master.py \
 - `--objective score`：理论最高分／最佳技能顺序收益。
 - `--method exact --time-limit 0`：不限时精确搜索；`fast` 和限时未完成的搜索不保证最优。
 - `--detail`：计算明细；`--warm-start`：复用结果；`score --order-search given`：计算指定顺序。
-- 活动批量比较可重复传 `-p`。平均模式下 CP 随技能顺序变化时，不提供有限预算计划。
+- 活动批量比较可重复传 `-p`；`event.assumptions.normal_runs`、`initial_cp` 设置有限预算，结果为期望次数及收益。
 - 逐名证明理论最高分：`python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10`。
 
 正常输入固定 5 人，成员卡、角色和 Snapshot 不重复，卡池数量无固定上限。

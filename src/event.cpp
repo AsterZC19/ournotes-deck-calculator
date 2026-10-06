@@ -59,7 +59,56 @@ struct Candidate {
     Yield yield;
     int score_rank = 0;
     Json rank_distribution;
+    std::map<int64_t, double> cp_distribution;
 };
+struct FiniteCP {
+    double plays, remaining;
+    Json distribution;
+};
+FiniteCP finite_cp(const Candidate &candidate, uint64_t runs, int64_t initial, int64_t cost) {
+    using Law = std::map<int64_t, long double>;
+    auto multiply = [&](const Law &a, const Law &b) {
+        Law result;
+        for (const auto &[x, p] : a)
+            for (const auto &[y, q] : b)
+                result[(x + y) % cost] += p * q;
+        return result;
+    };
+    Law increment, remainder{{initial % cost, 1}};
+    long double mean = 0, law_mass = 0;
+    for (const auto &[cp, probability] : candidate.cp_distribution) {
+        increment[cp % cost] += probability;
+        mean += static_cast<long double>(cp) * probability;
+        law_mass += probability;
+    }
+    mean /= law_mass;
+    for (auto &[cp, probability] : increment)
+        probability /= law_mass;
+    const uint64_t count = runs;
+    // Track CP remainders; the mean total determines expected whole challenge runs.
+    while (runs) {
+        if (runs & 1)
+            remainder = multiply(remainder, increment);
+        runs >>= 1;
+        if (runs)
+            increment = multiply(increment, increment);
+    }
+    long double remaining = 0, mass = 0;
+    for (const auto &[cp, probability] : remainder) {
+        remaining += cp * probability;
+        mass += probability;
+    }
+    remaining /= mass;
+    Json distribution = Json::array();
+    for (const auto &[cp, probability] : remainder) {
+        Json row = Json::object();
+        row.set("cp", Json(cp));
+        row.set("probability", Json(double(probability / mass)));
+        distribution.push_back(std::move(row));
+    }
+    return {double((initial + count * mean - remaining) / cost), double(remaining),
+            std::move(distribution)};
+}
 double positive(const Json &j, const char *key, double fallback) {
     double n = num_field(j, key, fallback);
     if (!std::isfinite(n) || n < 0)
@@ -251,6 +300,11 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
     std::set<FormationKey> evaluated;
     const bool fixed_rank = rank_mode == "fixed";
     const bool mean_rewards = options.objective == "mean_score";
+    const bool finite_random_cp =
+        mean_rewards && phase == "normal" && a.find("normal_runs") && !fixed_rank &&
+        std::any_of(reward_models.begin(), reward_models.end(), [&](const PhaseRewards &model) {
+            return model.base_cp != reward_models.front().base_cp;
+        });
     auto finalize = [&]() {
         for (auto &candidate : pool) {
             if (!candidate.score.has_estimated &&
@@ -282,10 +336,11 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
         const bool envelope_dominated =
             std::any_of(pool.begin(), pool.end(),
                         [&](const Candidate &other) { return dominates(other.yield, envelope); });
-        if (fixed_rank ? yield_dominated(reward_models[rank - 2])
-            : mean_rewards
-                ? envelope_dominated
-                : std::all_of(reward_models.begin(), reward_models.end(), yield_dominated)) {
+        if (!finite_random_cp &&
+            (fixed_rank ? yield_dominated(reward_models[rank - 2])
+             : mean_rewards
+                 ? envelope_dominated
+                 : std::all_of(reward_models.begin(), reward_models.end(), yield_dominated))) {
             ++stats.dominated_before_evaluation;
             return;
         }
@@ -308,23 +363,40 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             }
             Yield realized =
                 expected ? *expected : reward_models[result_rank - 2].calculate(pt, drop);
-            Candidate c{scored_formation, std::move(score), realized, expected ? 0 : result_rank,
-                        std::move(distribution)};
+            Candidate c{scored_formation,           std::move(score),        realized,
+                        expected ? 0 : result_rank, std::move(distribution), {}};
+            auto cp_integer = [](double cp) {
+                if (!std::isfinite(cp) || cp < 0 || cp > 9007199254740991.0 || cp != std::floor(cp))
+                    throw SpecError("CP 奖励超出安全整数范围");
+                return static_cast<int64_t>(cp);
+            };
+            if (c.rank_distribution.is_null())
+                c.cp_distribution[cp_integer(realized.cp)] = 1;
+            else
+                for (const auto &row : c.rank_distribution.items()) {
+                    const double cp =
+                        reward_models[int_field(row, "rank") - 2].calculate(pt, drop).cp;
+                    c.cp_distribution[cp_integer(cp)] += num_field(row, "probability");
+                }
+            auto comparable = [&](const Candidate &other) {
+                return !finite_random_cp || other.cp_distribution == c.cp_distribution;
+            };
             bool dominated = false;
             for (const auto &other : pool)
-                if (dominates(other.yield, c.yield)) {
+                if (comparable(other) && dominates(other.yield, c.yield)) {
                     dominated = true;
                     break;
                 }
             if (dominated)
                 return;
-            pool.erase(
-                std::remove_if(pool.begin(), pool.end(),
-                               [&](const Candidate &o) { return dominates(c.yield, o.yield); }),
-                pool.end());
+            pool.erase(std::remove_if(pool.begin(), pool.end(),
+                                      [&](const Candidate &o) {
+                                          return comparable(o) && dominates(c.yield, o.yield);
+                                      }),
+                       pool.end());
 
             auto equal = std::find_if(pool.begin(), pool.end(), [&](const Candidate &o) {
-                return o.yield.cp == c.yield.cp && o.yield.pt == c.yield.pt &&
+                return comparable(o) && o.yield.cp == c.yield.cp && o.yield.pt == c.yield.pt &&
                        o.yield.shop == c.yield.shop;
             });
             if (equal == pool.end())
@@ -442,6 +514,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 reward_thresholds.emplace_back(int_field(row, "rank"),
                                                num_field(row, "required_score"));
         auto reward_covered = [&](double pt, double drop, double upper_score) {
+            if (finite_random_cp)
+                return false;
             if (pool.empty())
                 return false;
             if (fixed_rank)
@@ -692,6 +766,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 ++stats.infeasible_branches;
                 return true;
             }
+            if (finite_random_cp)
+                return false;
             const double upper_pt =
                 upwards(pt + group_pt[depth] + snapshot_bonus(pt_order, snapshot_pt, remaining));
             const double upper_drop = upwards(drop + group_drop[depth] +
@@ -1354,35 +1430,29 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
             best_cp = &x;
     recommended.set("cp", best_cp ? candidate_json(*best_cp) : Json());
     out.set("recommended", std::move(recommended));
-    bool deterministic_cp = true;
-    for (const auto &candidate : normal) {
-        if (candidate.rank_distribution.is_null())
-            continue;
-        const auto &rows = candidate.rank_distribution.items();
-        double first = -1;
-        // Finite budgets require CP to be constant across reachable ranks.
-        for (const auto &row : rows) {
-            const double cp = value(engine.problem().raw.at("event").at("normal").at("cp"),
-                                    int_field(row, "rank"), "value");
-            if (first < 0)
-                first = cp;
-            else if (first != cp)
-                deterministic_cp = false;
-        }
-    }
-    if (na.find("normal_runs") && deterministic_cp) {
+    if (na.find("normal_runs")) {
         double count = positive(na, "normal_runs", 0), initial = positive(na, "initial_cp", 0);
-        if (count != std::floor(count) || initial != std::floor(initial))
-            throw SpecError("normal_runs/initial_cp 必须为非负整数");
+        constexpr double max_integer = 9007199254740991.0;
+        if (count != std::floor(count) || initial != std::floor(initial) || count > max_integer ||
+            initial > max_integer || cost != std::floor(cost) || cost > max_integer)
+            throw SpecError("normal_runs/initial_cp 和 challenge_cp_cost 必须为安全整数");
+        std::vector<FiniteCP> budgets;
+        for (const auto &candidate : normal)
+            budgets.push_back(finite_cp(candidate, static_cast<uint64_t>(count),
+                                        static_cast<int64_t>(initial), static_cast<int64_t>(cost)));
+        out.set("finite_budget_model", Json("independent_skill_orders_expected_rewards"));
         Json finite = Json::array();
         for (size_t i = 0; i < normal.size(); ++i)
             for (size_t j = 0; j < challenge.size(); ++j) {
-                double cp = initial + count * normal[i].yield.cp, plays = std::floor(cp / cost);
+                const auto &budget = budgets[i];
+                const double plays = budget.plays;
                 Json x = Json::object();
                 x.set("normal_candidate", Json(static_cast<int64_t>(i)));
                 x.set("challenge_candidate", Json(static_cast<int64_t>(j)));
                 x.set("challenge_runs", Json(plays));
-                x.set("remaining_cp", Json(cp - plays * cost));
+                x.set("remaining_cp", Json(budget.remaining));
+                if (normal[i].cp_distribution.size() > 1)
+                    x.set("remaining_cp_distribution", budget.distribution);
                 x.set("pt", Json(count * normal[i].yield.pt + plays * challenge[j].yield.pt));
                 x.set("shop_currency_expected",
                       Json(count * normal[i].yield.shop + plays * challenge[j].yield.shop));
@@ -1406,9 +1476,9 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     }
     out.set("cycles", std::move(cycles));
     Json warnings = Json::array();
-    if (na.find("normal_runs") && !deterministic_cp)
-        warnings.push_back(Json("平均模式下 CP 随技能顺序变化；暂不提供有限预算计划，避免对平均 CP "
-                                "取整导致错误。cycles 提供长期期望收益。"));
+    if (na.find("normal_runs") && options.objective == "mean_score")
+        warnings.push_back(
+            Json("有限预算的课题曲次数、剩余 CP 和收益均为期望值，按每局独立技能顺序计算。"));
     if (options.objective == "mean_score")
         warnings.push_back(Json("平均收益按每种技能顺序分别确定分数档位、取整奖励，再求平均；单局收"
                                 "益可能不同。score_rank=0 表示档位分布。"));
