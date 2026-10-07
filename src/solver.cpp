@@ -342,6 +342,536 @@ Solution make_solution(const Game &game, const std::vector<int> &pairs, bool wit
     return solution;
 }
 
+struct SnapshotClass {
+    int pair = 0;
+};
+
+struct ClassSearch {
+    Shared &shared;
+    NativeScoreBound bound;
+    std::vector<std::vector<SnapshotClass>> classes;
+    std::vector<std::vector<int>> class_of;
+    std::vector<int> members, selected_classes;
+    std::vector<std::vector<int64_t>> exact_power;
+    std::vector<std::vector<int>> class_order;
+    std::vector<std::vector<int64_t>> class_power;
+    Game game;
+    std::vector<int> candidates;
+    Solution best;
+    ScoreOrderStats order_stats;
+    int64_t nodes = 0, compositions = 0, class_nodes = 0, matchings = 0, pruned = 0;
+    bool timed_out = false;
+    std::vector<int64_t> dp_, next_;
+    std::vector<int> assigned_;
+    std::vector<int64_t> rem_power_;
+    std::vector<double> rem_gain_;
+    std::vector<std::vector<double>> member_pos_gain;
+    std::vector<std::vector<int>> all_orders_;
+    struct ClassKeyHash {
+        size_t operator()(const std::array<int, kMaxTeam> &key) const {
+            size_t hash = 0;
+            for (int value : key)
+                hash ^= std::hash<int>{}(value) + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+            return hash;
+        }
+    };
+    std::unordered_set<std::array<int, kMaxTeam>, ClassKeyHash> handled_classes_;
+    int64_t matching_cache_hits = 0, composition_bound_pruned = 0, order_bound_pruned = 0;
+    std::vector<std::vector<double>> dfs_powers_, dfs_gains_;
+    std::vector<double> rem_gain_order_;
+    std::vector<std::vector<int>> order_class_order_;
+    struct OrderEntry {
+        const std::vector<int> *pos = nullptr;
+        double cap = 0.0;
+    };
+    std::vector<OrderEntry> sorted_orders_;
+
+    explicit ClassSearch(Shared &s) : shared(s) {
+        bound.enabled = s.linear_score_bound_enabled;
+        bound.base = s.score_base_coefficient;
+        bound.max_power = s.score_linear_max_power;
+        bound.gains = s.score_gain_coefficients;
+        classes.resize(s.member_count);
+        class_of.assign(s.member_count, std::vector<int>(s.snap_count));
+        for (int m = 0; m < s.member_count; ++m) {
+            std::map<int64_t, int> ids;
+            for (int snap = 0; snap < s.snap_count; ++snap) {
+                auto [it, added] =
+                    ids.try_emplace(s.engine->duration_ms(m, snap), classes[m].size());
+                if (added)
+                    classes[m].push_back({m * s.snap_count + snap});
+                class_of[m][snap] = it->second;
+            }
+        }
+        member_pos_gain.assign(s.member_count, std::vector<double>(s.team_size, 0.0));
+        for (int m = 0; m < s.member_count; ++m) {
+            for (int k = 0; k < s.team_size; ++k) {
+                double max_g = 0.0;
+                for (const auto &sc : classes[m]) {
+                    if (sc.pair < static_cast<int>(bound.gains.size()) &&
+                        k < static_cast<int>(bound.gains[sc.pair].size())) {
+                        max_g = std::max(max_g, bound.gains[sc.pair][k]);
+                    }
+                }
+                member_pos_gain[m][k] = max_g;
+            }
+        }
+        std::vector<int> ord(s.team_size);
+        std::iota(ord.begin(), ord.end(), 0);
+        do {
+            all_orders_.push_back(ord);
+        } while (std::next_permutation(ord.begin(), ord.end()));
+        sorted_orders_.reserve(all_orders_.size());
+
+        dfs_powers_.resize(s.team_size + 1);
+        dfs_gains_.resize(s.team_size + 1);
+        const int groups = s.distinct_characters ? s.character_count : s.member_count;
+        for (int d = 0; d <= s.team_size; ++d) {
+            dfs_powers_[d].resize(groups);
+            dfs_gains_[d].resize(groups);
+        }
+        rem_gain_order_.resize(s.team_size + 1);
+        order_class_order_.resize(s.team_size);
+
+        dp_.resize(1 << s.team_size);
+        next_.resize(1 << s.team_size);
+        assigned_.resize(s.snap_count * (1 << s.team_size));
+        rem_power_.resize(s.team_size + 1);
+        rem_gain_.resize(s.team_size + 1);
+    }
+
+    double cutoff() const {
+        return best.found ? best.index : -std::numeric_limits<double>::infinity();
+    }
+    bool expired() {
+        if (wall_s() > shared.deadline)
+            timed_out = true;
+        return timed_out;
+    }
+    double cap(double power, double gain) const {
+        return NativeScoreBound::upper(power, gain, bound.base, bound.max_power, shared.team_size,
+                                       shared.engine->chart().times.size());
+    }
+    double class_gain(int member, int c) const {
+        const auto &row = bound.gains[classes[member][c].pair];
+        return *std::max_element(row.begin(), row.end());
+    }
+
+    std::vector<int> match() {
+        ++matchings;
+        const int n = shared.team_size, states = 1 << n;
+        const int64_t missing = std::numeric_limits<int64_t>::min();
+        std::fill(dp_.begin(), dp_.end(), missing);
+        std::fill(assigned_.begin(), assigned_.end(), -2);
+        dp_[0] = 0;
+        for (int s = 0; s < shared.snap_count; ++s) {
+            if (expired())
+                return {};
+            const bool required =
+                std::find(shared.required_snapshots.begin(), shared.required_snapshots.end(),
+                          shared.snapshots[s]->id) != shared.required_snapshots.end();
+            const int offset = s * states;
+            if (required)
+                std::fill(next_.begin(), next_.end(), missing);
+            else {
+                next_ = dp_;
+                for (int mask = 0; mask < states; ++mask)
+                    if (dp_[mask] != missing)
+                        assigned_[offset + mask] = -1;
+            }
+            for (int mask = 0; mask < states; ++mask) {
+                if (dp_[mask] == missing)
+                    continue;
+                for (int row = 0; row < n; ++row) {
+                    if ((mask & (1 << row)) || class_of[members[row]][s] != selected_classes[row])
+                        continue;
+                    const int target = mask | (1 << row);
+                    const int64_t value = dp_[mask] + exact_power[row][s];
+                    if (value > next_[target]) {
+                        next_[target] = value;
+                        assigned_[offset + target] = row;
+                    }
+                }
+            }
+            dp_.swap(next_);
+        }
+        if (dp_.back() == missing)
+            return {};
+        std::vector<int> pairs(n);
+        int mask = states - 1;
+        for (int s = shared.snap_count - 1; s >= 0; --s) {
+            const int row = assigned_[s * states + mask];
+            if (row >= 0) {
+                pairs[row] = members[row] * shared.snap_count + s;
+                mask ^= 1 << row;
+            }
+        }
+        return pairs;
+    }
+
+    void bindings(int depth, int64_t power, double gain) {
+        ++class_nodes;
+        if (expired())
+            return;
+        if (cap(power + rem_power_[depth],
+                std::nextafter(gain + rem_gain_[depth], std::numeric_limits<double>::infinity())) <=
+            cutoff()) {
+            ++pruned;
+            return;
+        }
+        if (depth != shared.team_size) {
+            for (int c : class_order[depth]) {
+                selected_classes[depth] = c;
+                bindings(depth + 1, power + class_power[depth][c],
+                         std::nextafter(gain + class_gain(members[depth], c),
+                                        std::numeric_limits<double>::infinity()));
+                if (timed_out)
+                    return;
+            }
+            return;
+        }
+        const auto pairs = match();
+        if (pairs.empty())
+            return;
+        Formation formation;
+        formation.leader = game.leader_id;
+        int64_t matched_power = 0;
+        for (int row = 0; row < shared.team_size; ++row) {
+            const auto &pair = shared.pairs[pairs[row]];
+            formation.slots.push_back(
+                {shared.members[pair.member]->id, shared.snapshots[pair.snap]->id, row + 1});
+            matched_power += exact_power[row][pair.snap];
+        }
+        if (cap(matched_power, gain) <= cutoff()) {
+            ++pruned;
+            return;
+        }
+        ++shared.score_evaluations;
+        std::optional<Evaluation> evaluation;
+        if (shared.average_objective || matched_power < 0) {
+            evaluation = shared.average_objective ? shared.engine->evaluate_mean(formation)
+                                                  : shared.engine->evaluate_theoretical(formation);
+            int64_t orders = 1;
+            for (int i = 2; i <= shared.team_size; ++i)
+                orders *= i;
+            order_stats.evaluated += orders;
+        } else
+            evaluation =
+                shared.engine->evaluate_best_order(formation, bound, cutoff(), order_stats);
+        if (!evaluation || *evaluation->ranking_score <= cutoff())
+            return;
+        best.found = true;
+        best.index = *evaluation->ranking_score;
+        best.member_set = {};
+        for (int m : members)
+            best.member_set.insert(m);
+        best.evaluation = std::move(*evaluation);
+    }
+
+    void order_classes_dfs(const std::vector<int> &ord, int depth, int64_t power, double gain) {
+        ++class_nodes;
+        if (expired())
+            return;
+        if (cap(power + rem_power_[depth],
+                std::nextafter(gain + rem_gain_order_[depth],
+                               std::numeric_limits<double>::infinity())) <= cutoff()) {
+            ++pruned;
+            return;
+        }
+        const int n = shared.team_size;
+        if (depth != n) {
+            for (int c : order_class_order_[depth]) {
+                selected_classes[depth] = c;
+                const double g = bound.gains[classes[members[depth]][c].pair][ord[depth]];
+                order_classes_dfs(
+                    ord, depth + 1, power + class_power[depth][c],
+                    std::nextafter(gain + g, std::numeric_limits<double>::infinity()));
+                if (timed_out)
+                    return;
+            }
+            return;
+        }
+
+        std::array<int, kMaxTeam> class_key{};
+        std::copy(selected_classes.begin(), selected_classes.end(), class_key.begin());
+        if (handled_classes_.count(class_key)) {
+            ++matching_cache_hits;
+            return;
+        }
+
+        const auto pairs = match();
+        if (pairs.empty()) {
+            if (!timed_out)
+                handled_classes_.insert(class_key);
+            return;
+        }
+
+        Formation formation;
+        formation.leader = game.leader_id;
+        int64_t matched_power = 0;
+        double max_all_orders_gain = 0.0;
+        for (int row = 0; row < n; ++row) {
+            const auto &pair = shared.pairs[pairs[row]];
+            formation.slots.push_back(
+                {shared.members[pair.member]->id, shared.snapshots[pair.snap]->id, row + 1});
+            matched_power += exact_power[row][pair.snap];
+            const auto &g_row = bound.gains[pairs[row]];
+            max_all_orders_gain =
+                std::nextafter(max_all_orders_gain + *std::max_element(g_row.begin(), g_row.end()),
+                               std::numeric_limits<double>::infinity());
+        }
+
+        if (cap(matched_power, max_all_orders_gain) <= cutoff()) {
+            ++pruned;
+            handled_classes_.insert(class_key);
+            return;
+        }
+
+        ++shared.score_evaluations;
+        std::optional<Evaluation> evaluation;
+        if (matched_power < 0) {
+            evaluation = shared.engine->evaluate_theoretical(formation);
+            int64_t orders = 1;
+            for (int i = 2; i <= n; ++i)
+                orders *= i;
+            order_stats.evaluated += orders;
+        } else {
+            evaluation =
+                shared.engine->evaluate_best_order(formation, bound, cutoff(), order_stats);
+        }
+
+        if (!timed_out)
+            handled_classes_.insert(class_key);
+
+        if (!evaluation || *evaluation->ranking_score <= cutoff())
+            return;
+
+        best.found = true;
+        best.index = *evaluation->ranking_score;
+        best.member_set = {};
+        for (int m : members)
+            best.member_set.insert(m);
+        best.evaluation = std::move(*evaluation);
+    }
+
+    void orders_search() {
+        const int n = shared.team_size;
+        handled_classes_.clear();
+
+        sorted_orders_.clear();
+        for (const auto &ord : all_orders_) {
+            double order_gain = 0.0;
+            for (int row = 0; row < n; ++row) {
+                const int m = members[row];
+                order_gain = std::nextafter(order_gain + member_pos_gain[m][ord[row]],
+                                            std::numeric_limits<double>::infinity());
+            }
+            sorted_orders_.push_back({&ord, cap(rem_power_[0], order_gain)});
+        }
+        std::stable_sort(sorted_orders_.begin(), sorted_orders_.end(),
+                         [](const OrderEntry &a, const OrderEntry &b) { return a.cap > b.cap; });
+
+        for (size_t order_index = 0; order_index < sorted_orders_.size(); ++order_index) {
+            const auto &entry = sorted_orders_[order_index];
+            if (expired())
+                return;
+            if (entry.cap <= cutoff()) {
+                order_bound_pruned += sorted_orders_.size() - order_index;
+                break;
+            }
+
+            const auto &ord = *entry.pos;
+            rem_gain_order_[n] = 0.0;
+            for (int row = n - 1; row >= 0; --row) {
+                const int m = members[row];
+                const int pos = ord[row];
+                rem_gain_order_[row] =
+                    std::nextafter(rem_gain_order_[row + 1] + member_pos_gain[m][pos],
+                                   std::numeric_limits<double>::infinity());
+            }
+
+            for (int row = 0; row < n; ++row) {
+                const int m = members[row];
+                const int pos = ord[row];
+                const double scale = std::max(1.0, game.member_max_power[m]);
+                order_class_order_[row].resize(classes[m].size());
+                std::iota(order_class_order_[row].begin(), order_class_order_[row].end(), 0);
+                std::stable_sort(
+                    order_class_order_[row].begin(), order_class_order_[row].end(),
+                    [&](int a, int b) {
+                        return class_power[row][a] * (bound.base + game.member_max_gain[m]) +
+                                   scale * bound.gains[classes[m][a].pair][pos] >
+                               class_power[row][b] * (bound.base + game.member_max_gain[m]) +
+                                   scale * bound.gains[classes[m][b].pair][pos];
+                    });
+            }
+
+            order_classes_dfs(ord, 0, 0, 0);
+            if (timed_out)
+                return;
+        }
+    }
+
+    void complete(double power_upper) {
+        SelectionSet mask;
+        std::vector<const Member *> team;
+        for (int m : members) {
+            mask.insert(m);
+            team.push_back(shared.members[m]);
+        }
+        for (auto excluded : shared.excluded_member_sets)
+            if (mask == excluded)
+                return;
+        for (auto id : shared.required_members)
+            if (std::none_of(team.begin(), team.end(),
+                             [&](const Member *m) { return m->id == id; }))
+                return;
+
+        const int n = shared.team_size;
+        const int states = 1 << n;
+        std::array<double, 1 << kMaxTeam> assign_dp;
+        assign_dp.fill(-1.0);
+        assign_dp[0] = 0.0;
+        for (int msk = 0; msk < states; ++msk) {
+            if (assign_dp[msk] < 0)
+                continue;
+            const int row = __builtin_popcount(static_cast<unsigned>(msk));
+            if (row >= n)
+                continue;
+            const int m = members[row];
+            for (int k = 0; k < n; ++k) {
+                if (!(msk & (1 << k))) {
+                    const int next = msk | (1 << k);
+                    const double v = std::nextafter(assign_dp[msk] + member_pos_gain[m][k],
+                                                    std::numeric_limits<double>::infinity());
+                    if (v > assign_dp[next])
+                        assign_dp[next] = v;
+                }
+            }
+        }
+        const double max_assigned_gain = assign_dp[states - 1];
+        if (cap(power_upper, max_assigned_gain) <= cutoff()) {
+            ++pruned;
+            ++composition_bound_pruned;
+            return;
+        }
+
+        ++compositions;
+        exact_power.assign(n, std::vector<int64_t>(shared.snap_count));
+        class_power.resize(n);
+        class_order.resize(n);
+        selected_classes.resize(n);
+        for (int row = 0; row < n; ++row) {
+            const int m = members[row];
+            class_power[row].assign(classes[m].size(), std::numeric_limits<int64_t>::min());
+            class_order[row].resize(classes[m].size());
+            std::iota(class_order[row].begin(), class_order[row].end(), 0);
+            for (int s = 0; s < shared.snap_count; ++s) {
+                const auto p = shared.engine->slot_power(game.leader_member, m, s, &team);
+                exact_power[row][s] = p;
+                class_power[row][class_of[m][s]] = std::max(class_power[row][class_of[m][s]], p);
+            }
+        }
+        rem_power_[n] = 0;
+        for (int row = n - 1; row >= 0; --row) {
+            rem_power_[row] = rem_power_[row + 1] +
+                              *std::max_element(class_power[row].begin(), class_power[row].end());
+        }
+
+        if (shared.average_objective) {
+            for (int row = 0; row < n; ++row) {
+                const int m = members[row];
+                const double scale = std::max(1.0, game.member_max_power[m]);
+                std::stable_sort(
+                    class_order[row].begin(), class_order[row].end(), [&](int a, int b) {
+                        return class_power[row][a] * (bound.base + game.member_max_gain[m]) +
+                                   scale * class_gain(m, a) >
+                               class_power[row][b] * (bound.base + game.member_max_gain[m]) +
+                                   scale * class_gain(m, b);
+                    });
+            }
+            rem_gain_[n] = 0.0;
+            for (int row = n - 1; row >= 0; --row) {
+                double maximum = 0;
+                for (int c : class_order[row])
+                    maximum = std::max(maximum, class_gain(members[row], c));
+                rem_gain_[row] = std::nextafter(rem_gain_[row + 1] + maximum,
+                                                std::numeric_limits<double>::infinity());
+            }
+            bindings(0, 0, 0);
+            return;
+        }
+
+        orders_search();
+    }
+
+    void compositions_dfs(int begin, SelectionSet characters, double power, double gain,
+                          std::array<double, kMaxTeam> selected_pos_max) {
+        ++nodes;
+        if (expired())
+            return;
+        const int remaining = shared.team_size - members.size();
+        if (!remaining) {
+            complete(power);
+            return;
+        }
+        const int depth = members.size();
+        auto &powers = dfs_powers_[depth];
+        auto &gains = dfs_gains_[depth];
+        std::fill(powers.begin(), powers.end(), -1.0);
+        std::fill(gains.begin(), gains.end(), 0.0);
+        std::array<double, kMaxTeam> cand_pos_max{};
+        for (int i = begin; i < static_cast<int>(candidates.size()); ++i) {
+            const int m = candidates[i], character = shared.members[m]->character;
+            if (m == game.leader_member ||
+                (shared.distinct_characters && characters.contains(character)))
+                continue;
+            const int group = shared.distinct_characters ? shared.character_groups[m] : m;
+            powers[group] = std::max(powers[group], game.member_max_power[m]);
+            gains[group] = std::max(gains[group], game.member_max_gain[m]);
+            for (int k = 0; k < shared.team_size; ++k)
+                cand_pos_max[k] = std::max(cand_pos_max[k], member_pos_gain[m][k]);
+        }
+        if (std::count_if(powers.begin(), powers.end(), [](double p) { return p >= 0; }) <
+            remaining)
+            return;
+        std::sort(powers.begin(), powers.end(), std::greater<double>());
+        std::sort(gains.begin(), gains.end(), std::greater<double>());
+        double p = power, g = gain;
+        for (int i = 0; i < remaining; ++i) {
+            p += powers[i];
+            g = std::nextafter(g + gains[i], std::numeric_limits<double>::infinity());
+        }
+        double pos_gain = 0.0;
+        for (int k = 0; k < shared.team_size; ++k) {
+            pos_gain = std::nextafter(pos_gain + std::max(selected_pos_max[k], cand_pos_max[k]),
+                                      std::numeric_limits<double>::infinity());
+        }
+        const double safe_gain = std::min(g, pos_gain);
+        if (cap(p, safe_gain) <= cutoff()) {
+            ++pruned;
+            return;
+        }
+        for (int i = begin; i < static_cast<int>(candidates.size()); ++i) {
+            const int m = candidates[i], character = shared.members[m]->character;
+            if (m == game.leader_member ||
+                (shared.distinct_characters && characters.contains(character)))
+                continue;
+            members.push_back(m);
+            std::array<double, kMaxTeam> next_pos_max = selected_pos_max;
+            for (int k = 0; k < shared.team_size; ++k)
+                next_pos_max[k] = std::max(next_pos_max[k], member_pos_gain[m][k]);
+            compositions_dfs(i + 1, characters.with(character), power + game.member_max_power[m],
+                             std::nextafter(gain + game.member_max_gain[m],
+                                            std::numeric_limits<double>::infinity()),
+                             next_pos_max);
+            members.pop_back();
+            if (timed_out)
+                return;
+        }
+    }
+};
+
 struct BeamState {
     int depth = 0;
     SelectionSet member_set;
@@ -1460,9 +1990,31 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             best_by_leader[formation.leader] = candidate;
     }
     const bool seeded_exact = exact_mode && !pool.empty();
+    bool class_search_enabled = exact_mode && theoretical && options.top == 1 &&
+                                shared.distinct_snapshots && shared.linear_score_bound_enabled;
+    for (auto id : leader_ids)
+        class_search_enabled =
+            class_search_enabled &&
+            std::isfinite(linear_score_upper(
+                shared, leader_potential[id],
+                *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end()) *
+                    team_size)) &&
+            linear_score_upper(
+                shared, leader_potential[id],
+                *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end()) *
+                    team_size) < static_cast<double>(std::numeric_limits<int64_t>::max() / 2);
+    std::unique_ptr<ClassSearch> class_search;
+    const int64_t seed_score_evaluations = shared.score_evaluations;
+    if (class_search_enabled) {
+        class_search = std::make_unique<ClassSearch>(shared);
+        for (const auto &entry : pool)
+            if (!class_search->best.found || entry.second.index > class_search->best.index)
+                class_search->best = entry.second;
+    }
+    const bool bypass_heuristics = seeded_exact || class_search_enabled;
 
     shared.score_objective = false;
-    if (!seeded_exact) {
+    if (!bypass_heuristics) {
 
         for (auto &entry : pool)
             entry.second.index = entry.second.evaluation.index;
@@ -1560,7 +2112,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             }
         }
     }
-    if (theoretical && !seeded_exact) {
+    if (theoretical && !bypass_heuristics) {
 
         std::vector<Solution> shortlist;
         for (auto &entry : pool)
@@ -1595,7 +2147,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     }
     shared.score_objective = theoretical;
 
-    if (theoretical && !seeded_exact && !exact_mode) {
+    if (theoretical && !bypass_heuristics && !exact_mode) {
         std::vector<int64_t> neighborhood_leaders;
         for (const auto &[leader_id, candidate] : best_by_leader)
             neighborhood_leaders.push_back(leader_id);
@@ -1629,6 +2181,42 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             if (wall_s() > deadline) {
                 certified = false;
                 break;
+            }
+            if (class_search) {
+                auto &search = *class_search;
+                search.game = build_game(leader_id, false);
+                search.candidates.resize(shared.member_count);
+                std::iota(search.candidates.begin(), search.candidates.end(), 0);
+                const double p = std::max(1.0, leader_potential[leader_id] * 0.5);
+                const double g = *std::max_element(search.game.member_max_gain.begin(),
+                                                   search.game.member_max_gain.end()) *
+                                 team_size * 0.5;
+                std::stable_sort(
+                    search.candidates.begin(), search.candidates.end(), [&](int a, int b) {
+                        return search.game.member_max_power[a] * (search.bound.base + g) +
+                                   p * search.game.member_max_gain[a] >
+                               search.game.member_max_power[b] * (search.bound.base + g) +
+                                   p * search.game.member_max_gain[b];
+                    });
+                const int lm = search.game.leader_member;
+                search.members = {lm};
+                std::array<double, kMaxTeam> selected_pos_max{};
+                for (int k = 0; k < shared.team_size; ++k)
+                    selected_pos_max[k] = search.member_pos_gain[lm][k];
+                search.compositions_dfs(0, SelectionSet::single(shared.members[lm]->character),
+                                        search.game.member_max_power[lm],
+                                        search.game.member_max_gain[lm], selected_pos_max);
+                if (search.best.found)
+                    pool[search.best.member_set] = search.best;
+                if (search.timed_out) {
+                    certified = false;
+                    break;
+                }
+                ++leaders_proven;
+                if (options.progress)
+                    options.progress("proven leader " + std::to_string(leader_id) +
+                                     " member nodes " + std::to_string(search.nodes));
+                continue;
             }
             auto incumbent = best_by_leader.find(leader_id);
             Game game = build_game(leader_id, !theoretical);
@@ -1716,6 +2304,21 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
 
     RankResult result;
     for (Solution &solution : ordered) {
+        if (class_search) {
+            Formation formation;
+            formation.leader = solution.evaluation.leader;
+            for (const auto &slot : solution.evaluation.slots)
+                formation.slots.push_back({slot.member, slot.snapshot, slot.trigger});
+            const auto replay = shared.average_objective ? engine.evaluate_mean(formation)
+                                                         : engine.evaluate_theoretical(formation);
+            if (replay.ranking_score != solution.evaluation.ranking_score)
+                throw SpecError("技能分类搜索与完整分数复算不一致");
+            solution.evaluation = replay;
+            int64_t orders = 1;
+            for (int i = 2; i <= team_size; ++i)
+                orders *= i;
+            class_search->order_stats.evaluated += orders;
+        }
         engine.populate_estimated_score(solution.evaluation);
         result.results.push_back(std::move(solution.evaluation));
     }
@@ -1724,7 +2327,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     }
 
     Json audit = Json::object();
-    audit.set("solver", Json(exact_mode ? "beam-annealing-lns-dp-dfs" : "beam-annealing-lns-dp"));
+    audit.set("solver", Json(class_search ? "snapshot-classes-matching-dfs"
+                             : exact_mode ? "beam-annealing-lns-dp-dfs"
+                                          : "beam-annealing-lns-dp"));
     audit.set("lns_neighborhoods", Json(neighborhood_stats.neighborhoods));
     audit.set("lns_proposals", Json(neighborhood_stats.proposals));
     audit.set("lns_evaluations", Json(neighborhood_stats.evaluations));
@@ -1732,7 +2337,21 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     audit.set("lns_bound_pruned", Json(neighborhood_stats.bound_pruned));
     audit.set("lns_elapsed_s", Json(neighborhood_stats.elapsed_s));
     audit.set("dfs_branch_order", Json("power_and_skill_potential"));
-    audit.set("dfs_nodes", Json(dfs_nodes));
+    audit.set("dfs_nodes",
+              Json(class_search ? class_search->nodes + class_search->class_nodes : dfs_nodes));
+    if (class_search) {
+        int64_t classes = 0;
+        for (const auto &row : class_search->classes)
+            classes += row.size();
+        audit.set("snapshot_skill_classes", Json(classes));
+        audit.set("member_compositions", Json(class_search->compositions));
+        audit.set("snapshot_matchings", Json(class_search->matchings));
+        audit.set("snapshot_matching_cache_hits", Json(class_search->matching_cache_hits));
+        audit.set("composition_bound_pruned", Json(class_search->composition_bound_pruned));
+        audit.set("class_orders_pruned", Json(class_search->order_bound_pruned));
+        audit.set("class_bound_pruned", Json(class_search->pruned));
+        audit.set("score_orders_pruned", Json(class_search->order_stats.pruned));
+    }
     audit.set("cheap_bound_pruned", Json(cheap_bound_pruned));
     audit.set("anneal_proposals", Json(anneal_stats.proposals));
     audit.set("anneal_accepted", Json(anneal_stats.accepted));
@@ -1762,8 +2381,9 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     audit.set("supplied_seed_formations", Json(supplied_seeds));
     audit.set("accepted_seed_formations", Json(accepted_seeds));
     audit.set("excluded_seed_formations", Json(excluded_seeds));
-    audit.set("warm_start_strategy",
-              Json(seeded_exact ? "validated_prior_formations" : "beam_annealing"));
+    audit.set("warm_start_strategy", Json(seeded_exact   ? "validated_prior_formations"
+                                          : class_search ? "none"
+                                                         : "beam_annealing"));
     audit.set("complete_beam_variants_per_member_set", Json(4));
     audit.set("index_snapshot_pruning_used_in_score_dfs", Json(false));
     audit.set(
@@ -1783,7 +2403,10 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     int64_t permutations = 1;
     for (int i = 2; i <= team_size; ++i)
         permutations *= i;
-    audit.set("score_orders_evaluated", Json(shared.score_evaluations * permutations));
+    audit.set("score_orders_evaluated",
+              Json(class_search
+                       ? seed_score_evaluations * permutations + class_search->order_stats.evaluated
+                       : shared.score_evaluations * permutations));
     audit.set("certified", Json(certified));
     audit.set("stop_reason",
               Json(certified ? "searched" : (exact_mode ? "time_limit" : "heuristic")));

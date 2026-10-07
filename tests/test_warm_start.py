@@ -103,7 +103,8 @@ def main():
         next_rank["audit"]["accepted_seed_formations"] == 0
         and next_rank["audit"]["excluded_seed_formations"] == 1
     )
-    assert next_rank["audit"]["warm_start_strategy"] == "beam_annealing"
+    assert next_rank["audit"]["warm_start_strategy"] == "none"
+    assert next_rank["audit"]["solver"] == "snapshot-classes-matching-dfs"
     expected_next = max(oracle(p, m["id"], excluded)["score"] for m in p["catalog"]["members"])
     assert next_rank["results"][0]["ranking_score"] == expected_next
 

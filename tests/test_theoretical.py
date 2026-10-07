@@ -57,6 +57,19 @@ def oracle(p, leader_id=40, excluded=()):
         combos.append(native)
         weights.append(percentages[n["op"]] / 100 * (1 + combo))
     baseweight = math.fsum(weights)
+    supp_map = {
+        sk["id"]: sum(e["value"] for e in sk.get("effects", []) if e.get("effect_type") == 15000)
+        for sk in c.get("support_skills", [])
+    }
+    snap_dur = {
+        s["id"]: 500
+        + (
+            sum(supp_map.get(sid, 0) for sid in s.get("support_skills", []))
+            if s.get("support_skills")
+            else (s["id"] - 1) * 250
+        )
+        for s in c["snapshots"]
+    }
     maxmean = -1
     maxscore = -1
     maxindex = -1
@@ -92,7 +105,7 @@ def oracle(p, leader_id=40, excluded=()):
                 windows = [
                     (
                         p["chart"]["skill_times_ms"][k],
-                        p["chart"]["skill_times_ms"][k] + 500 + (s["id"] - 1) * 250,
+                        p["chart"]["skill_times_ms"][k] + snap_dur[s["id"]],
                         boost[m["live_skill"]],
                         k,
                     )
@@ -170,7 +183,7 @@ def oracle(p, leader_id=40, excluded=()):
     }
 
 
-def run(p, objective=None, detail=False, seconds=10, leaders="40", excluded=()):
+def run(p, objective=None, detail=False, seconds=10, leaders="40", excluded=(), top=1):
     with tempfile.TemporaryDirectory() as folder:
         f = Path(folder) / "p.json"
         f.write_text(json.dumps(p))
@@ -187,7 +200,7 @@ def run(p, objective=None, detail=False, seconds=10, leaders="40", excluded=()):
             "--time-limit",
             str(seconds),
             "--top",
-            "1",
+            str(top),
             "--quiet",
         ]
         if excluded:
@@ -349,9 +362,101 @@ def main():
         )
         assert json.loads(theoretical.stdout)["results"][0]["ranking_score"] == a["ranking_score"]
 
-    tiny = run(prepared(0), seconds=0.00001)
-    assert tiny["audit"]["theoretical_max_certified"] is False
-    assert tiny["audit"]["certified"] is False
+    p_coll = prepared(1)
+    s1 = copy.deepcopy(p_coll["catalog"]["snapshots"][0])
+    s_high = copy.deepcopy(s1)
+    s_high["id"] = 999
+    s_high["trained"] = [99999, 0, 0]
+    p_coll["catalog"]["snapshots"].append(s_high)
+    d_coll = run(p_coll, seconds=0)
+    assert d_coll["audit"]["theoretical_max_certified"]
+    assert 999 in {s["snapshot"] for s in d_coll["results"][0]["assignments"]}
+    assert d_coll["results"][0]["ranking_score"] == oracle(p_coll)["score"]
+
+    p_req = prepared(2)
+    p_req["constraints"]["required_snapshots"] = [3]
+    p_req["constraints"]["required_members"] = [20]
+    d_req = run(p_req, seconds=0)
+    assert d_req["audit"]["theoretical_max_certified"]
+    assignments_req = d_req["results"][0]["assignments"]
+    assert 3 in {s["snapshot"] for s in assignments_req}
+    assert 20 in d_req["results"][0]["members"]
+    assert len({s["snapshot"] for s in assignments_req}) == len(assignments_req)
+    assert d_req["results"][0]["ranking_score"] == oracle(p_req)["score"]
+
+    p_ov = prepared(3)
+    p_ov["chart"]["skill_times_ms"] = [0, 100, 200]
+    for s in p_ov["catalog"]["snapshots"]:
+        s["support_skills"] = [4]
+    d_ov_score = run(p_ov, objective="score", seconds=0)
+    assert d_ov_score["audit"]["theoretical_max_certified"]
+    assert d_ov_score["audit"]["score_orders_pruned"] > 0
+    assert d_ov_score["results"][0]["ranking_score"] == oracle(p_ov)["score"]
+    d_ov_mean = run(p_ov, objective="mean", seconds=0)
+    assert d_ov_mean["audit"]["mean_score_certified"]
+    assert d_ov_mean["results"][0]["ranking_score"] == oracle(p_ov)["mean_score"]
+
+    d_fallback = run(p_ov, objective="score", seconds=0, top=2)
+    assert d_fallback["audit"]["solver"] == "beam-annealing-lns-dp-dfs"
+    assert d_fallback["audit"]["certified"]
+    assert d_fallback["results"][0]["ranking_score"] == oracle(p_ov)["score"]
+
+    p_inf = copy.deepcopy(p_ov)
+    p_inf["constraints"]["required_members"] = [10, 20, 30, 40]
+    d_inf = run(p_inf, objective="score", seconds=0)
+    assert d_inf["audit"]["infeasible_proven"]
+    assert len(d_inf["results"]) == 0
+
+    p_pos = prepared(2)
+    p_pos["chart"]["skill_times_ms"] = [0, 50, 150]
+    snap_a = copy.deepcopy(p_pos["catalog"]["snapshots"][0])
+    snap_a["id"] = 998
+    snap_a["support_skills"] = [1]
+    snap_b = copy.deepcopy(p_pos["catalog"]["snapshots"][1])
+    snap_b["id"] = 999
+    snap_b["support_skills"] = [4]
+    p_pos["catalog"]["snapshots"].extend([snap_a, snap_b])
+    d_pos_score = run(p_pos, objective="score", seconds=0)
+    assert d_pos_score["audit"]["theoretical_max_certified"]
+    assert d_pos_score["results"][0]["ranking_score"] == oracle(p_pos)["score"]
+    d_pos_mean = run(p_pos, objective="mean", seconds=0)
+    assert d_pos_mean["audit"]["mean_score_certified"]
+    assert d_pos_mean["results"][0]["ranking_score"] == oracle(p_pos)["mean_score"]
+
+    p_classes = prepared(2)
+    p_classes["settings"]["team_size"] = 1
+    p_classes["chart"]["skill_times_ms"] = [0]
+    for i, note in enumerate(p_classes["chart"]["notes"]):
+        note["t"] = i
+    template = p_classes["catalog"]["snapshots"][0]
+    p_classes["catalog"]["snapshots"] = []
+    p_classes["catalog"]["support_skills"] = []
+    for i in range(257):
+        snap = copy.deepcopy(template)
+        snap["id"] = i + 1
+        snap["support_skills"] = [i + 1]
+        p_classes["catalog"]["snapshots"].append(snap)
+        p_classes["catalog"]["support_skills"].append(
+            {"id": i + 1, "effects": [{"level": 5, "effect_type": 15000, "value": i * 250}]}
+        )
+    p_classes["constraints"]["required_snapshots"] = [257]
+    p_classes["constraints"]["required_members"] = [40]
+    d_classes = run(p_classes, objective="score", seconds=0)
+    assert d_classes["audit"]["theoretical_max_certified"]
+    assert d_classes["audit"]["snapshot_skill_classes"] > 256
+    assert d_classes["results"][0]["assignments"][0]["snapshot"] == 257
+    assert d_classes["results"][0]["ranking_score"] == oracle(p_classes)["score"], (
+        d_classes["results"][0],
+        oracle(p_classes),
+    )
+
+    for objective in ("score", "mean"):
+        tiny = run(prepared(0), objective=objective, seconds=0.00001)
+        assert not tiny["audit"]["certified"]
+        assert not tiny["audit"]["theoretical_max_certified"]
+        assert not tiny["audit"]["mean_score_certified"]
+        assert tiny["audit"]["stop_reason"] == "time_limit"
+
     print(
         "Theoretical score exhaustive oracle passed: 16 native float32 cases and index/score inversion"
     )

@@ -138,6 +138,10 @@ struct NativeScoreBound {
                         size_t note_count);
 };
 
+struct ScoreOrderStats {
+    int64_t evaluated = 0, pruned = 0;
+};
+
 using PowerMatrix = std::vector<std::vector<int64_t>>;
 
 class EngineCache {
@@ -208,6 +212,9 @@ public:
                               const std::function<bool(const Evaluation &)> &visitor) const;
     Evaluation evaluate_theoretical(const Formation &formation, bool detail = false) const;
     Evaluation evaluate_mean(const Formation &formation, bool detail = false) const;
+    std::optional<Evaluation> evaluate_best_order(const Formation &formation,
+                                                  const NativeScoreBound &bound, double cutoff,
+                                                  ScoreOrderStats &stats) const;
     double theoretical_upper_bound(double power_bound, const std::vector<float> &live_bound) const;
     NativeScoreBound linear_score_bound(const std::vector<float> &live_bound) const;
 

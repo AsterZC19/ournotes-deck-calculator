@@ -7,7 +7,7 @@ from test_game_rules import invoke
 from test_theoretical import oracle, prepared
 
 
-def rank(p, objective, method):
+def rank(p, objective, method, top=1):
     result, data = invoke(
         p,
         "rank",
@@ -22,7 +22,7 @@ def rank(p, objective, method):
             "--time-limit",
             "0",
             "--top",
-            "1",
+            str(top),
             "--beam-width",
             "1",
             "--restarts",
@@ -69,9 +69,12 @@ def main():
         skill["effects"][0]["value"] = 1000
     expected = oracle(p)
     for objective, key in (("mean", "mean_score"), ("score", "score")):
-        data = rank(p, objective, "exact")
+        data = rank(p, objective, "exact", top=2)
         assert data["audit"]["certified"] and data["audit"]["lns_proposals"] > 0
         assert data["results"][0]["ranking_score"] == expected[key]
+        exact_top1 = rank(p, objective, "exact", top=1)
+        assert exact_top1["audit"]["certified"]
+        assert exact_top1["results"][0]["ranking_score"] == expected[key]
 
     infeasible = prepared(1)
     for member in infeasible["catalog"]["members"]:

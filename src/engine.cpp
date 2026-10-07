@@ -1688,8 +1688,8 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
     for (size_t m = 0; m < member_count; ++m) {
         const Member &member = *members_[m];
         common[m] = member_common(member, fix, float32_mode);
-        if (formation_conditions &&
-            std::any_of(common[m].begin(), common[m].end(), [](int64_t value) { return value < 0; })) {
+        if (formation_conditions && std::any_of(common[m].begin(), common[m].end(),
+                                                [](int64_t value) { return value < 0; })) {
             throw SpecError("编队条件搜索要求成员基础综合力各项非负，无法为负值建立安全上界");
         }
         if (problem_.song.type == member.card_type) {
@@ -2302,6 +2302,101 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
     best.warnings.push_back(
         "ranking_score 是 AP 且随机技能顺序最有利时的模型最高分，不是每局保证得分。");
     return best;
+}
+
+std::optional<Evaluation> Engine::evaluate_best_order(const Formation &formation,
+                                                      const NativeScoreBound &bound, double cutoff,
+                                                      ScoreOrderStats &stats) const {
+    EvalOptions options;
+    options.order_search = "given";
+    options.calculate_score = false;
+    const Evaluation base = evaluate(formation, options);
+    struct Order {
+        std::vector<int> positions;
+        double cap;
+    };
+    std::vector<Order> orders;
+    std::vector<int> positions(team_size());
+    std::iota(positions.begin(), positions.end(), 0);
+    do {
+        double gain = 0;
+        for (int i = 0; i < team_size(); ++i) {
+            const auto &slot = base.slots[i];
+            const int pair =
+                member_pos(slot.member) * snapshots().size() + snapshot_pos(slot.snapshot);
+            gain = std::nextafter(gain + bound.gains[pair][positions[i]],
+                                  std::numeric_limits<double>::infinity());
+        }
+        orders.push_back(
+            {positions, NativeScoreBound::upper(base.power, gain, bound.base, bound.max_power,
+                                                team_size(), chart_.times.size())});
+    } while (std::next_permutation(positions.begin(), positions.end()));
+    std::stable_sort(orders.begin(), orders.end(),
+                     [](const Order &a, const Order &b) { return a.cap > b.cap; });
+    const auto &settings = problem_.settings;
+    float difficulty = static_cast<float>(problem_.chart.level - settings.score.level_base);
+    difficulty *= static_cast<float>(*settings.score.level_alpha);
+    difficulty += 1.0f;
+    float note_base =
+        static_cast<float>(settings.score.adjustment_factor) * static_cast<float>(base.power);
+    note_base *= difficulty;
+    const float life =
+        settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
+    const float assist =
+        settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100.0) : 1.0f;
+    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
+    std::vector<float> before_live(chart_.times.size());
+    for (size_t i = 0; i < before_live.size(); ++i) {
+        float value = static_cast<float>(chart_.note_weights[i]) * note_base;
+        value *= judgement;
+        value *= chart_.native_combo_bonuses[i] + 1.0f;
+        before_live[i] = value;
+    }
+    std::vector<int> best;
+    for (const auto &order : orders) {
+        if (order.cap <= cutoff) {
+            ++stats.pruned;
+            continue;
+        }
+        std::vector<int> slots(team_size());
+        for (int i = 0; i < team_size(); ++i)
+            slots[order.positions[i]] = i;
+        int64_t total = 0;
+        for (size_t i = 0; i < chart_.times.size(); ++i) {
+            float live = 0;
+            // The scorer accumulates overlapping boosts in trigger order, including float rounding.
+            for (int k = 0; k < team_size(); ++k) {
+                const auto &slot = base.slots[slots[k]];
+                const auto start = problem_.chart.skill_times_ms[k];
+                if (chart_.times[i] >= start && chart_.times[i] < start + slot.duration_ms)
+                    live += static_cast<float>(slot.live_boost);
+            }
+            float value = before_live[i] * (1.0f + live);
+            value /= static_cast<float>(chart_.converted_note_count);
+            value = std::floor(value);
+            value *= life;
+            value *= assist;
+            total += static_cast<int64_t>(std::floor(value));
+        }
+        ++stats.evaluated;
+        if (total > cutoff) {
+            cutoff = static_cast<double>(total);
+            best = order.positions;
+        }
+    }
+    if (best.empty())
+        return std::nullopt;
+    Formation selected;
+    selected.leader = formation.leader;
+    for (int i = 0; i < team_size(); ++i)
+        selected.slots.push_back({base.slots[i].member, base.slots[i].snapshot, best[i] + 1});
+    options.calculate_score = true;
+    Evaluation result = evaluate(selected, options);
+    if (num_field(result.estimated_score, "total") != cutoff)
+        throw SpecError("技能顺序快速计分与完整计分不一致");
+    result.ranking_objective = "theoretical_score";
+    result.ranking_score = cutoff;
+    return result;
 }
 
 Evaluation Engine::evaluate_mean(const Formation &formation, bool detail) const {
