@@ -2236,6 +2236,64 @@ bool Engine::for_each_score_order(const Formation &formation,
     return true;
 }
 
+namespace {
+
+struct FastScoreParams {
+    std::vector<float> before_live;
+    float converted = 1.0f;
+    float life = 1.0f;
+    float assist = 1.0f;
+};
+
+FastScoreParams make_fast_score_params(const Problem &problem, const ChartData &chart,
+                                       int64_t power) {
+    const auto &settings = problem.settings;
+    float difficulty = static_cast<float>(problem.chart.level - settings.score.level_base);
+    difficulty *= static_cast<float>(*settings.score.level_alpha);
+    difficulty += 1.0f;
+    float note_base =
+        static_cast<float>(settings.score.adjustment_factor) * static_cast<float>(power);
+    note_base *= difficulty;
+    FastScoreParams params;
+    params.converted = static_cast<float>(chart.converted_note_count);
+    params.life = settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
+    params.assist =
+        settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100.0) : 1.0f;
+    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
+    params.before_live.resize(chart.times.size());
+    for (size_t i = 0; i < params.before_live.size(); ++i) {
+        float value = static_cast<float>(chart.note_weights[i]) * note_base;
+        value *= judgement;
+        value *= chart.native_combo_bonuses[i] + 1.0f;
+        params.before_live[i] = value;
+    }
+    return params;
+}
+
+int64_t score_order_native(const FastScoreParams &params, const std::vector<int64_t> &chart_times,
+                            int n, const int64_t *starts, const int64_t *ends,
+                            const float *boosts) {
+    int64_t total = 0;
+    const size_t note_count = chart_times.size();
+    for (size_t i = 0; i < note_count; ++i) {
+        float live = 0.0f;
+        const int64_t t = chart_times[i];
+        for (int k = 0; k < n; ++k) {
+            if (t >= starts[k] && t < ends[k])
+                live += boosts[k];
+        }
+        float value = params.before_live[i] * (1.0f + live);
+        value /= params.converted;
+        value = std::floor(value);
+        value *= params.life;
+        value *= params.assist;
+        total += static_cast<int64_t>(std::floor(value));
+    }
+    return total;
+}
+
+} // namespace
+
 Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail) const {
     validate_theoretical_scope();
     formation.validate(problem_);
@@ -2258,30 +2316,86 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
     double maximum = -std::numeric_limits<double>::infinity(),
            minimum = std::numeric_limits<double>::infinity(), sum = 0;
     int64_t count = 0;
-    do {
-        auto slots = original_slots;
-        for (int i = 0; i < team_size(); ++i)
-            slots[i].trigger = permutation[i] + 1;
-        std::sort(slots.begin(), slots.end(), [](const SlotEval &left, const SlotEval &right) {
-            return left.trigger < right.trigger;
-        });
-        const Json result = absolute_score_block(problem_, chart_, boosts(), member_pos_, slots,
-                                                 base.power, base.weight_factor);
-        const double score = num_field(result, "total");
-        if (score > maximum) {
-            maximum = score;
-            for (int i = 0; i < team_size(); ++i)
-                selected.slots[i].trigger = permutation[i] + 1;
+    std::vector<int> best_permutation = permutation;
+
+    const auto &settings = problem_.settings;
+    const bool fast_applicable =
+        settings.score.level_alpha.has_value() &&
+        settings.score.rounding == "float32_floor" &&
+        settings.judgement.mode == "all_perfect" &&
+        settings.life.mode == "constant" &&
+        !settings.gekisou.enabled &&
+        chart_.converted_note_count > 0 &&
+        team_size() >= 1 &&
+        settings.judgement.factors.find("perfect") != settings.judgement.factors.end();
+
+    if (fast_applicable) {
+        const auto params = make_fast_score_params(problem_, chart_, base.power);
+        const int n = team_size();
+        struct FastSlot {
+            int64_t duration_ms = 0;
+            float live_boost = 0.0f;
+        };
+        std::vector<FastSlot> fast_slots(n);
+        for (int i = 0; i < n; ++i) {
+            fast_slots[i] = {original_slots[i].duration_ms,
+                             static_cast<float>(original_slots[i].live_boost)};
         }
-        minimum = std::min(minimum, score);
-        sum += score;
-        ++count;
-    } while (std::next_permutation(permutation.begin(), permutation.end()));
+        std::vector<int64_t> starts(n), ends(n);
+        std::vector<float> boosts(n);
+        for (int k = 0; k < n; ++k)
+            starts[k] = problem_.chart.skill_times_ms[k];
+        std::vector<int> slots_at_trigger(n);
+        do {
+            for (int i = 0; i < n; ++i)
+                slots_at_trigger[permutation[i]] = i;
+            for (int k = 0; k < n; ++k) {
+                const int slot_idx = slots_at_trigger[k];
+                ends[k] = starts[k] + fast_slots[slot_idx].duration_ms;
+                boosts[k] = fast_slots[slot_idx].live_boost;
+            }
+            const int64_t total = score_order_native(params, chart_.times, n,
+                                                     starts.data(), ends.data(), boosts.data());
+            const double score = static_cast<double>(total);
+            if (score > maximum) {
+                maximum = score;
+                best_permutation = permutation;
+            }
+            minimum = std::min(minimum, score);
+            sum += score;
+            ++count;
+        } while (std::next_permutation(permutation.begin(), permutation.end()));
+    } else {
+        do {
+            auto slots = original_slots;
+            for (int i = 0; i < team_size(); ++i)
+                slots[i].trigger = permutation[i] + 1;
+            std::sort(slots.begin(), slots.end(), [](const SlotEval &left, const SlotEval &right) {
+                return left.trigger < right.trigger;
+            });
+            const Json result = absolute_score_block(problem_, chart_, boosts(), member_pos_, slots,
+                                                     base.power, base.weight_factor);
+            const double score = num_field(result, "total");
+            if (score > maximum) {
+                maximum = score;
+                best_permutation = permutation;
+            }
+            minimum = std::min(minimum, score);
+            sum += score;
+            ++count;
+        } while (std::next_permutation(permutation.begin(), permutation.end()));
+    }
+
+    for (int i = 0; i < team_size(); ++i)
+        selected.slots[i].trigger = best_permutation[i] + 1;
     EvalOptions selected_options;
     selected_options.order_search = "given";
     selected_options.validate = false;
     selected_options.detail = detail;
     Evaluation best = evaluate(selected, selected_options);
+    if (num_field(best.estimated_score, "total") != maximum) {
+        throw SpecError("技能顺序快速计分与完整计分不一致");
+    }
     Json order = Json::array();
     for (int trigger = 1; trigger <= team_size(); ++trigger)
         for (const auto &slot : best.slots)
@@ -2295,7 +2409,7 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
     best.order_analysis.set("best_order_is_controllable", Json(false));
     best.order_analysis.set("best_score_order", std::move(order));
     best.order_analysis.set("best_score", Json(maximum));
-    best.order_analysis.set("mean_score", Json(sum / count));
+    best.order_analysis.set("mean_score", Json(count > 0 ? sum / count : 0.0));
     best.order_analysis.set("worst_score", Json(minimum));
     best.order_analysis.set("score_permutations", Json(count));
     best.order_analysis.set("order_search_complete", Json(true));
@@ -2333,51 +2447,28 @@ std::optional<Evaluation> Engine::evaluate_best_order(const Formation &formation
     } while (std::next_permutation(positions.begin(), positions.end()));
     std::stable_sort(orders.begin(), orders.end(),
                      [](const Order &a, const Order &b) { return a.cap > b.cap; });
-    const auto &settings = problem_.settings;
-    float difficulty = static_cast<float>(problem_.chart.level - settings.score.level_base);
-    difficulty *= static_cast<float>(*settings.score.level_alpha);
-    difficulty += 1.0f;
-    float note_base =
-        static_cast<float>(settings.score.adjustment_factor) * static_cast<float>(base.power);
-    note_base *= difficulty;
-    const float life =
-        settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
-    const float assist =
-        settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100.0) : 1.0f;
-    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
-    std::vector<float> before_live(chart_.times.size());
-    for (size_t i = 0; i < before_live.size(); ++i) {
-        float value = static_cast<float>(chart_.note_weights[i]) * note_base;
-        value *= judgement;
-        value *= chart_.native_combo_bonuses[i] + 1.0f;
-        before_live[i] = value;
-    }
+    const auto params = make_fast_score_params(problem_, chart_, base.power);
+    const int n = team_size();
+    std::vector<int64_t> starts(n), ends(n);
+    std::vector<float> boosts(n);
+    for (int k = 0; k < n; ++k)
+        starts[k] = problem_.chart.skill_times_ms[k];
+    std::vector<int> slots(n);
     std::vector<int> best;
     for (const auto &order : orders) {
         if (order.cap <= cutoff) {
             ++stats.pruned;
             continue;
         }
-        std::vector<int> slots(team_size());
-        for (int i = 0; i < team_size(); ++i)
+        for (int i = 0; i < n; ++i)
             slots[order.positions[i]] = i;
-        int64_t total = 0;
-        for (size_t i = 0; i < chart_.times.size(); ++i) {
-            float live = 0;
-            // The scorer accumulates overlapping boosts in trigger order, including float rounding.
-            for (int k = 0; k < team_size(); ++k) {
-                const auto &slot = base.slots[slots[k]];
-                const auto start = problem_.chart.skill_times_ms[k];
-                if (chart_.times[i] >= start && chart_.times[i] < start + slot.duration_ms)
-                    live += static_cast<float>(slot.live_boost);
-            }
-            float value = before_live[i] * (1.0f + live);
-            value /= static_cast<float>(chart_.converted_note_count);
-            value = std::floor(value);
-            value *= life;
-            value *= assist;
-            total += static_cast<int64_t>(std::floor(value));
+        for (int k = 0; k < n; ++k) {
+            const auto &slot = base.slots[slots[k]];
+            ends[k] = starts[k] + slot.duration_ms;
+            boosts[k] = static_cast<float>(slot.live_boost);
         }
+        const int64_t total = score_order_native(params, chart_.times, n,
+                                                 starts.data(), ends.data(), boosts.data());
         ++stats.evaluated;
         if (total > cutoff) {
             cutoff = static_cast<double>(total);

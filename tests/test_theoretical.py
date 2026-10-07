@@ -217,6 +217,40 @@ def run(p, objective=None, detail=False, seconds=10, leaders="40", excluded=(), 
         return json.loads(result.stdout)
 
 
+def topk_oracle(p, k=3, objective="score", allowed_leaders=None, excluded=()):
+    c = p["catalog"]
+    team_size = p["settings"]["team_size"]
+    all_combos = [
+        tuple(sorted(m["id"] for m in combo))
+        for combo in itertools.combinations(c["members"], team_size)
+    ]
+    req_m = set(p["constraints"].get("required_members", []))
+    ex_sets = {tuple(sorted(x)) for x in excluded}
+    valid_combos = [cb for cb in all_combos if req_m <= set(cb) and cb not in ex_sets]
+
+    if allowed_leaders is None:
+        allowed_leaders = [m["id"] for m in c["members"]]
+
+    best_per_combo = []
+    for combo in valid_combos:
+        best_score = -1
+        best_leader = -1
+        other_combos = [cb for cb in all_combos if cb != combo]
+        for leader_id in combo:
+            if leader_id not in allowed_leaders:
+                continue
+            res = oracle(p, leader_id=leader_id, excluded=other_combos)
+            s = res[objective if objective == "score" else "mean_score"]
+            if s > best_score:
+                best_score = s
+                best_leader = leader_id
+        if best_score >= 0:
+            best_per_combo.append((best_score, best_leader, list(combo)))
+
+    best_per_combo.sort(key=lambda x: x[0], reverse=True)
+    return best_per_combo[:k]
+
+
 def main():
     for seed in range(8):
         for reuse in (False, True):
@@ -459,8 +493,52 @@ def main():
         assert not tiny["audit"]["mean_score_certified"]
         assert tiny["audit"]["stop_reason"] == "time_limit"
 
+    p_dims = prepared(5)
+    p_dims["constraints"]["required_members"] = []
+    p_dims["constraints"]["required_snapshots"] = []
+    for i, s in enumerate(p_dims["catalog"]["snapshots"]):
+        s["support_skills"] = [i + 1]
+    for i, sk in enumerate(p_dims["catalog"]["support_skills"]):
+        sk["effects"] = [{"level": 5, "effect_type": 15000, "value": (i + 1) * 350}]
+    p_dims["chart"]["skill_times_ms"] = [0, 300, 600]
+    p_dims["catalog"]["note_parameters"] = [
+        {"op": 1, "score_percent": 100},
+        {"op": 2, "score_percent": 30},
+        {"op": 3, "score_percent": 140},
+        {"op": 4, "score_percent": 80},
+    ]
+    for i, n in enumerate(p_dims["chart"]["notes"]):
+        n["op"] = (i % 4) + 1
+    p_dims["catalog"]["combo_bonuses"] = [
+        {"type": 0, "required_combo_count": 2, "factor": 0.015},
+        {"type": 0, "required_combo_count": 5, "factor": 0.025},
+        {"type": 0, "required_combo_count": 8, "factor": 0.035},
+    ]
+    p_dims["settings"]["score_model"]["level_alpha"] = 0.0065
+    p_dims["settings"]["life"] = {"mode": "constant", "initial": 0, "onus_factor": 0.35}
+    p_dims["settings"]["assist"] = {"enabled": True, "score_percent": 85}
+
+    exp_dims_score = topk_oracle(p_dims, k=3, objective="score")
+    exp_dims_mean = topk_oracle(p_dims, k=3, objective="mean")
+
+    d_dims_score = run(p_dims, objective="score", top=3, leaders="10,20,30,40", seconds=0)
+    assert d_dims_score["audit"]["theoretical_max_certified"]
+    assert d_dims_score["audit"]["top_k_certified"]
+    assert len(d_dims_score["results"]) == 3
+    for exp, act in zip(exp_dims_score, d_dims_score["results"]):
+        assert act["ranking_score"] == exp[0]
+        assert sorted(act["members"]) == exp[2]
+
+    d_dims_mean = run(p_dims, objective="mean", top=3, leaders="10,20,30,40", seconds=0)
+    assert d_dims_mean["audit"]["mean_score_certified"]
+    assert d_dims_mean["audit"]["top_k_certified"]
+    assert len(d_dims_mean["results"]) == 3
+    for exp, act in zip(exp_dims_mean, d_dims_mean["results"]):
+        assert abs(act["ranking_score"] - exp[0]) < 1e-6
+        assert sorted(act["members"]) == exp[2]
+
     print(
-        "Theoretical score exhaustive oracle passed: 16 native float32 cases and index/score inversion"
+        "Theoretical score exhaustive oracle passed: 16 native float32 cases, 7 scoring dimensions and Top-K"
     )
 
 
