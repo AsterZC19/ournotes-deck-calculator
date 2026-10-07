@@ -442,6 +442,10 @@ struct ClassSearch {
     bool timed_out = false;
     std::vector<int64_t> dp_, next_;
     std::vector<int> assigned_;
+    std::vector<int> candidate_snapshots_;
+    std::vector<char> is_required_snap_;
+    std::vector<int> required_snap_indices_;
+    std::vector<std::vector<int>> best_class_snap_;
     std::vector<int64_t> rem_power_;
     std::vector<double> rem_gain_;
     std::vector<std::vector<double>> member_pos_gain;
@@ -518,6 +522,16 @@ struct ClassSearch {
         assigned_.resize(s.snap_count * (1 << s.team_size));
         rem_power_.resize(s.team_size + 1);
         rem_gain_.resize(s.team_size + 1);
+
+        candidate_snapshots_.reserve(s.snap_count);
+        is_required_snap_.assign(s.snap_count, 0);
+        for (int snap = 0; snap < s.snap_count; ++snap) {
+            if (std::find(s.required_snapshots.begin(), s.required_snapshots.end(),
+                          s.snapshots[snap]->id) != s.required_snapshots.end()) {
+                is_required_snap_[snap] = 1;
+                required_snap_indices_.push_back(snap);
+            }
+        }
     }
 
     double cutoff() const {
@@ -542,18 +556,90 @@ struct ClassSearch {
 
     std::vector<int> match() {
         ++matchings;
-        const int n = shared.team_size, states = 1 << n;
-        const int64_t missing = std::numeric_limits<int64_t>::min();
-        std::fill(dp_.begin(), dp_.end(), missing);
-        std::fill(assigned_.begin(), assigned_.end(), -2);
-        dp_[0] = 0;
+        const int n = shared.team_size;
+
+        for (int req_s : required_snap_indices_) {
+            bool covered = false;
+            for (int row = 0; row < n; ++row) {
+                if (class_of[members[row]][req_s] == selected_classes[row]) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered)
+                return {};
+        }
+
+        std::array<int, kMaxTeam> fast_snaps{};
+        bool fast_valid = true;
+        for (int row = 0; row < n; ++row) {
+            const int s = best_class_snap_[row][selected_classes[row]];
+            if (s < 0) {
+                fast_valid = false;
+                break;
+            }
+            for (int prev = 0; prev < row; ++prev) {
+                if (fast_snaps[prev] == s) {
+                    fast_valid = false;
+                    break;
+                }
+            }
+            if (!fast_valid)
+                break;
+            fast_snaps[row] = s;
+        }
+
+        if (fast_valid && !required_snap_indices_.empty()) {
+            for (int req_s : required_snap_indices_) {
+                bool found = false;
+                for (int row = 0; row < n; ++row) {
+                    if (fast_snaps[row] == req_s) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    fast_valid = false;
+                    break;
+                }
+            }
+        }
+
+        if (fast_valid) {
+            std::vector<int> pairs(n);
+            for (int row = 0; row < n; ++row)
+                pairs[row] = members[row] * shared.snap_count + fast_snaps[row];
+            return pairs;
+        }
+
+        candidate_snapshots_.clear();
         for (int s = 0; s < shared.snap_count; ++s) {
+            for (int row = 0; row < n; ++row) {
+                if (class_of[members[row]][s] == selected_classes[row]) {
+                    candidate_snapshots_.push_back(s);
+                    break;
+                }
+            }
+        }
+        if (candidate_snapshots_.size() < static_cast<size_t>(n))
+            return {};
+
+        const int states = 1 << n;
+        const int64_t missing = std::numeric_limits<int64_t>::min();
+        const size_t num_candidates = candidate_snapshots_.size();
+        if (assigned_.size() < num_candidates * states)
+            assigned_.resize(num_candidates * states);
+
+        std::fill(dp_.begin(), dp_.end(), missing);
+        std::fill(assigned_.begin(), assigned_.begin() + num_candidates * states, -2);
+        dp_[0] = 0;
+
+        for (size_t i = 0; i < num_candidates; ++i) {
             if (expired())
                 return {};
-            const bool required =
-                std::find(shared.required_snapshots.begin(), shared.required_snapshots.end(),
-                          shared.snapshots[s]->id) != shared.required_snapshots.end();
-            const int offset = s * states;
+            const int s = candidate_snapshots_[i];
+            const bool required = is_required_snap_[s] != 0;
+            const size_t offset = i * states;
             if (required)
                 std::fill(next_.begin(), next_.end(), missing);
             else {
@@ -582,8 +668,9 @@ struct ClassSearch {
             return {};
         std::vector<int> pairs(n);
         int mask = states - 1;
-        for (int s = shared.snap_count - 1; s >= 0; --s) {
-            const int row = assigned_[s * states + mask];
+        for (int i = static_cast<int>(num_candidates) - 1; i >= 0; --i) {
+            const int s = candidate_snapshots_[i];
+            const int row = assigned_[i * states + mask];
             if (row >= 0) {
                 pairs[row] = members[row] * shared.snap_count + s;
                 mask ^= 1 << row;
@@ -841,19 +928,41 @@ struct ClassSearch {
         }
 
         ++compositions;
+        const bool has_team_conditions = shared.engine->rules().formation_leader_conditions();
+        const auto *leader_matrix =
+            has_team_conditions
+                ? nullptr
+                : &shared.engine->power_matrix(static_cast<size_t>(game.leader_member));
+
         exact_power.assign(n, std::vector<int64_t>(shared.snap_count));
         class_power.resize(n);
         class_order.resize(n);
         selected_classes.resize(n);
+        best_class_snap_.resize(n);
+
         for (int row = 0; row < n; ++row) {
             const int m = members[row];
-            class_power[row].assign(classes[m].size(), std::numeric_limits<int64_t>::min());
-            class_order[row].resize(classes[m].size());
+            const size_t num_classes = classes[m].size();
+            class_power[row].assign(num_classes, std::numeric_limits<int64_t>::min());
+            class_order[row].resize(num_classes);
             std::iota(class_order[row].begin(), class_order[row].end(), 0);
+            best_class_snap_[row].assign(num_classes, -1);
+
+            const auto *m_row = leader_matrix ? &(*leader_matrix)[m] : nullptr;
             for (int s = 0; s < shared.snap_count; ++s) {
-                const auto p = shared.engine->slot_power(game.leader_member, m, s, &team);
+                const int64_t p = has_team_conditions
+                                      ? shared.engine->slot_power(game.leader_member, m, s, &team)
+                                      : (*m_row)[s];
                 exact_power[row][s] = p;
-                class_power[row][class_of[m][s]] = std::max(class_power[row][class_of[m][s]], p);
+                const int c = class_of[m][s];
+                if (p > class_power[row][c]) {
+                    class_power[row][c] = p;
+                    best_class_snap_[row][c] = s;
+                } else if (p == class_power[row][c] && is_required_snap_[s] &&
+                           best_class_snap_[row][c] >= 0 &&
+                           !is_required_snap_[best_class_snap_[row][c]]) {
+                    best_class_snap_[row][c] = s;
+                }
             }
         }
         rem_power_[n] = 0;

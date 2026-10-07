@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from test_theoretical import prepared, oracle
+from test_game_rules import game_problem
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -375,6 +376,113 @@ def test_proof_tool():
         assert wrong.returncode and "another problem" in wrong.stderr
 
 
+
+def test_class_search_no_conflict():
+    p = prepared(3)
+    p["constraints"]["required_members"] = []
+    p["constraints"]["required_snapshots"] = []
+    for i, m in enumerate(p["catalog"]["members"]):
+        m["card_type"] = i + 1
+    for i, s in enumerate(p["catalog"]["snapshots"]):
+        s["card_type"] = i + 1
+        s["trained"] = [1000 * (i + 1), 0, 0]
+    expected = topk_oracle(p, k=3, objective="score")
+    actual = run_rank(p, ["--top", "3", "--objective", "score", "--method", "exact", "--quiet"])
+    assert len(actual["results"]) == 3
+    for exp, act in zip(expected, actual["results"]):
+        assert act["ranking_score"] == exp[0]
+        assert sorted(act["members"]) == exp[2]
+    assert actual["audit"]["top_k_certified"]
+
+
+def test_class_search_collision_fallback():
+    p = prepared(3)
+    p["constraints"]["required_members"] = []
+    p["constraints"]["required_snapshots"] = []
+    p["catalog"]["snapshots"][0]["trained"] = [10000, 0, 0]
+    p["catalog"]["snapshots"][1]["trained"] = [0, 0, 0]
+    p["catalog"]["snapshots"][2]["trained"] = [0, 0, 0]
+    expected = topk_oracle(p, k=3, objective="score")
+    actual = run_rank(p, ["--top", "3", "--objective", "score", "--method", "exact", "--quiet"])
+    assert len(actual["results"]) == 3
+    for exp, act in zip(expected, actual["results"]):
+        assert act["ranking_score"] == exp[0]
+        assert sorted(act["members"]) == exp[2]
+    assert actual["audit"]["top_k_certified"]
+
+
+def test_class_search_tied_maximum():
+    p = prepared(3)
+    p["constraints"]["required_members"] = []
+    p["constraints"]["required_snapshots"] = []
+    p["catalog"]["snapshots"][0]["trained"] = [5000, 0, 0]
+    p["catalog"]["snapshots"][1]["trained"] = [5000, 0, 0]
+    p["catalog"]["snapshots"][2]["trained"] = [100, 0, 0]
+    expected = topk_oracle(p, k=3, objective="score")
+    actual = run_rank(p, ["--top", "3", "--objective", "score", "--method", "exact", "--quiet"])
+    assert len(actual["results"]) == 3
+    for exp, act in zip(expected, actual["results"]):
+        assert act["ranking_score"] == exp[0]
+        assert sorted(act["members"]) == exp[2]
+    assert actual["audit"]["top_k_certified"]
+
+
+def test_class_search_required_snapshot():
+    p = prepared(3)
+    p["constraints"]["required_members"] = []
+    p["constraints"]["required_snapshots"] = [p["catalog"]["snapshots"][2]["id"]]
+    expected = topk_oracle(p, k=2, objective="score")
+    actual = run_rank(p, ["--top", "2", "--objective", "score", "--method", "exact", "--quiet"])
+    assert len(actual["results"]) == 2
+    for exp, act in zip(expected, actual["results"]):
+        assert act["ranking_score"] == exp[0]
+        assert sorted(act["members"]) == exp[2]
+        assert 3 in {s["snapshot"] for s in act["assignments"]}
+    assert actual["audit"]["top_k_certified"]
+
+
+def test_class_search_infeasible():
+    p = prepared(3)
+    p["constraints"]["required_snapshots"] = [1, 2, 3, 4]
+    actual = run_rank(p, ["--top", "1", "--method", "exact", "--quiet"])
+    assert len(actual["results"]) == 0
+    assert actual["audit"]["infeasible_proven"]
+
+
+def test_class_search_formation_leader():
+    p = game_problem()
+    actual = run_rank(p, ["--top", "1", "--objective", "score", "--method", "exact", "--quiet"])
+    assert len(actual["results"]) == 1
+    winner = actual["results"][0]
+    assert winner["leader"] == 1
+    assert sorted(winner["members"]) == [1, 2, 3, 4, 5]
+    assert actual["audit"]["top_k_certified"]
+    p2 = copy.deepcopy(p)
+    p2["constraints"]["required_members"] = [6]
+    actual2 = run_rank(p2, ["--top", "1", "--objective", "score", "--method", "exact", "--quiet"])
+    assert actual2["results"][0]["ranking_score"] < winner["ranking_score"]
+
+
+def test_class_search_topk_mean_and_score():
+    p = prepared(3)
+    p["constraints"]["required_members"] = []
+    p["constraints"]["required_snapshots"] = []
+    for i, s in enumerate(p["catalog"]["snapshots"]):
+        s["support_skills"] = [i + 1]
+    for i, sk in enumerate(p["catalog"]["support_skills"]):
+        sk["effects"] = [{"level": 5, "effect_type": 15000, "value": i * 250}]
+    exp_s = topk_oracle(p, k=3, objective="score")
+    act_s = run_rank(p, ["--top", "3", "--objective", "score", "--method", "exact", "--quiet"])
+    for exp, act in zip(exp_s, act_s["results"]):
+        assert act["ranking_score"] == exp[0]
+        assert sorted(act["members"]) == exp[2]
+    exp_m = topk_oracle(p, k=3, objective="mean")
+    act_m = run_rank(p, ["--top", "3", "--objective", "mean", "--method", "exact", "--quiet"])
+    for exp, act in zip(exp_m, act_m["results"]):
+        assert abs(act["ranking_score"] - exp[0]) < 1e-6
+        assert sorted(act["members"]) == exp[2]
+
+
 def main():
     test_multiple_leaders()
     test_varying_snapshot_durations()
@@ -390,8 +498,16 @@ def main():
     test_default_auto_large_pool()
     test_explicit_fast_preservation()
     test_proof_tool()
-    print("Top-K exhaustive oracle checks passed: 14 scenarios verified")
+    test_class_search_no_conflict()
+    test_class_search_collision_fallback()
+    test_class_search_tied_maximum()
+    test_class_search_required_snapshot()
+    test_class_search_infeasible()
+    test_class_search_formation_leader()
+    test_class_search_topk_mean_and_score()
+    print("Top-K exhaustive oracle checks passed: 21 scenarios verified")
 
 
 if __name__ == "__main__":
     main()
+
