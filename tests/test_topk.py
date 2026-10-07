@@ -376,7 +376,6 @@ def test_proof_tool():
         assert wrong.returncode and "another problem" in wrong.stderr
 
 
-
 def test_class_search_no_conflict():
     p = prepared(3)
     p["constraints"]["required_members"] = []
@@ -399,6 +398,8 @@ def test_class_search_collision_fallback():
     p = prepared(3)
     p["constraints"]["required_members"] = []
     p["constraints"]["required_snapshots"] = []
+    for s in p["catalog"]["snapshots"]:
+        s["support_skills"] = [1]
     p["catalog"]["snapshots"][0]["trained"] = [10000, 0, 0]
     p["catalog"]["snapshots"][1]["trained"] = [0, 0, 0]
     p["catalog"]["snapshots"][2]["trained"] = [0, 0, 0]
@@ -415,6 +416,8 @@ def test_class_search_tied_maximum():
     p = prepared(3)
     p["constraints"]["required_members"] = []
     p["constraints"]["required_snapshots"] = []
+    for s in p["catalog"]["snapshots"]:
+        s["support_skills"] = [1]
     p["catalog"]["snapshots"][0]["trained"] = [5000, 0, 0]
     p["catalog"]["snapshots"][1]["trained"] = [5000, 0, 0]
     p["catalog"]["snapshots"][2]["trained"] = [100, 0, 0]
@@ -430,6 +433,11 @@ def test_class_search_tied_maximum():
 def test_class_search_required_snapshot():
     p = prepared(3)
     p["constraints"]["required_members"] = []
+    for s in p["catalog"]["snapshots"]:
+        s["support_skills"] = [1]
+    p["catalog"]["snapshots"][0]["trained"] = [5000, 0, 0]
+    p["catalog"]["snapshots"][1]["trained"] = [4000, 0, 0]
+    p["catalog"]["snapshots"][2]["trained"] = [100, 0, 0]
     p["constraints"]["required_snapshots"] = [p["catalog"]["snapshots"][2]["id"]]
     expected = topk_oracle(p, k=2, objective="score")
     actual = run_rank(p, ["--top", "2", "--objective", "score", "--method", "exact", "--quiet"])
@@ -510,4 +518,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

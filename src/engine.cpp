@@ -2271,8 +2271,7 @@ FastScoreParams make_fast_score_params(const Problem &problem, const ChartData &
 }
 
 int64_t score_order_native(const FastScoreParams &params, const std::vector<int64_t> &chart_times,
-                            int n, const int64_t *starts, const int64_t *ends,
-                            const float *boosts) {
+                           int n, const int64_t *starts, const int64_t *ends, const float *boosts) {
     int64_t total = 0;
     const size_t note_count = chart_times.size();
     for (size_t i = 0; i < note_count; ++i) {
@@ -2320,13 +2319,9 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
 
     const auto &settings = problem_.settings;
     const bool fast_applicable =
-        settings.score.level_alpha.has_value() &&
-        settings.score.rounding == "float32_floor" &&
-        settings.judgement.mode == "all_perfect" &&
-        settings.life.mode == "constant" &&
-        !settings.gekisou.enabled &&
-        chart_.converted_note_count > 0 &&
-        team_size() >= 1 &&
+        settings.score.level_alpha.has_value() && settings.score.rounding == "float32_floor" &&
+        settings.judgement.mode == "all_perfect" && settings.life.mode == "constant" &&
+        !settings.gekisou.enabled && chart_.converted_note_count > 0 && team_size() >= 1 &&
         settings.judgement.factors.find("perfect") != settings.judgement.factors.end();
 
     if (fast_applicable) {
@@ -2354,8 +2349,8 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
                 ends[k] = starts[k] + fast_slots[slot_idx].duration_ms;
                 boosts[k] = fast_slots[slot_idx].live_boost;
             }
-            const int64_t total = score_order_native(params, chart_.times, n,
-                                                     starts.data(), ends.data(), boosts.data());
+            const int64_t total = score_order_native(params, chart_.times, n, starts.data(),
+                                                     ends.data(), boosts.data());
             const double score = static_cast<double>(total);
             if (score > maximum) {
                 maximum = score;
@@ -2467,8 +2462,8 @@ std::optional<Evaluation> Engine::evaluate_best_order(const Formation &formation
             ends[k] = starts[k] + slot.duration_ms;
             boosts[k] = static_cast<float>(slot.live_boost);
         }
-        const int64_t total = score_order_native(params, chart_.times, n,
-                                                 starts.data(), ends.data(), boosts.data());
+        const int64_t total =
+            score_order_native(params, chart_.times, n, starts.data(), ends.data(), boosts.data());
         ++stats.evaluated;
         if (total > cutoff) {
             cutoff = static_cast<double>(total);
