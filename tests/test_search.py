@@ -190,7 +190,9 @@ def main():
     trap["constraints"]["required_snapshots"] = []
     plain = run(trap, "fast", beam=1, restarts=0)
     strong = run(trap, "fast", beam=1)
-    assert strong["results"][0]["index"] > plain["results"][0]["index"]
+    assert strong["results"][0]["index"] >= plain["results"][0]["index"]
+    assert plain["audit"]["lns_improvements"] > 0
+    assert abs(plain["results"][0]["index"] - expected(trap, 40)) < 1e-8
     assert abs(strong["results"][0]["index"] - expected(trap, 40)) < 1e-8
 
     print(

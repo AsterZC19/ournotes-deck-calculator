@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <random>
 #include <set>
 #include <string>
@@ -90,6 +91,8 @@ struct Shared {
     std::vector<SelectionSet> excluded_member_sets;
     std::vector<float> score_live_bound;
     mutable int64_t score_evaluations = 0;
+    mutable int64_t score_cache_hits = 0;
+    mutable std::map<std::array<int, kMaxTeam + 1>, Evaluation> score_cache;
     bool linear_score_bound_enabled = false;
     double score_base_coefficient = 0;
     double score_linear_max_power = 0;
@@ -219,6 +222,8 @@ struct Game {
     int64_t leader_id = 0;
     int leader_member = -1;
     std::vector<int> by_power;
+    std::vector<int> by_potential;
+    std::vector<double> member_max_power, member_max_gain;
 
     int64_t slot_power(int pair) const {
         return flat_power[static_cast<size_t>(pair)];
@@ -246,9 +251,24 @@ Evaluation evaluate_picks(const Game &game, const std::vector<Pick> &picks) {
         formation.slots.push_back(slot);
     }
     if (shared.score_objective) {
+        std::array<int, kMaxTeam + 1> key;
+        key.fill(-1);
+        key[0] = game.leader_member;
+        for (size_t i = 0; i < picks.size(); ++i)
+            key[i + 1] = picks[i].pair;
+        std::sort(key.begin() + 1, key.begin() + 1 + picks.size());
+        const auto cached = shared.score_cache.find(key);
+        if (cached != shared.score_cache.end()) {
+            ++shared.score_cache_hits;
+            return cached->second;
+        }
         ++shared.score_evaluations;
-        return shared.average_objective ? shared.engine->evaluate_mean(formation)
-                                        : shared.engine->evaluate_theoretical(formation);
+        auto result = shared.average_objective ? shared.engine->evaluate_mean(formation)
+                                               : shared.engine->evaluate_theoretical(formation);
+        if (shared.score_cache.size() >= 1024)
+            shared.score_cache.clear();
+        shared.score_cache.emplace(key, result);
+        return result;
     }
     EvalOptions options;
     options.calculate_score = false;
@@ -695,6 +715,158 @@ Solution anneal(const Game &game, const Solution &seed, const RankOptions &optio
     return best;
 }
 
+struct NeighborhoodStats {
+    int64_t neighborhoods = 0, proposals = 0, evaluations = 0, improvements = 0;
+    int64_t bound_pruned = 0;
+    double elapsed_s = 0;
+};
+
+double linear_score_upper(const Shared &shared, double power, double gain);
+double completed_linear_gain(const Shared &shared, const std::vector<int> &pairs);
+
+Solution large_neighborhood(const Game &game, Solution best, double deadline,
+                            NeighborhoodStats &stats) {
+    const auto &shared = *game.shared;
+    if (!best.found || shared.team_size < 2)
+        return best;
+    const double started = wall_s();
+    std::set<std::vector<int>> evaluated;
+    for (int round = 0; round < 2 && wall_s() < deadline; ++round) {
+        bool improved = false;
+        for (int mask = 1; mask < (1 << shared.team_size) && wall_s() < deadline; ++mask) {
+            const int count = __builtin_popcount(static_cast<unsigned>(mask));
+            if (count != 2 && count != 3)
+                continue;
+            ++stats.neighborhoods;
+            std::vector<int> pairs, positions;
+            SelectionSet members, snapshots, characters;
+            for (int i = 0; i < shared.team_size; ++i) {
+                pairs.push_back(best.picks[i].pair);
+                if (mask & (1 << i)) {
+                    positions.push_back(i);
+                } else {
+                    const auto &item = shared.pairs[pairs.back()];
+                    members.insert(item.member);
+                    snapshots.insert(item.snap);
+                    characters.insert(shared.members[item.member]->character);
+                }
+            }
+            std::vector<std::vector<int>> choices;
+            for (int position : positions) {
+                const bool leader = shared.pairs[pairs[position]].member == game.leader_member;
+                std::vector<int> row;
+                std::unordered_map<int, int> per_member;
+                auto add = [&](int pair, bool repair) {
+                    const auto &item = shared.pairs[pair];
+                    if ((item.member == game.leader_member) != leader ||
+                        members.contains(item.member) ||
+                        (shared.distinct_snapshots && snapshots.contains(item.snap)) ||
+                        (shared.distinct_characters &&
+                         characters.contains(shared.members[item.member]->character)) ||
+                        std::find(row.begin(), row.end(), pair) != row.end())
+                        return;
+                    if (!repair && per_member[item.member] >= 2)
+                        return;
+                    row.push_back(pair);
+                    ++per_member[item.member];
+                };
+                // Keep current cards and released Snapshots available for coordinated swaps.
+                for (int other : positions)
+                    add(shared.pairs[pairs[position]].member * shared.snap_count +
+                            shared.pairs[pairs[other]].snap,
+                        true);
+                for (int pair : game.by_potential) {
+                    if (row.size() >= 10)
+                        break;
+                    add(pair, false);
+                }
+                choices.push_back(std::move(row));
+            }
+            std::vector<std::pair<double, std::vector<int>>> shortlist;
+            int64_t leaves = 0;
+            auto visit = [&](auto &&self, size_t depth, SelectionSet used_members,
+                             SelectionSet used_snapshots, SelectionSet used_characters) -> void {
+                if (leaves >= 2048 || wall_s() >= deadline)
+                    return;
+                if (depth == positions.size()) {
+                    ++leaves;
+                    if (!legal_pairs(game, pairs))
+                        return;
+                    ++stats.proposals;
+                    std::vector<int> key = pairs;
+                    std::sort(key.begin(), key.end());
+                    if (evaluated.count(key))
+                        return;
+                    double power = 0, gain = 0;
+                    for (int pair : pairs) {
+                        power += game.slot_power(pair);
+                        gain += shared.max_gain(pair);
+                    }
+                    const double base = shared.score_objective && shared.linear_score_bound_enabled
+                                            ? shared.score_base_coefficient
+                                            : 1.0;
+                    const double value = power * (base + gain);
+                    if (shortlist.size() == 4 && value <= shortlist.back().first)
+                        return;
+                    if (std::any_of(shortlist.begin(), shortlist.end(), [&](const auto &entry) {
+                            auto existing = entry.second;
+                            std::sort(existing.begin(), existing.end());
+                            return existing == key;
+                        }))
+                        return;
+                    shortlist.emplace_back(value, pairs);
+                    std::stable_sort(
+                        shortlist.begin(), shortlist.end(),
+                        [](const auto &a, const auto &b) { return a.first > b.first; });
+                    if (shortlist.size() > 4)
+                        shortlist.pop_back();
+                    return;
+                }
+                for (int pair : choices[depth]) {
+                    const auto &item = shared.pairs[pair];
+                    const int character = shared.members[item.member]->character;
+                    if (used_members.contains(item.member) ||
+                        (shared.distinct_snapshots && used_snapshots.contains(item.snap)) ||
+                        (shared.distinct_characters && used_characters.contains(character)))
+                        continue;
+                    pairs[positions[depth]] = pair;
+                    self(self, depth + 1, used_members.with(item.member),
+                         used_snapshots.with(item.snap), used_characters.with(character));
+                }
+            };
+            visit(visit, 0, members, snapshots, characters);
+            for (const auto &[potential, proposal] : shortlist) {
+                if (wall_s() >= deadline)
+                    break;
+                auto key = proposal;
+                std::sort(key.begin(), key.end());
+                evaluated.insert(std::move(key));
+                if (shared.score_objective && shared.linear_score_bound_enabled) {
+                    double power = 0;
+                    for (int pair : proposal)
+                        power += game.slot_power(pair);
+                    if (linear_score_upper(shared, power,
+                                           completed_linear_gain(shared, proposal)) <= best.index) {
+                        ++stats.bound_pruned;
+                        continue;
+                    }
+                }
+                ++stats.evaluations;
+                auto candidate = make_solution(game, proposal, true);
+                if (candidate.found && candidate.index > best.index) {
+                    best = std::move(candidate);
+                    ++stats.improvements;
+                    improved = true;
+                }
+            }
+        }
+        if (!improved)
+            break;
+    }
+    stats.elapsed_s += wall_s() - started;
+    return best;
+}
+
 std::vector<float> completed_live_bound(const Shared &shared, const std::vector<int> &pairs) {
     const auto &engine = *shared.engine;
     const auto &chart = engine.chart();
@@ -769,8 +941,12 @@ struct Bnb {
     double best = 0.0;
     std::vector<int> best_pairs;
     int64_t nodes = 0;
+    int64_t cheap_bound_pruned = 0, last_improvement_node = 0;
+    bool neighborhood_attempted = false;
     double lambda = 0;
     std::vector<std::array<double, kMaxTeam>> joint;
+    Solution neighborhood_seed;
+    NeighborhoodStats *neighborhood_stats = nullptr;
 };
 
 double relaxed_joint(const Bnb &ctx, const std::vector<int> &trial,
@@ -825,6 +1001,29 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, const SelectionSet &member_set,
         ctx.timed_out = true;
         return;
     }
+    // Improve only competitive leaders whose exact search has stopped finding better teams.
+    if (!ctx.neighborhood_attempted && ctx.nodes - ctx.last_improvement_node >= 512 &&
+        ctx.neighborhood_stats && ctx.neighborhood_seed.found &&
+        ctx.neighborhood_seed.index >= ctx.best * 0.98 &&
+        ctx.neighborhood_stats->elapsed_s < 0.06) {
+        ctx.neighborhood_attempted = true;
+        const double neighborhood_deadline = std::min(
+            ctx.deadline, wall_s() + std::min(0.02, 0.06 - ctx.neighborhood_stats->elapsed_s));
+        auto candidate = large_neighborhood(*ctx.game, ctx.neighborhood_seed, neighborhood_deadline,
+                                            *ctx.neighborhood_stats);
+        if (candidate.index > ctx.best) {
+            ctx.best = candidate.index;
+            ctx.best_pairs.clear();
+            for (const auto &pick : candidate.picks)
+                ctx.best_pairs.push_back(pick.pair);
+            ctx.last_improvement_node = ctx.nodes;
+        }
+        ctx.neighborhood_seed = std::move(candidate);
+        if (wall_s() > ctx.deadline) {
+            ctx.timed_out = true;
+            return;
+        }
+    }
     if (level == team_size) {
         if (!legal_pairs(*ctx.game, trial))
             return;
@@ -842,13 +1041,19 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, const SelectionSet &member_set,
         }
         std::vector<int> triggers;
         const double gain = assign_triggers(shared, trial, triggers);
-        const double value = shared.score_objective ? make_solution(*ctx.game, trial, true).index
-                             : shared.engine->rules().formation_leader_conditions()
-                                 ? make_solution(*ctx.game, trial, true).index
-                                 : static_cast<double>(power) * (1.0 + gain);
+        Solution candidate;
+        const bool evaluated =
+            shared.score_objective || shared.engine->rules().formation_leader_conditions();
+        if (evaluated)
+            candidate = make_solution(*ctx.game, trial, true);
+        const double value =
+            evaluated ? candidate.index : static_cast<double>(power) * (1.0 + gain);
         if (shared.score_objective ? value > ctx.best : value > ctx.best * (1.0 + 1e-12)) {
             ctx.best = value;
             ctx.best_pairs = trial;
+            ctx.last_improvement_node = ctx.nodes;
+            if (evaluated)
+                ctx.neighborhood_seed = std::move(candidate);
         }
         return;
     }
@@ -857,6 +1062,8 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, const SelectionSet &member_set,
 
     const int group_count =
         shared.distinct_characters ? shared.character_count : shared.member_count;
+    if (group_count < remaining)
+        return;
     std::vector<double> group_power(group_count), group_gain(group_count);
     std::vector<char> allowed_members(shared.member_count);
     for (int m = min_pair + 1; m < shared.member_count; ++m) {
@@ -866,7 +1073,28 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, const SelectionSet &member_set,
         if (shared.distinct_characters && (character_set.contains(c)))
             continue;
         allowed_members[m] = 1;
+        const int group = shared.distinct_characters ? shared.character_groups[m] : m;
+        group_power[group] = std::max(group_power[group], ctx.game->member_max_power[m]);
+        group_gain[group] = std::max(group_gain[group], ctx.game->member_max_gain[m]);
     }
+    std::sort(group_power.begin(), group_power.end(), std::greater<double>());
+    std::sort(group_gain.begin(), group_gain.end(), std::greater<double>());
+    double cheap_power = power, cheap_gain = 0;
+    for (int pair : trial)
+        cheap_gain += shared.max_gain(pair);
+    for (int i = 0; i < remaining; ++i) {
+        cheap_power += group_power[i];
+        cheap_gain += group_gain[i];
+    }
+    // Relax Snapshot conflicts first, before scanning the full pair matrix.
+    if (shared.score_objective ? shared.linear_score_bound_enabled &&
+                                     linear_score_upper(shared, cheap_power, cheap_gain) <= ctx.best
+                               : cheap_power * (1 + cheap_gain) <= ctx.best * (1 - 1e-12)) {
+        ++ctx.cheap_bound_pruned;
+        return;
+    }
+    std::fill(group_power.begin(), group_power.end(), 0);
+    std::fill(group_gain.begin(), group_gain.end(), 0);
     std::array<double, kMaxTeam> trigger_max{};
     std::vector<double> snapshot_power(shared.snap_count), snapshot_gain(shared.snap_count);
     std::vector<std::array<double, kMaxTeam>> joint_groups(ctx.lambda > 0 ? group_count : 0),
@@ -948,7 +1176,7 @@ void bnb_dfs(Bnb &ctx, int level, int min_pair, const SelectionSet &member_set,
     } else if (power_bound * (1 + gain_bound) <= ctx.best * (1 - 1e-12))
         return;
 
-    for (int pair : ctx.game->by_power) {
+    for (int pair : ctx.game->by_potential) {
         if (!allowed_members[shared.pairs[pair].member])
             continue;
         if (!shared.any_kept(pair))
@@ -1150,7 +1378,8 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     std::unordered_map<int64_t, Solution> best_by_leader;
     std::mt19937_64 rng(static_cast<uint64_t>(problem.search.seed));
     AnnealStats anneal_stats;
-    int64_t dfs_nodes = 0, leaders_proven = 0;
+    NeighborhoodStats neighborhood_stats;
+    int64_t dfs_nodes = 0, leaders_proven = 0, cheap_bound_pruned = 0;
     int64_t leaders_tried = 0;
     bool certified = exact_mode;
 
@@ -1176,6 +1405,30 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             game.by_power[i] = static_cast<int>(i);
         std::stable_sort(game.by_power.begin(), game.by_power.end(),
                          [&](int a, int b) { return game.slot_power(a) > game.slot_power(b); });
+        const double reference_power = std::max(1.0, leader_potential[leader_id] * 0.5);
+        const auto &potential_gains = theoretical && shared.linear_score_bound_enabled
+                                          ? shared.score_max_gains
+                                          : shared.index_max_gains;
+        const double reference_gain =
+            *std::max_element(potential_gains.begin(), potential_gains.end()) * team_size * 0.5;
+        const double base =
+            theoretical && shared.linear_score_bound_enabled ? shared.score_base_coefficient : 1.0;
+        game.member_max_power.assign(shared.member_count, 0);
+        game.member_max_gain.assign(shared.member_count, 0);
+        std::vector<double> potential(shared.pairs.size());
+        // A first-order score estimate orders branches; only proven bounds prune them.
+        for (size_t pair = 0; pair < shared.pairs.size(); ++pair) {
+            const int member = shared.pairs[pair].member;
+            game.member_max_power[member] =
+                std::max(game.member_max_power[member], static_cast<double>(game.slot_power(pair)));
+            game.member_max_gain[member] =
+                std::max(game.member_max_gain[member], potential_gains[pair]);
+            potential[pair] = game.slot_power(pair) * (base + reference_gain) +
+                              reference_power * potential_gains[pair];
+        }
+        game.by_potential = game.by_power;
+        std::stable_sort(game.by_potential.begin(), game.by_potential.end(),
+                         [&](int a, int b) { return potential[a] > potential[b]; });
         return game;
     };
 
@@ -1285,6 +1538,10 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             if (!seed.found)
                 seed = make_solution(game, random_team(game, rng), false);
             Solution strengthened = anneal(game, seed, options, rng, anneal_stats);
+            if (!theoretical && strengthened.found)
+                strengthened = large_neighborhood(game, std::move(strengthened),
+                                                  std::min(shared.deadline, wall_s() + 0.005),
+                                                  neighborhood_stats);
             if (strengthened.found) {
                 auto existing = pool.find(strengthened.member_set);
                 if (existing == pool.end() || existing->second.index < strengthened.index)
@@ -1338,6 +1595,34 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     }
     shared.score_objective = theoretical;
 
+    if (theoretical && !seeded_exact && !exact_mode) {
+        std::vector<int64_t> neighborhood_leaders;
+        for (const auto &[leader_id, candidate] : best_by_leader)
+            neighborhood_leaders.push_back(leader_id);
+        std::stable_sort(neighborhood_leaders.begin(), neighborhood_leaders.end(),
+                         [&](int64_t a, int64_t b) {
+                             const double left = best_by_leader.at(a).index;
+                             const double right = best_by_leader.at(b).index;
+                             return left != right ? left > right : a < b;
+                         });
+        if (neighborhood_leaders.size() > 3)
+            neighborhood_leaders.resize(3);
+        const double neighborhood_deadline = std::min(deadline, wall_s() + 0.06);
+        for (int64_t leader_id : neighborhood_leaders) {
+            auto incumbent = best_by_leader.find(leader_id);
+            if (wall_s() >= neighborhood_deadline)
+                continue;
+            Game game = build_game(leader_id, false);
+            auto candidate = large_neighborhood(game, incumbent->second,
+                                                std::min(neighborhood_deadline, wall_s() + 0.02),
+                                                neighborhood_stats);
+            incumbent->second = candidate;
+            auto existing = pool.find(candidate.member_set);
+            if (existing == pool.end() || existing->second.index < candidate.index)
+                pool[candidate.member_set] = std::move(candidate);
+        }
+    }
+
     shared.deadline = deadline;
     if (exact_mode) {
         for (int64_t leader_id : leader_ids) {
@@ -1351,6 +1636,10 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             ctx.game = &game;
             ctx.excluded = &shared.excluded_member_sets;
             ctx.deadline = deadline;
+            if (theoretical && !seeded_exact && incumbent != best_by_leader.end()) {
+                ctx.neighborhood_seed = incumbent->second;
+                ctx.neighborhood_stats = &neighborhood_stats;
+            }
             ctx.best = incumbent == best_by_leader.end() ? -std::numeric_limits<double>::infinity()
                                                          : incumbent->second.index;
 
@@ -1371,28 +1660,34 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                                              ctx.lambda * shared.score_gain_coefficients[pair][k];
             }
             std::vector<int> trial;
-            for (int snap = 0; snap < shared.snap_count; ++snap) {
-                const int pair = game.leader_member * shared.snap_count + snap;
+            int roots = 0;
+            for (int pair : game.by_potential) {
+                if (shared.pairs[pair].member != game.leader_member)
+                    continue;
+                ++roots;
                 if (!shared.any_kept(pair))
                     continue;
                 trial.push_back(pair);
                 bnb_dfs(ctx, 1, -1, SelectionSet::single(game.leader_member),
-                        SelectionSet::single(snap),
+                        SelectionSet::single(shared.pairs[pair].snap),
                         SelectionSet::single(
                             shared.members[static_cast<size_t>(game.leader_member)]->character),
                         game.slot_power(pair), trial);
                 trial.pop_back();
                 if (ctx.timed_out)
                     break;
-                if (options.progress && (snap % 8 == 7 || snap + 1 == shared.snap_count))
+                if (options.progress && (roots % 8 == 0 || roots == shared.snap_count))
                     options.progress("leader " + std::to_string(leader_id) + " Snapshot roots " +
-                                     std::to_string(snap + 1) + "/" +
+                                     std::to_string(roots) + "/" +
                                      std::to_string(shared.snap_count) + " nodes " +
                                      std::to_string(ctx.nodes));
             }
             dfs_nodes += ctx.nodes;
+            cheap_bound_pruned += ctx.cheap_bound_pruned;
             if (ctx.best_pairs.size() == static_cast<size_t>(team_size)) {
-                Solution solution = make_solution(game, ctx.best_pairs, true);
+                Solution solution = ctx.neighborhood_seed.found
+                                        ? std::move(ctx.neighborhood_seed)
+                                        : make_solution(game, ctx.best_pairs, true);
                 auto existing = pool.find(solution.member_set);
                 if (existing == pool.end() || existing->second.index < solution.index) {
                     pool[solution.member_set] = std::move(solution);
@@ -1429,8 +1724,16 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     }
 
     Json audit = Json::object();
-    audit.set("solver", Json(exact_mode ? "beam-annealing-dp-dfs" : "beam-annealing-dp"));
+    audit.set("solver", Json(exact_mode ? "beam-annealing-lns-dp-dfs" : "beam-annealing-lns-dp"));
+    audit.set("lns_neighborhoods", Json(neighborhood_stats.neighborhoods));
+    audit.set("lns_proposals", Json(neighborhood_stats.proposals));
+    audit.set("lns_evaluations", Json(neighborhood_stats.evaluations));
+    audit.set("lns_improvements", Json(neighborhood_stats.improvements));
+    audit.set("lns_bound_pruned", Json(neighborhood_stats.bound_pruned));
+    audit.set("lns_elapsed_s", Json(neighborhood_stats.elapsed_s));
+    audit.set("dfs_branch_order", Json("power_and_skill_potential"));
     audit.set("dfs_nodes", Json(dfs_nodes));
+    audit.set("cheap_bound_pruned", Json(cheap_bound_pruned));
     audit.set("anneal_proposals", Json(anneal_stats.proposals));
     audit.set("anneal_accepted", Json(anneal_stats.accepted));
     audit.set("anneal_downhill_accepted", Json(anneal_stats.downhill));
@@ -1476,6 +1779,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     audit.set("warm_start_objective", Json("index"));
     audit.set("score_model_calibrated", Json(false));
     audit.set("score_formations_evaluated", Json(shared.score_evaluations));
+    audit.set("score_cache_hits", Json(shared.score_cache_hits));
     int64_t permutations = 1;
     for (int i = 2; i <= team_size; ++i)
         permutations *= i;

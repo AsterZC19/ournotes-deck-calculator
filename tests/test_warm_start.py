@@ -72,6 +72,31 @@ def main():
     _, array = calculate(p, [formation])
     assert array["results"][0]["ranking_score"] == expected
 
+    reordered = copy.deepcopy(formation)
+    reordered["slots"].reverse()
+    _, repeated = calculate(p, [formation, reordered])
+    assert repeated["audit"]["accepted_seed_formations"] == 2
+    assert repeated["audit"]["score_cache_hits"] > 0
+    assert repeated["results"][0]["ranking_score"] == expected
+
+    forced = copy.deepcopy(p)
+    forced["constraints"]["required_members"] = [s["member"] for s in formation["slots"]]
+    cards = [
+        m
+        for m in forced["catalog"]["members"]
+        if m["id"] in forced["constraints"]["required_members"]
+    ]
+    skills = {s["id"]: s["effects"][0]["value"] for s in forced["catalog"]["leader_skills"]}
+    ordered = sorted(cards, key=lambda m: skills[m["leader_skill"]])
+    leaders = [ordered[0]["id"], ordered[-1]["id"]]
+    forced["constraints"]["leader_pool"] = leaders
+    seeds = [dict(formation, leader=leader) for leader in leaders]
+    _, leader_cache = calculate(forced, seeds)
+    assert leader_cache["audit"]["accepted_seed_formations"] == 2
+    assert leader_cache["results"][0]["ranking_score"] == max(
+        oracle(forced, leader)["score"] for leader in leaders
+    )
+
     excluded = [sorted(witness["members"])]
     _, next_rank = calculate(p, {"results": [witness]}, excluded)
     assert (
