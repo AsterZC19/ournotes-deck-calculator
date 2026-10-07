@@ -38,7 +38,8 @@ void usage() {
            "                    [--objective mean|score] (默认平均收益，score 为最佳顺序收益)\n"
            "                    [--challenge-problem challenge.json] [--leaders 61,62]\n"
            "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
-           "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--time-limit S]\n"
+           "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--prove-top N] "
+           "[--time-limit S]\n"
            "                    [--method auto|fast|exact] [--leaders 61,62] [--detail] [--quiet]\n"
            "                    [--objective mean|score|index] [--beam-width 64] [--restarts 4] "
            "[--anneal-steps 3000] [--seed 0]\n"
@@ -61,11 +62,13 @@ struct Args {
     std::string output;
     std::string order_search;
     std::string method = "auto";
+    bool method_explicit = false;
     std::string objective = "theoretical_score";
     bool objective_explicit = false;
     bool experimental = false;
     std::string leaders;
     int top = 0;
+    int prove_top = 0;
     int beam_width = 64, restarts = 4, anneal_steps = 3000;
     std::optional<int64_t> seed;
     double time_limit = -1;
@@ -122,7 +125,12 @@ Args parse_args(int argc, char **argv) {
             if (args.objective == "score")
                 args.objective = "theoretical_score";
         } else if (flag == "--method") {
+            args.method_explicit = true;
             args.method = need_value(argc, argv, i, "--method");
+        } else if (flag == "--prove-top") {
+            args.prove_top = std::stoi(need_value(argc, argv, i, "--prove-top"));
+            if (args.prove_top <= 0)
+                throw SpecError("--prove-top 必须为正数");
         } else if (flag == "--leaders") {
             args.leaders = need_value(argc, argv, i, "--leaders");
         } else if (flag == "--top") {
@@ -161,6 +169,12 @@ Args parse_args(int argc, char **argv) {
         throw SpecError("objective 必须为 mean/score/index");
     if (args.method != "auto" && args.method != "fast" && args.method != "exact")
         throw SpecError("method 必须为 auto/fast/exact");
+    if (args.prove_top > 0) {
+        if (args.method_explicit && args.method == "fast")
+            throw SpecError("--prove-top 与 --method " + args.method + " 冲突，证明需要 exact");
+        args.method = "exact";
+        args.top = args.prove_top;
+    }
     return args;
 }
 
@@ -290,6 +304,8 @@ Json rank_document(const Problem &problem, const Engine &engine, const deckcalc:
     Json search = Json::object();
     search.set("method", Json(args.method));
     search.set("top", Json(static_cast<int64_t>(args.top > 0 ? args.top : problem.search.top)));
+    if (args.prove_top > 0)
+        search.set("prove_top", Json(static_cast<int64_t>(args.prove_top)));
     search.set("time_limit_s",
                Json(args.time_limit >= 0 ? args.time_limit : problem.search.time_limit_s));
     search.set("leaders", Json(args.leaders));

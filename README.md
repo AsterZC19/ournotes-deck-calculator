@@ -33,7 +33,7 @@ python3 tools/compile_from_master.py \
 
 ```sh
 # 推荐队伍
-./build/deckcalc rank -p output/problem.json --method fast --top 10 -o output/rank.json
+./build/deckcalc rank -p output/problem.json --top 10 -o output/rank.json
 
 # 计算指定队伍
 ./build/deckcalc score -p output/problem.json -f output/formation.json -o output/score.json
@@ -46,7 +46,7 @@ python3 tools/compile_from_master.py \
 - `--method exact --time-limit 0`：不限时精确搜索；`fast` 和限时未完成的搜索不保证最优。
 - `--detail`：计算明细；`--warm-start`：复用结果；`score --order-search given`：计算指定顺序。
 - 活动批量比较可重复传 `-p`；`event.assumptions.normal_runs`、`initial_cp` 设置有限预算，结果为期望次数及收益。
-- 逐名证明理论最高分：`python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10`。
+- 证明理论最高分前十并生成报告：`python3 tools/prove_top_k.py -p problem.json -o reports/top10 --count 10`；旧版证明记录需换新输出目录。
 
 正常输入固定 5 人，成员卡、角色和 Snapshot 不重复，卡池数量无固定上限。
 实验输入需同时设置 `input_mode: experimental` 并传 `--experimental`。

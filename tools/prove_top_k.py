@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove distinct member-set ranks by successive unlimited exact searches."""
+"""Prove distinct member-set ranks using native Top-K exact search."""
 
 import argparse
 import hashlib
@@ -29,6 +29,12 @@ def main():
     parser.add_argument("--experimental", action="store_true")
     parser.add_argument("--count", type=int, default=10)
     parser.add_argument(
+        "--objective",
+        choices=["score", "mean"],
+        default="score",
+        help="Ranking objective: score (theoretical_score) or mean (mean_score)",
+    )
+    parser.add_argument(
         "--warm-start", type=Path, help="Prior rank/topk results, always revalidated and rescored"
     )
     parser.add_argument("--solver", type=Path, default=ROOT / "build/deckcalc")
@@ -47,99 +53,100 @@ def main():
         raise RuntimeError("Output directory belongs to another problem")
     if not snapshot.exists():
         shutil.copyfile(source, snapshot)
+
+    native_proof = out / "proof-topk.json"
+    if not native_proof.exists() and (out / "topk-certified.json").exists():
+        raise RuntimeError("Legacy proof chain; use a new output directory")
+    binary_hash_file = out / "proof-topk-binary.sha256"
+    proof_hash_file = out / "proof-topk.sha256"
+    started = time.monotonic()
+
+    if native_proof.exists():
+        if not binary_hash_file.exists() or binary_hash_file.read_text().strip() != binary:
+            raise RuntimeError("Solver changed; use a new output directory")
+        if not proof_hash_file.exists() or proof_hash_file.read_text().strip() != digest(
+            native_proof
+        ):
+            raise RuntimeError("Search proof changed; use a new output directory")
+        search_doc = json.loads(native_proof.read_text())
+    else:
+        print(f"Proving top {args.count} with native exact search...", flush=True)
+        command = [
+            str(solver),
+            "rank",
+            "-p",
+            str(snapshot),
+            "--objective",
+            args.objective,
+            "--prove-top",
+            str(args.count),
+            "--time-limit",
+            "0",
+            "--detail",
+            "-o",
+            str(native_proof),
+        ]
+        if args.experimental:
+            command += ["--experimental"]
+        if args.warm_start:
+            command += ["--warm-start", str(args.warm_start.resolve())]
+        log = out / "proof-topk.log"
+        with log.open("w") as stream:
+            subprocess.run(command, stderr=stream, check=True)
+        if digest(solver) != binary:
+            raise RuntimeError("Solver changed during search; use a new output directory")
+        binary_hash_file.write_text(binary + "\n")
+        proof_hash_file.write_text(digest(native_proof) + "\n")
+        search_doc = json.loads(native_proof.read_text())
+
+    audit = search_doc["audit"]
+    results = search_doc["results"]
+    objective_key = "mean_score" if args.objective == "mean" else "theoretical_score"
+    if audit.get("requested_count") != args.count or audit.get("objective") != objective_key:
+        raise RuntimeError("Search configuration changed; use a new output directory")
+    if audit.get("infeasible_proven") and not results:
+        raise RuntimeError("Only 0 legal member sets exist")
+    if not audit.get("top_k_certified") and not (
+        args.count == 1 and audit.get("theoretical_max_certified")
+    ):
+        raise RuntimeError("Incomplete certificate")
+    if not results:
+        raise RuntimeError("Only 0 legal member sets exist")
+
     manifest = {
-        "schema": "ournotes-topk-proof@1",
+        "schema": "ournotes-topk-proof@2",
         "problem_sha256": fingerprint,
         "solver_sha256": binary,
-        "ranking_objective": "theoretical_score",
+        "ranking_objective": objective_key,
         "distinct_member_sets": True,
         "requested_count": args.count,
+        "returned_count": len(results),
         "time_limit_s": 0,
         "no_time_deadline": True,
+        "search_proof": {
+            "file": native_proof.name,
+            "sha256": digest(native_proof),
+            "audit": audit,
+        },
         "results": [],
         "proofs": [],
         "complete": False,
     }
-    members = {m["id"]: m for m in problem["catalog"]["members"]}
-    snaps = {s["id"]: s for s in problem["catalog"]["snapshots"]}
-    excluded = []
-    started = time.monotonic()
-    candidate_bank = []
-    if args.warm_start:
-        supplied = json.loads(args.warm_start.read_text())
-        candidate_bank = supplied if isinstance(supplied, list) else supplied["results"]
-    for rank in range(1, args.count + 1):
+
+    seen_sets = set()
+    for rank, result in enumerate(results, 1):
         if digest(solver) != binary:
-            raise RuntimeError(
-                "Solver changed during proof chain; stop and use a new output directory"
-            )
-        exclusions = out / f"excluded-before-{rank:02d}.json"
-        save(exclusions, excluded)
-        proof = out / f"proof-{rank:02d}.json"
-        log = out / f"proof-{rank:02d}.log"
-        if proof.exists():
-            prior = out / f"proof-{rank:02d}-binary.sha256"
-            if not prior.exists() or prior.read_text().strip() != binary:
-                raise RuntimeError("Solver changed; use a new output directory")
-        else:
-            print(f"Proving rank {rank}/{args.count} without time deadline...", flush=True)
-            command = [
-                str(solver),
-                "rank",
-                "-p",
-                str(snapshot),
-                "--objective",
-                "score",
-                "--method",
-                "exact",
-                "--time-limit",
-                "0",
-                "--beam-width",
-                "128",
-                "--restarts",
-                "8",
-                "--anneal-steps",
-                "10000",
-                "--top",
-                str(max(20, args.count)),
-                "--detail",
-                "--exclude-member-sets",
-                str(exclusions),
-                "-o",
-                str(proof),
-            ]
-            if args.experimental:
-                command += ["--experimental"]
-            if candidate_bank:
-                seeds = out / f"warm-before-{rank:02d}.json"
-                save(seeds, {"results": candidate_bank})
-                command += ["--warm-start", str(seeds)]
-            with log.open("w") as stream:
-                subprocess.run(command, stderr=stream, check=True)
-            (out / f"proof-{rank:02d}-binary.sha256").write_text(binary + "\n")
-        document = json.loads(proof.read_text())
-        audit = document["audit"]
-        candidate_bank = document["results"]
-        if audit.get("infeasible_proven") and not candidate_bank:
-            raise RuntimeError(f"Only {rank-1} legal member sets exist")
-        if (
-            not audit["theoretical_max_certified"]
-            or audit["leaders_proven"] != audit["leaders_requested"]
-        ):
-            raise RuntimeError("Incomplete certificate")
-        if audit["excluded_member_sets"] != excluded:
-            raise RuntimeError("Exclusion chain mismatch")
-        if not document["results"]:
-            raise RuntimeError(f"Only {rank-1} legal member sets exist")
-        result = document["results"][0]
-        key = sorted(result["members"])
-        if key in excluded:
-            raise RuntimeError("Repeated member set")
+            raise RuntimeError("Solver changed during witness checks; use a new output directory")
+        key = tuple(sorted(result["members"]))
+        if key in seen_sets:
+            raise RuntimeError("Repeated member set in top-k results")
+        seen_sets.add(key)
         if (
             manifest["results"]
             and result["ranking_score"] > manifest["results"][-1]["ranking_score"]
         ):
             raise RuntimeError("Rank scores must be nonincreasing")
+
         slots = sorted(result["assignments"], key=lambda x: x["trigger"])
         formation = {
             "schema": "ournotes-deck-formation@1",
@@ -148,51 +155,56 @@ def main():
         }
         fp = out / f"formation-{rank:02d}.json"
         save(fp, formation)
-        witness = json.loads(
-            subprocess.check_output(
-                [
-                    str(solver),
-                    "score",
-                    "-p",
-                    str(snapshot),
-                    "-f",
-                    str(fp),
-                    "--order-search",
-                    "given",
-                    *(["--experimental"] if args.experimental else []),
-                ],
-                text=True,
-            )
-        )["results"][0]["estimated_score"]["total"]
+
+        witness_cmd = [
+            str(solver),
+            "score",
+            "-p",
+            str(snapshot),
+            "-f",
+            str(fp),
+            "--order-search",
+            "given" if args.objective == "score" else "exact",
+        ]
+        if args.experimental:
+            witness_cmd += ["--experimental"]
+        score_doc = json.loads(subprocess.check_output(witness_cmd, text=True))
+        if args.objective == "mean":
+            witness = score_doc["results"][0]["order_analysis"]["mean_score"]
+        else:
+            witness = score_doc["results"][0]["estimated_score"]["total"]
         if witness != result["ranking_score"]:
             raise RuntimeError("Witness score mismatch")
+
         result["rank"] = rank
         manifest["results"].append(result)
         manifest["proofs"].append(
             {
                 "rank": rank,
-                "file": proof.name,
-                "sha256": digest(proof),
+                "search_proof_file": native_proof.name,
+                "search_proof_sha256": digest(native_proof),
+                "formation_file": fp.name,
                 "audit": audit,
                 "witness_replayed": True,
+                "witness_score": witness,
             }
         )
-        excluded.append(key)
-        manifest["complete"] = rank == args.count
-        manifest["elapsed_runner_s"] = time.monotonic() - started
-        save(out / "topk-certified.json", manifest)
-        print(
-            f'Rank {rank} proven: {int(result["ranking_score"]):,}; members {key}; nodes {audit["dfs_nodes"]:,}; seconds {audit["elapsed_s"]:.2f}',
-            flush=True,
-        )
+
+    manifest["complete"] = (len(results) == args.count) or audit.get("top_k_exhausted", False)
+    manifest["elapsed_runner_s"] = time.monotonic() - started
+    save(out / "topk-certified.json", manifest)
+
+    members = {m["id"]: m for m in problem["catalog"]["members"]}
+    snaps = {s["id"]: s for s in problem["catalog"]["snapshots"]}
+    obj_label = "理论平均分" if args.objective == "mean" else "理论最高分"
     lines = [
-        f'# {problem["song"].get("title",problem["song"]["id"])}：理论最高分前 {args.count} 名',
+        f'# {problem["song"].get("title", problem["song"]["id"])}：{obj_label}前 {len(results)} 名',
         "",
         f'{problem["chart"]["difficulty"]} Lv.{problem["chart"]["level"]}；成员 {len(members)} 张、Snapshot {len(snaps)} 张。输入见 problem.json。',
         "",
-        "按成员组合区分名次，在输入范围内逐名证明。AP、恒定生命；技能顺序随机。",
+        "按成员组合区分名次，原生精确证明。AP、恒定生命；技能顺序随机。",
         "",
-        "| 全局名次 | 理论最高分 | 队长 | 配对与技能顺序（从左到右；★为队长） |",
+        f"| 全局名次 | {obj_label} | 队长 | 配对与技能顺序（从左到右；★为队长） |",
         "|---:|---:|---|---|",
     ]
     usedm = set()
@@ -228,18 +240,16 @@ def main():
         "| 名次 | 已证明队长 | DFS 节点 | 搜索秒数 | 完成标志 |",
         "|---:|---:|---:|---:|---|",
     ]
-    for proof in manifest["proofs"]:
-        a = proof["audit"]
-        lines.append(
-            f'| {proof["rank"]} | {a["leaders_proven"]}/{a["leaders_requested"]} | {a["dfs_nodes"]:,} | {a["elapsed_s"]:.2f} | theoretical_max_certified=true |'
-        )
+    lines.append(
+        f'| 1..{len(results)} | {audit["leaders_proven"]}/{audit["leaders_requested"]} | '
+        f'{audit.get("dfs_nodes", 0):,} | {audit.get("elapsed_s", 0):.2f} | top_k_certified=true |'
+    )
     lines += [
         "",
         f"输入 SHA-256：`{fingerprint}`",
         f"计算器 SHA-256：`{binary}`",
         "",
-        "各名次 proof-XX.json 保存排除组合、完整最优编成、分数及证书；proof-XX.log 保存队长/根分支完成日志。formation-XX.json 可按 score --order-search given 重放，所有名次已验证重放分数一致。",
-        "剪枝使用原生 float32 单调上界、含保守浮点误差的线性包络、成员/角色与 Snapshot 两种独立放松的触发位分配上界；理论分证明禁用指数占优删除。",
+        f"原生搜索证明保存于 {native_proof.name}；formation-XX.json 可重放验证。",
     ]
     (out / "top10-certified.md").write_text("\n".join(lines) + "\n")
     print("Completed report:", out / "top10-certified.md", flush=True)

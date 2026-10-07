@@ -346,6 +346,84 @@ struct SnapshotClass {
     int pair = 0;
 };
 
+// Order retained candidates; equally scoring sets at the cutoff are interchangeable.
+struct SolutionBetter {
+    bool operator()(const Solution &a, const Solution &b) const {
+        if (a.index != b.index)
+            return a.index > b.index;
+        if (a.evaluation.power != b.evaluation.power)
+            return a.evaluation.power > b.evaluation.power;
+        if (a.evaluation.leader != b.evaluation.leader)
+            return a.evaluation.leader < b.evaluation.leader;
+        return a.member_set.values < b.member_set.values;
+    }
+};
+
+struct TopKPool {
+    int k = 1;
+    std::unordered_map<SelectionSet, Solution, SelectionHash> pool;
+    double kth_score = -std::numeric_limits<double>::infinity();
+
+    static bool is_better(const Solution &a, const Solution &b) {
+        return SolutionBetter{}(a, b);
+    }
+
+    void update_kth() {
+        if (static_cast<int>(pool.size()) < k) {
+            kth_score = -std::numeric_limits<double>::infinity();
+            return;
+        }
+        auto worst_it = pool.begin();
+        for (auto it = std::next(pool.begin()); it != pool.end(); ++it) {
+            if (is_better(worst_it->second, it->second)) {
+                worst_it = it;
+            }
+        }
+        kth_score = worst_it->second.index;
+    }
+
+    double cutoff() const {
+        return kth_score;
+    }
+
+    double set_score(const SelectionSet &set) const {
+        auto it = pool.find(set);
+        if (it != pool.end())
+            return it->second.index;
+        return -std::numeric_limits<double>::infinity();
+    }
+
+    bool consider(Solution candidate) {
+        auto it = pool.find(candidate.member_set);
+        if (it != pool.end()) {
+            if (is_better(candidate, it->second)) {
+                it->second = std::move(candidate);
+                update_kth();
+                return true;
+            }
+            return false;
+        }
+        if (static_cast<int>(pool.size()) < k) {
+            pool.emplace(candidate.member_set, std::move(candidate));
+            update_kth();
+            return true;
+        }
+        auto worst_it = pool.begin();
+        for (auto iter = std::next(pool.begin()); iter != pool.end(); ++iter) {
+            if (is_better(worst_it->second, iter->second)) {
+                worst_it = iter;
+            }
+        }
+        if (is_better(candidate, worst_it->second)) {
+            pool.erase(worst_it);
+            pool.emplace(candidate.member_set, std::move(candidate));
+            update_kth();
+            return true;
+        }
+        return false;
+    }
+};
+
 struct ClassSearch {
     Shared &shared;
     NativeScoreBound bound;
@@ -357,7 +435,8 @@ struct ClassSearch {
     std::vector<std::vector<int64_t>> class_power;
     Game game;
     std::vector<int> candidates;
-    Solution best;
+    TopKPool pool;
+    SelectionSet current_set_{};
     ScoreOrderStats order_stats;
     int64_t nodes = 0, compositions = 0, class_nodes = 0, matchings = 0, pruned = 0;
     bool timed_out = false;
@@ -386,7 +465,8 @@ struct ClassSearch {
     };
     std::vector<OrderEntry> sorted_orders_;
 
-    explicit ClassSearch(Shared &s) : shared(s) {
+    explicit ClassSearch(Shared &s, int top_k = 1) : shared(s) {
+        pool.k = std::max(1, top_k);
         bound.enabled = s.linear_score_bound_enabled;
         bound.base = s.score_base_coefficient;
         bound.max_power = s.score_linear_max_power;
@@ -441,7 +521,10 @@ struct ClassSearch {
     }
 
     double cutoff() const {
-        return best.found ? best.index : -std::numeric_limits<double>::infinity();
+        return pool.cutoff();
+    }
+    double current_set_cutoff() const {
+        return std::max(pool.cutoff(), pool.set_score(current_set_));
     }
     bool expired() {
         if (wall_s() > shared.deadline)
@@ -515,7 +598,7 @@ struct ClassSearch {
             return;
         if (cap(power + rem_power_[depth],
                 std::nextafter(gain + rem_gain_[depth], std::numeric_limits<double>::infinity())) <=
-            cutoff()) {
+            current_set_cutoff()) {
             ++pruned;
             return;
         }
@@ -542,7 +625,7 @@ struct ClassSearch {
                 {shared.members[pair.member]->id, shared.snapshots[pair.snap]->id, row + 1});
             matched_power += exact_power[row][pair.snap];
         }
-        if (cap(matched_power, gain) <= cutoff()) {
+        if (cap(matched_power, gain) <= current_set_cutoff()) {
             ++pruned;
             return;
         }
@@ -556,16 +639,16 @@ struct ClassSearch {
                 orders *= i;
             order_stats.evaluated += orders;
         } else
-            evaluation =
-                shared.engine->evaluate_best_order(formation, bound, cutoff(), order_stats);
-        if (!evaluation || *evaluation->ranking_score <= cutoff())
+            evaluation = shared.engine->evaluate_best_order(formation, bound, current_set_cutoff(),
+                                                            order_stats);
+        if (!evaluation || *evaluation->ranking_score <= current_set_cutoff())
             return;
-        best.found = true;
-        best.index = *evaluation->ranking_score;
-        best.member_set = {};
-        for (int m : members)
-            best.member_set.insert(m);
-        best.evaluation = std::move(*evaluation);
+        Solution candidate;
+        candidate.found = true;
+        candidate.index = *evaluation->ranking_score;
+        candidate.member_set = current_set_;
+        candidate.evaluation = std::move(*evaluation);
+        pool.consider(std::move(candidate));
     }
 
     void order_classes_dfs(const std::vector<int> &ord, int depth, int64_t power, double gain) {
@@ -574,7 +657,7 @@ struct ClassSearch {
             return;
         if (cap(power + rem_power_[depth],
                 std::nextafter(gain + rem_gain_order_[depth],
-                               std::numeric_limits<double>::infinity())) <= cutoff()) {
+                               std::numeric_limits<double>::infinity())) <= current_set_cutoff()) {
             ++pruned;
             return;
         }
@@ -621,7 +704,7 @@ struct ClassSearch {
                                std::numeric_limits<double>::infinity());
         }
 
-        if (cap(matched_power, max_all_orders_gain) <= cutoff()) {
+        if (cap(matched_power, max_all_orders_gain) <= current_set_cutoff()) {
             ++pruned;
             handled_classes_.insert(class_key);
             return;
@@ -636,22 +719,22 @@ struct ClassSearch {
                 orders *= i;
             order_stats.evaluated += orders;
         } else {
-            evaluation =
-                shared.engine->evaluate_best_order(formation, bound, cutoff(), order_stats);
+            evaluation = shared.engine->evaluate_best_order(formation, bound, current_set_cutoff(),
+                                                            order_stats);
         }
 
         if (!timed_out)
             handled_classes_.insert(class_key);
 
-        if (!evaluation || *evaluation->ranking_score <= cutoff())
+        if (!evaluation || *evaluation->ranking_score <= current_set_cutoff())
             return;
 
-        best.found = true;
-        best.index = *evaluation->ranking_score;
-        best.member_set = {};
-        for (int m : members)
-            best.member_set.insert(m);
-        best.evaluation = std::move(*evaluation);
+        Solution candidate;
+        candidate.found = true;
+        candidate.index = *evaluation->ranking_score;
+        candidate.member_set = current_set_;
+        candidate.evaluation = std::move(*evaluation);
+        pool.consider(std::move(candidate));
     }
 
     void orders_search() {
@@ -675,7 +758,7 @@ struct ClassSearch {
             const auto &entry = sorted_orders_[order_index];
             if (expired())
                 return;
-            if (entry.cap <= cutoff()) {
+            if (entry.cap <= current_set_cutoff()) {
                 order_bound_pruned += sorted_orders_.size() - order_index;
                 break;
             }
@@ -727,6 +810,7 @@ struct ClassSearch {
                              [&](const Member *m) { return m->id == id; }))
                 return;
 
+        current_set_ = mask;
         const int n = shared.team_size;
         const int states = 1 << n;
         std::array<double, 1 << kMaxTeam> assign_dp;
@@ -750,7 +834,7 @@ struct ClassSearch {
             }
         }
         const double max_assigned_gain = assign_dp[states - 1];
-        if (cap(power_upper, max_assigned_gain) <= cutoff()) {
+        if (cap(power_upper, max_assigned_gain) <= current_set_cutoff()) {
             ++pruned;
             ++composition_bound_pruned;
             return;
@@ -1899,9 +1983,42 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
         return leader_potential[a] > leader_potential[b];
     });
 
+    const auto is_class_search_eligible = [&]() {
+        if (options.method == "fast")
+            return false;
+        if (!theoretical)
+            return false;
+        if (options.top < 1)
+            return false;
+        if (!shared.distinct_snapshots)
+            return false;
+        if (!shared.linear_score_bound_enabled)
+            return false;
+        if (shared.team_size > kMaxTeam)
+            return false;
+        for (auto id : leader_ids) {
+            auto it = leader_potential.find(id);
+            if (it == leader_potential.end())
+                return false;
+            double upper = linear_score_upper(
+                shared, it->second,
+                *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end()) *
+                    shared.team_size);
+            if (!std::isfinite(upper) ||
+                upper >= static_cast<double>(std::numeric_limits<int64_t>::max() / 2))
+                return false;
+        }
+        return true;
+    };
+    const bool class_search_eligible = is_class_search_eligible();
+
     bool exact_mode = options.method == "exact";
     if (options.method == "auto") {
-        exact_mode = static_cast<int64_t>(shared.member_count) * shared.snap_count <= 1024;
+        if (class_search_eligible) {
+            exact_mode = true;
+        } else {
+            exact_mode = static_cast<int64_t>(shared.member_count) * shared.snap_count <= 1024;
+        }
     }
 
     std::unordered_map<SelectionSet, Solution, SelectionHash> pool;
@@ -1990,26 +2107,13 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             best_by_leader[formation.leader] = candidate;
     }
     const bool seeded_exact = exact_mode && !pool.empty();
-    bool class_search_enabled = exact_mode && theoretical && options.top == 1 &&
-                                shared.distinct_snapshots && shared.linear_score_bound_enabled;
-    for (auto id : leader_ids)
-        class_search_enabled =
-            class_search_enabled &&
-            std::isfinite(linear_score_upper(
-                shared, leader_potential[id],
-                *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end()) *
-                    team_size)) &&
-            linear_score_upper(
-                shared, leader_potential[id],
-                *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end()) *
-                    team_size) < static_cast<double>(std::numeric_limits<int64_t>::max() / 2);
+    const bool class_search_enabled = exact_mode && class_search_eligible;
     std::unique_ptr<ClassSearch> class_search;
     const int64_t seed_score_evaluations = shared.score_evaluations;
     if (class_search_enabled) {
-        class_search = std::make_unique<ClassSearch>(shared);
+        class_search = std::make_unique<ClassSearch>(shared, options.top);
         for (const auto &entry : pool)
-            if (!class_search->best.found || entry.second.index > class_search->best.index)
-                class_search->best = entry.second;
+            class_search->pool.consider(entry.second);
     }
     const bool bypass_heuristics = seeded_exact || class_search_enabled;
 
@@ -2184,6 +2288,15 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             }
             if (class_search) {
                 auto &search = *class_search;
+                const double max_leader_gain =
+                    shared.team_size *
+                    *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end());
+                const double leader_score_cap =
+                    search.cap(leader_potential[leader_id], max_leader_gain);
+                if (leader_score_cap <= search.pool.cutoff()) {
+                    ++leaders_proven;
+                    continue;
+                }
                 search.game = build_game(leader_id, false);
                 search.candidates.resize(shared.member_count);
                 std::iota(search.candidates.begin(), search.candidates.end(), 0);
@@ -2206,8 +2319,6 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                 search.compositions_dfs(0, SelectionSet::single(shared.members[lm]->character),
                                         search.game.member_max_power[lm],
                                         search.game.member_max_gain[lm], selected_pos_max);
-                if (search.best.found)
-                    pool[search.best.member_set] = search.best;
                 if (search.timed_out) {
                     certified = false;
                     break;
@@ -2293,12 +2404,20 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
         }
     }
 
+    if (class_search) {
+        for (const auto &entry : class_search->pool.pool) {
+            auto it = pool.find(entry.first);
+            if (it == pool.end() || SolutionBetter{}(entry.second, it->second)) {
+                pool[entry.first] = entry.second;
+            }
+        }
+    }
+
     std::vector<Solution> ordered;
     ordered.reserve(pool.size());
     for (auto &entry : pool)
         ordered.push_back(entry.second);
-    std::stable_sort(ordered.begin(), ordered.end(),
-                     [](const Solution &a, const Solution &b) { return a.index > b.index; });
+    std::stable_sort(ordered.begin(), ordered.end(), SolutionBetter{});
     if (static_cast<int>(ordered.size()) > options.top)
         ordered.resize(static_cast<size_t>(options.top));
 
@@ -2370,6 +2489,13 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                                                 certified && !result.results.empty()));
     audit.set("mean_score_certified",
               Json(shared.average_objective && certified && !result.results.empty()));
+    const bool is_topk_certified = class_search != nullptr && certified;
+    audit.set("top_k_certified", Json(is_topk_certified));
+    audit.set("top_k_complete", Json(is_topk_certified));
+    audit.set("top_k_exhausted",
+              Json(is_topk_certified && static_cast<int>(result.results.size()) < options.top));
+    audit.set("requested_count", Json(static_cast<int64_t>(options.top)));
+    audit.set("returned_count", Json(static_cast<int64_t>(result.results.size())));
     audit.set("input_mode", Json(problem.input_mode));
     audit.set("infeasible_proven", Json(certified && result.results.empty()));
     audit.set("score_dfs_pruning",
@@ -2386,16 +2512,29 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                                                          : "beam_annealing"));
     audit.set("complete_beam_variants_per_member_set", Json(4));
     audit.set("index_snapshot_pruning_used_in_score_dfs", Json(false));
-    audit.set(
-        "certified_scope",
-        Json(shared.average_objective
-                 ? "maximum mean rounded AP model score over uniformly random skill permutations "
-                   "within requested leaders/card pool; other top entries are candidates"
-             : theoretical ? "maximum rounded AP model score over all legal formations and all "
+    if (is_topk_certified && options.top > 1) {
+        audit.set(
+            "certified_scope",
+            Json(
+                shared.average_objective
+                    ? "exact top-k distinct member sets by maximum mean rounded AP model score "
+                      "over uniformly random skill permutations within requested leaders/card pool"
+                    : "exact top-k distinct member sets by maximum rounded AP model score over all "
+                      "legal formations and all skill permutations within requested leaders/card "
+                      "pool after excluded member sets"));
+    } else {
+        audit.set("certified_scope",
+                  Json(shared.average_objective
+                           ? "maximum mean rounded AP model score over uniformly random skill "
+                             "permutations "
+                             "within requested leaders/card pool; other top entries are candidates"
+                       : theoretical
+                           ? "maximum rounded AP model score over all legal formations and all "
                              "skill permutations within requested leaders/card pool after "
                              "excluded member sets; other top entries are candidates"
                            : "best index within requested leaders and card constraints; "
                              "remaining top entries are candidates"));
+    }
     audit.set("warm_start_objective", Json("index"));
     audit.set("score_model_calibrated", Json(false));
     audit.set("score_formations_evaluated", Json(shared.score_evaluations));

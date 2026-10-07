@@ -68,10 +68,13 @@ def main():
     for skill in p["catalog"]["live_skills"]:
         skill["effects"][0]["value"] = 1000
     expected = oracle(p)
+    p_fallback = copy.deepcopy(p)
+    p_fallback["constraints"]["distinct_snapshots"] = False
+    expected_fallback = oracle(p_fallback)
     for objective, key in (("mean", "mean_score"), ("score", "score")):
-        data = rank(p, objective, "exact", top=2)
+        data = rank(p_fallback, objective, "exact", top=2)
         assert data["audit"]["certified"] and data["audit"]["lns_proposals"] > 0
-        assert data["results"][0]["ranking_score"] == expected[key]
+        assert data["results"][0]["ranking_score"] == expected_fallback[key]
         exact_top1 = rank(p, objective, "exact", top=1)
         assert exact_top1["audit"]["certified"]
         assert exact_top1["results"][0]["ranking_score"] == expected[key]

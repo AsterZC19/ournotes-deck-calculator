@@ -396,10 +396,12 @@ def main():
     assert d_ov_mean["audit"]["mean_score_certified"]
     assert d_ov_mean["results"][0]["ranking_score"] == oracle(p_ov)["mean_score"]
 
-    d_fallback = run(p_ov, objective="score", seconds=0, top=2)
+    p_fallback = copy.deepcopy(p_ov)
+    p_fallback["constraints"]["distinct_snapshots"] = False
+    d_fallback = run(p_fallback, objective="score", seconds=0, top=2)
     assert d_fallback["audit"]["solver"] == "beam-annealing-lns-dp-dfs"
     assert d_fallback["audit"]["certified"]
-    assert d_fallback["results"][0]["ranking_score"] == oracle(p_ov)["score"]
+    assert d_fallback["results"][0]["ranking_score"] == oracle(p_fallback)["score"]
 
     p_inf = copy.deepcopy(p_ov)
     p_inf["constraints"]["required_members"] = [10, 20, 30, 40]
