@@ -25,6 +25,7 @@ struct PhaseSearchStats {
     int64_t member_groups = 0, bounded_member_groups = 0, pruned_member_prefixes = 0;
     bool score_bound_enabled = false, reward_ceiling_certified = false, phase_cache_hit = false;
     int64_t coupled_bound_nodes = 0, coupled_pruned_branches = 0;
+    int64_t cp_distribution_pruned_candidates = 0, cp_distribution_pruned_branches = 0;
     double score_ceiling = std::numeric_limits<double>::infinity();
     Json to_json() const {
         Json out = Json::object();
@@ -48,6 +49,8 @@ struct PhaseSearchStats {
         out.set("phase_cache_hit", Json(phase_cache_hit));
         out.set("coupled_bound_nodes", Json(coupled_bound_nodes));
         out.set("coupled_pruned_branches", Json(coupled_pruned_branches));
+        out.set("cp_distribution_pruned_candidates", Json(cp_distribution_pruned_candidates));
+        out.set("cp_distribution_pruned_branches", Json(cp_distribution_pruned_branches));
         out.set("score_ceiling_certified", Json(std::isfinite(score_ceiling)));
         out.set("score_ceiling", std::isfinite(score_ceiling) ? Json(score_ceiling) : Json());
         return out;
@@ -60,7 +63,36 @@ struct Candidate {
     int score_rank = 0;
     Json rank_distribution;
     std::map<int64_t, double> cp_distribution;
+    std::map<int64_t, int64_t> cp_counts;
 };
+bool cp_dominates(const Candidate &a, const Candidate &b) {
+    int64_t na = 0, nb = 0;
+    for (const auto &[cp, count] : a.cp_counts)
+        na += count;
+    for (const auto &[cp, count] : b.cp_counts)
+        nb += count;
+    if (na <= 0 || nb <= 0 || na > 40320 || nb > 40320)
+        return false;
+    auto ia = a.cp_counts.begin(), ib = b.cp_counts.begin();
+    int64_t ca = 0, cb = 0;
+    // Integer CDF comparisons avoid rounding away a rare adverse CP outcome.
+    while (ia != a.cp_counts.end() || ib != b.cp_counts.end()) {
+        const int64_t cp = ia == a.cp_counts.end()   ? ib->first
+                           : ib == b.cp_counts.end() ? ia->first
+                                                     : std::min(ia->first, ib->first);
+        if (ia != a.cp_counts.end() && ia->first == cp) {
+            ca += ia->second;
+            ++ia;
+        }
+        if (ib != b.cp_counts.end() && ib->first == cp) {
+            cb += ib->second;
+            ++ib;
+        }
+        if (ca * nb > cb * na)
+            return false;
+    }
+    return true;
+}
 struct FiniteCP {
     double plays, remaining;
     Json distribution;
@@ -314,6 +346,13 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             }
         }
     };
+    auto finite_envelope_covered = [&](const Yield &envelope) {
+        return std::any_of(pool.begin(), pool.end(), [&](const Candidate &candidate) {
+            return !candidate.cp_counts.empty() &&
+                   candidate.cp_counts.begin()->first >= envelope.cp &&
+                   candidate.yield.pt >= envelope.pt && candidate.yield.shop >= envelope.shop;
+        });
+    };
     auto retain = [&](Formation formation, double pt, double drop) {
         if (options.method != "exact" && !evaluated.insert(formation_key(formation)).second) {
             ++stats.duplicate_formations;
@@ -336,11 +375,12 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
         const bool envelope_dominated =
             std::any_of(pool.begin(), pool.end(),
                         [&](const Candidate &other) { return dominates(other.yield, envelope); });
-        if (!finite_random_cp &&
-            (fixed_rank ? yield_dominated(reward_models[rank - 2])
-             : mean_rewards
-                 ? envelope_dominated
-                 : std::all_of(reward_models.begin(), reward_models.end(), yield_dominated))) {
+        if (finite_random_cp
+                ? finite_envelope_covered(envelope)
+                : (fixed_rank     ? yield_dominated(reward_models[rank - 2])
+                   : mean_rewards ? envelope_dominated
+                                  : std::all_of(reward_models.begin(), reward_models.end(),
+                                                yield_dominated))) {
             ++stats.dominated_before_evaluation;
             return;
         }
@@ -363,40 +403,53 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             }
             Yield realized =
                 expected ? *expected : reward_models[result_rank - 2].calculate(pt, drop);
-            Candidate c{scored_formation,           std::move(score),        realized,
-                        expected ? 0 : result_rank, std::move(distribution), {}};
+            Candidate c{scored_formation,
+                        std::move(score),
+                        realized,
+                        expected ? 0 : result_rank,
+                        std::move(distribution),
+                        {},
+                        {}};
             auto cp_integer = [](double cp) {
                 if (!std::isfinite(cp) || cp < 0 || cp > 9007199254740991.0 || cp != std::floor(cp))
                     throw SpecError("CP 奖励超出安全整数范围");
                 return static_cast<int64_t>(cp);
             };
-            if (c.rank_distribution.is_null())
+            if (c.rank_distribution.is_null()) {
                 c.cp_distribution[cp_integer(realized.cp)] = 1;
-            else
+                c.cp_counts[cp_integer(realized.cp)] = 1;
+            } else
                 for (const auto &row : c.rank_distribution.items()) {
                     const double cp =
                         reward_models[int_field(row, "rank") - 2].calculate(pt, drop).cp;
                     c.cp_distribution[cp_integer(cp)] += num_field(row, "probability");
+                    c.cp_counts[cp_integer(cp)] += int_field(row, "orders");
                 }
-            auto comparable = [&](const Candidate &other) {
-                return !finite_random_cp || other.cp_distribution == c.cp_distribution;
+            auto covers = [&](const Candidate &a, const Candidate &b) {
+                return dominates(a.yield, b.yield) && (!finite_random_cp || cp_dominates(a, b));
             };
             bool dominated = false;
             for (const auto &other : pool)
-                if (comparable(other) && dominates(other.yield, c.yield)) {
+                if (covers(other, c)) {
                     dominated = true;
+                    if (finite_random_cp)
+                        ++stats.cp_distribution_pruned_candidates;
                     break;
                 }
             if (dominated)
                 return;
             pool.erase(std::remove_if(pool.begin(), pool.end(),
                                       [&](const Candidate &o) {
-                                          return comparable(o) && dominates(c.yield, o.yield);
+                                          const bool removed = covers(c, o);
+                                          if (removed && finite_random_cp)
+                                              ++stats.cp_distribution_pruned_candidates;
+                                          return removed;
                                       }),
                        pool.end());
 
             auto equal = std::find_if(pool.begin(), pool.end(), [&](const Candidate &o) {
-                return comparable(o) && o.yield.cp == c.yield.cp && o.yield.pt == c.yield.pt &&
+                return (!finite_random_cp || o.cp_distribution == c.cp_distribution) &&
+                       o.yield.cp == c.yield.cp && o.yield.pt == c.yield.pt &&
                        o.yield.shop == c.yield.shop;
             });
             if (equal == pool.end())
@@ -469,6 +522,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             for (const auto &[achieved, occurrences] : ranks) {
                 Json row = Json::object();
                 row.set("rank", Json(achieved));
+                row.set("orders", Json(occurrences));
                 row.set("probability", Json(double(occurrences) / count));
                 distribution.push_back(std::move(row));
             }
@@ -514,8 +568,6 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 reward_thresholds.emplace_back(int_field(row, "rank"),
                                                num_field(row, "required_score"));
         auto reward_covered = [&](double pt, double drop, double upper_score) {
-            if (finite_random_cp)
-                return false;
             if (pool.empty())
                 return false;
             if (fixed_rank)
@@ -530,6 +582,12 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                     envelope.cp = std::max(envelope.cp, y.cp);
                     envelope.pt = std::max(envelope.pt, y.pt);
                     envelope.shop = std::max(envelope.shop, y.shop);
+                }
+                if (finite_random_cp) {
+                    const bool pruned = finite_envelope_covered(envelope);
+                    if (pruned)
+                        ++stats.cp_distribution_pruned_branches;
+                    return pruned;
                 }
                 return covered(envelope);
             }
@@ -766,8 +824,6 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 ++stats.infeasible_branches;
                 return true;
             }
-            if (finite_random_cp)
-                return false;
             const double upper_pt =
                 upwards(pt + group_pt[depth] + snapshot_bonus(pt_order, snapshot_pt, remaining));
             const double upper_drop = upwards(drop + group_drop[depth] +

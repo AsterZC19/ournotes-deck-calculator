@@ -210,10 +210,11 @@ def main():
         p, "rank", flags=("--objective", "score", "--method", "exact", "--time-limit", "0")
     )
     assert result.returncode == 0 and maximum["audit"]["theoretical_max_certified"]
-    for seed in range(4):
-        small = prepared(seed)
+    for seed in range(16):
+        small = prepared(seed, small=bool(seed % 2), reuse=bool(seed % 3 == 0))
         exact = rank_score(small, objective="mean", seconds=0, detail=True)
         assert exact["audit"]["mean_score_certified"]
+        assert exact["audit"]["mean_score_bound_enabled"]
         assert abs(exact["results"][0]["ranking_score"] - oracle(small)["mean_score"]) < 1e-8
     print(
         "Game-rule checks passed: five-slot legality, experimental isolation, formation conditions and independent mean-score oracles"

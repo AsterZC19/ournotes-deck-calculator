@@ -722,6 +722,16 @@ void prepare_linear_score_bound(Shared &shared) {
     auto bound = shared.engine->linear_score_bound(shared.score_live_bound);
     shared.score_base_coefficient = bound.base;
     shared.score_gain_coefficients = std::move(bound.gains);
+    if (shared.average_objective && bound.enabled)
+        for (auto &row : shared.score_gain_coefficients) {
+            // Each member occupies each trigger equally often in a uniform shuffle.
+            long double sum = 0;
+            for (double gain : row)
+                sum += gain;
+            const double mean = std::nextafter(static_cast<double>(sum / row.size()),
+                                               std::numeric_limits<double>::infinity());
+            std::fill(row.begin(), row.end(), mean);
+        }
     shared.score_linear_max_power = bound.max_power;
     shared.linear_score_bound_enabled = bound.enabled;
 }
@@ -1443,6 +1453,8 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     audit.set("score_dfs_pruning",
               Json(theoretical ? "native_float32_monotone_and_linear_envelope" : "index_bound"));
     audit.set("linear_score_bound_enabled", Json(shared.linear_score_bound_enabled));
+    audit.set("mean_score_bound_enabled",
+              Json(shared.average_objective && shared.linear_score_bound_enabled));
     audit.set("global_incumbent_pruning", Json(exact_mode));
     audit.set("supplied_seed_formations", Json(supplied_seeds));
     audit.set("accepted_seed_formations", Json(accepted_seeds));

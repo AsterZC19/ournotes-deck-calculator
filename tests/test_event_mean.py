@@ -12,6 +12,7 @@ def frontier(rows):
 
 
 def main():
+    distribution_pruned = bound_pruned = False
     p = problem()
     p["constraints"] = {"leader_pool": [1], "distinct_snapshots": True}
     p["event"]["assumptions"].update(score_rank_mode="estimated_score", minimum_index=0)
@@ -105,13 +106,14 @@ def main():
             assert result["optimality_certified"] and result["reward_objective"] == "mean_reward"
             for c in result[phase + "_frontier"]:
                 assert abs(sum(r["probability"] for r in c["score_rank_distribution"]) - 1) < 1e-12
+                assert sum(r["orders"] for r in c["score_rank_distribution"]) == 2
         default = run("event", q, objective=None, method="exact", time_limit=0)
         assert default["reward_objective"] == "mean_reward"
         fast = run("event", q, objective="mean", method="fast", time_limit=2)
         for phase in ("normal", "challenge"):
             assert fast[phase + "_frontier"]
             assert all(c.get("score_rank_distribution") for c in fast[phase + "_frontier"])
-        if case < 2:
+        if case < 6:
             for runs in (0, 1, 2, 3):
                 finite = copy.deepcopy(q)
                 finite["event"]["assumptions"].update(
@@ -119,6 +121,9 @@ def main():
                 )
                 finite["event"]["challenge_boosts"][0]["cost"] = 37
                 result = run("event", finite, objective="mean", method="exact", time_limit=0)
+                audit = result["normal_search_audit"]
+                distribution_pruned |= audit["cp_distribution_pruned_candidates"] > 0
+                bound_pruned |= audit["cp_distribution_pruned_branches"] > 0
                 expected = []
                 for normal in laws["normal"]:
                     totals = [
@@ -174,6 +179,7 @@ def main():
     for plan in result["finite_budget"]:
         assert abs(plan["remaining_cp"] - 75) < 1e-8
         assert abs(plan["challenge_runs"] - (75000000 - 75) / 160) < 1e-8
+    assert distribution_pruned and bound_pruned
     print(
         "Mean event rewards passed independent exhaustive frontier checks, cross-rank averaging and nonmonotonic rewards"
     )
