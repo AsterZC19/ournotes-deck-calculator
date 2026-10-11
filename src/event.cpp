@@ -333,7 +333,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
     const bool fixed_rank = rank_mode == "fixed";
     const bool mean_rewards = options.objective == "mean_score";
     const bool finite_random_cp =
-        mean_rewards && phase == "normal" && a.find("normal_runs") && !fixed_rank &&
+        mean_rewards && phase == "normal" && (a.find("normal_runs") || a.find("boost_budget")) &&
+        !fixed_rank &&
         std::any_of(reward_models.begin(), reward_models.end(), [&](const PhaseRewards &model) {
             return model.base_cp != reward_models.front().base_cp;
         });
@@ -1369,6 +1370,19 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     if (int_field(na, "shop_resource_id") != int_field(ca, "shop_resource_id") ||
         int_field(na, "shop_resource_type", 1) != int_field(ca, "shop_resource_type", 1))
         throw SpecError("两个阶段必须比较同一种商店货币");
+    const bool has_normal_runs = na.find("normal_runs") != nullptr;
+    const bool has_boost_budget = na.find("boost_budget") != nullptr;
+    if (has_normal_runs && has_boost_budget)
+        throw SpecError("event.assumptions 不能同时指定 boost_budget 与 normal_runs");
+    constexpr double max_safe_int = 9007199254740991.0;
+    if (has_boost_budget) {
+        double budget_val = positive(na, "boost_budget", 0);
+        if (budget_val != std::floor(budget_val) || budget_val > max_safe_int)
+            throw SpecError("boost_budget 必须为安全整数");
+        int64_t cost_val = int_field(na, "normal_boost_cost", 1);
+        if (cost_val <= 0)
+            throw SpecError("normal_boost_cost 必须为正整数，不能为零");
+    }
     bool normal_complete = false, challenge_complete = false;
     PhaseSearchStats normal_stats, challenge_stats;
     const double phase_seconds = options.time_limit_s == 0 ? std::numeric_limits<double>::infinity()
@@ -1467,15 +1481,32 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
             x.set("challenge_runs_per_normal_live", Json(a.cp / cost));
             cycles.push_back(std::move(x));
         }
+    auto compare_cycles = [](const Json &a, const Json &b, const std::string &primary) -> bool {
+        const std::string secondary = (primary == "pt") ? "shop_currency_expected" : "pt";
+        double pa = num_field(a.at("amortized_per_normal_live"), primary.c_str());
+        double pb = num_field(b.at("amortized_per_normal_live"), primary.c_str());
+        if (pa != pb)
+            return pa > pb;
+        double sa = num_field(a.at("amortized_per_normal_live"), secondary.c_str());
+        double sb = num_field(b.at("amortized_per_normal_live"), secondary.c_str());
+        if (sa != sb)
+            return sa > sb;
+        double ra = num_field(a, "challenge_runs_per_normal_live");
+        double rb = num_field(b, "challenge_runs_per_normal_live");
+        if (ra != rb)
+            return ra > rb;
+        int64_t na = int_field(a, "normal_candidate");
+        int64_t nb = int_field(b, "normal_candidate");
+        if (na != nb)
+            return na < nb;
+        return int_field(a, "challenge_candidate") < int_field(b, "challenge_candidate");
+    };
     Json recommended = Json::object();
     for (const char *objective : {"pt", "shop_currency_expected"}) {
         const Json *best = nullptr;
-        double best_value = -1;
         for (const auto &cycle : cycles.items()) {
-            double v = num_field(cycle.at("amortized_per_normal_live"), objective);
-            if (v > best_value) {
+            if (!best || compare_cycles(cycle, *best, objective)) {
                 best = &cycle;
-                best_value = v;
             }
         }
         recommended.set(objective, best ? *best : Json());
@@ -1486,11 +1517,34 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
             best_cp = &x;
     recommended.set("cp", best_cp ? candidate_json(*best_cp) : Json());
     out.set("recommended", std::move(recommended));
-    if (na.find("normal_runs")) {
-        double count = positive(na, "normal_runs", 0), initial = positive(na, "initial_cp", 0);
-        constexpr double max_integer = 9007199254740991.0;
-        if (count != std::floor(count) || initial != std::floor(initial) || count > max_integer ||
-            initial > max_integer || cost != std::floor(cost) || cost > max_integer)
+
+    double count = 0;
+    std::optional<int64_t> unused_boost;
+    const bool has_finite = has_normal_runs || has_boost_budget;
+    constexpr double max_integer = 9007199254740991.0;
+    if (has_boost_budget) {
+        double budget_val = positive(na, "boost_budget", 0);
+        if (budget_val != std::floor(budget_val) || budget_val > max_integer)
+            throw SpecError("boost_budget 必须为安全整数");
+        int64_t cost_val = int_field(na, "normal_boost_cost", 1);
+        if (cost_val <= 0)
+            throw SpecError("normal_boost_cost 必须为正整数，不能为零");
+        count = std::floor(budget_val / cost_val);
+        unused_boost = static_cast<int64_t>(budget_val) % cost_val;
+        normal_assumptions.set("boost_budget", Json(static_cast<int64_t>(budget_val)));
+        normal_assumptions.set("unused_boost", Json(*unused_boost));
+        normal_assumptions.set("normal_runs", Json(static_cast<int64_t>(count)));
+        out.set("normal_assumptions", normal_assumptions);
+    } else if (has_normal_runs) {
+        count = positive(na, "normal_runs", 0);
+        if (count != std::floor(count) || count > max_integer)
+            throw SpecError("normal_runs 必须为安全整数");
+    }
+
+    if (has_finite) {
+        double initial = positive(na, "initial_cp", 0);
+        if (initial != std::floor(initial) || initial > max_integer || cost != std::floor(cost) ||
+            cost > max_integer)
             throw SpecError("normal_runs/initial_cp 和 challenge_cp_cost 必须为安全整数");
         std::vector<FiniteCP> budgets;
         for (const auto &candidate : normal)
@@ -1514,25 +1568,57 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
                       Json(count * normal[i].yield.shop + plays * challenge[j].yield.shop));
                 finite.push_back(std::move(x));
             }
+        auto compare_plans = [](const Json &a, const Json &b, const std::string &primary) -> bool {
+            const std::string secondary = (primary == "pt") ? "shop_currency_expected" : "pt";
+            double pa = num_field(a, primary.c_str());
+            double pb = num_field(b, primary.c_str());
+            if (pa != pb)
+                return pa > pb;
+            double sa = num_field(a, secondary.c_str());
+            double sb = num_field(b, secondary.c_str());
+            if (sa != sb)
+                return sa > sb;
+            double ca = num_field(a, "remaining_cp");
+            double cb = num_field(b, "remaining_cp");
+            if (ca != cb)
+                return ca > cb;
+            int64_t na = int_field(a, "normal_candidate");
+            int64_t nb = int_field(b, "normal_candidate");
+            if (na != nb)
+                return na < nb;
+            return int_field(a, "challenge_candidate") < int_field(b, "challenge_candidate");
+        };
+        const Json *best_pt = nullptr;
+        const Json *best_shop = nullptr;
+        for (const auto &plan : finite.items()) {
+            if (!best_pt || compare_plans(plan, *best_pt, "pt"))
+                best_pt = &plan;
+            if (!best_shop || compare_plans(plan, *best_shop, "shop_currency_expected"))
+                best_shop = &plan;
+        }
         Json finite_recommended = Json::object();
-        for (const char *objective : {"pt", "shop_currency_expected"}) {
-            const Json *best = nullptr;
-            double best_value = -1;
-            for (const auto &plan : finite.items()) {
-                double v = num_field(plan, objective);
-                if (v > best_value) {
-                    best = &plan;
-                    best_value = v;
-                }
-            }
-            finite_recommended.set(objective, best ? *best : Json());
+        finite_recommended.set("pt", best_pt ? *best_pt : Json());
+        finite_recommended.set("shop_currency_expected", best_shop ? *best_shop : Json());
+        if (best_pt && best_shop) {
+            Json tradeoff = Json::object();
+            double pt_best_pt = num_field(*best_pt, "pt");
+            double shop_best_pt = num_field(*best_pt, "shop_currency_expected");
+            double pt_best_shop = num_field(*best_shop, "pt");
+            double shop_best_shop = num_field(*best_shop, "shop_currency_expected");
+            tradeoff.set("event_points_lost_with_shop_plan", Json(pt_best_pt - pt_best_shop));
+            tradeoff.set("event_items_lost_with_pt_plan", Json(shop_best_shop - shop_best_pt));
+            finite_recommended.set("tradeoff_summary", tradeoff);
+            out.set("finite_budget_tradeoff", std::move(tradeoff));
+        }
+        if (unused_boost.has_value()) {
+            out.set("unused_boost", Json(*unused_boost));
         }
         out.set("recommended_finite_budget", std::move(finite_recommended));
         out.set("finite_budget", std::move(finite));
     }
     out.set("cycles", std::move(cycles));
     Json warnings = Json::array();
-    if (na.find("normal_runs") && options.objective == "mean_score")
+    if (has_finite && options.objective == "mean_score")
         warnings.push_back(
             Json("有限预算的课题曲次数、剩余 CP 和收益均为期望值，按每局独立技能顺序计算。"));
     if (options.objective == "mean_score")

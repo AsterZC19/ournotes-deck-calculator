@@ -468,6 +468,166 @@ int main(int argc, char **argv) {
             }
             Json out = Json::object();
             out.set("schema", Json("ournotes-event-batch@1"));
+
+            auto compare_batch_finite = [](const Json &a, const Json &b,
+                                           const std::string &primary) -> bool {
+                const std::string secondary = (primary == "pt") ? "shop_currency_expected" : "pt";
+                double pa = deckcalc::num_field(a, primary.c_str());
+                double pb = deckcalc::num_field(b, primary.c_str());
+                if (pa != pb)
+                    return pa > pb;
+                double sa = deckcalc::num_field(a, secondary.c_str());
+                double sb = deckcalc::num_field(b, secondary.c_str());
+                if (sa != sb)
+                    return sa > sb;
+                double ca = deckcalc::num_field(a, "remaining_cp");
+                double cb = deckcalc::num_field(b, "remaining_cp");
+                if (ca != cb)
+                    return ca > cb;
+                int64_t sa_id = deckcalc::int_field(a, "song_id");
+                int64_t sb_id = deckcalc::int_field(b, "song_id");
+                if (sa_id != sb_id)
+                    return sa_id < sb_id;
+                int64_t na = deckcalc::int_field(a, "normal_candidate");
+                int64_t nb = deckcalc::int_field(b, "normal_candidate");
+                if (na != nb)
+                    return na < nb;
+                return deckcalc::int_field(a, "challenge_candidate") <
+                       deckcalc::int_field(b, "challenge_candidate");
+            };
+
+            auto compare_batch_cycles = [](const Json &a, const Json &b,
+                                           const std::string &primary) -> bool {
+                const std::string secondary = (primary == "pt") ? "shop_currency_expected" : "pt";
+                double pa = deckcalc::num_field(a.at("amortized_per_normal_live"), primary.c_str());
+                double pb = deckcalc::num_field(b.at("amortized_per_normal_live"), primary.c_str());
+                if (pa != pb)
+                    return pa > pb;
+                double sa =
+                    deckcalc::num_field(a.at("amortized_per_normal_live"), secondary.c_str());
+                double sb =
+                    deckcalc::num_field(b.at("amortized_per_normal_live"), secondary.c_str());
+                if (sa != sb)
+                    return sa > sb;
+                double ra = deckcalc::num_field(a, "challenge_runs_per_normal_live");
+                double rb = deckcalc::num_field(b, "challenge_runs_per_normal_live");
+                if (ra != rb)
+                    return ra > rb;
+                int64_t sa_id = deckcalc::int_field(a, "song_id");
+                int64_t sb_id = deckcalc::int_field(b, "song_id");
+                if (sa_id != sb_id)
+                    return sa_id < sb_id;
+                int64_t na = deckcalc::int_field(a, "normal_candidate");
+                int64_t nb = deckcalc::int_field(b, "normal_candidate");
+                if (na != nb)
+                    return na < nb;
+                return deckcalc::int_field(a, "challenge_candidate") <
+                       deckcalc::int_field(b, "challenge_candidate");
+            };
+
+            Json batch_finite_rec = Json::object();
+            Json batch_cycle_rec = Json::object();
+            std::optional<Json> best_pt_finite;
+            std::optional<Json> best_shop_finite;
+            std::optional<Json> best_pt_cycle;
+            std::optional<Json> best_shop_cycle;
+            size_t best_pt_finite_idx = 0, best_shop_finite_idx = 0;
+            size_t best_pt_cycle_idx = 0, best_shop_cycle_idx = 0;
+            bool any_finite = false;
+
+            for (size_t p_idx = 0; p_idx < plans.items().size(); ++p_idx) {
+                const auto &p = plans.items()[p_idx];
+                int64_t song_id = deckcalc::int_field(p, "normal_song_id");
+                if (const Json *rec = p.find("recommended_finite_budget")) {
+                    any_finite = true;
+                    if (const Json *pt_plan = rec->find("pt")) {
+                        if (!pt_plan->is_null()) {
+                            Json cand = *pt_plan;
+                            cand.set("song_id", Json(song_id));
+                            if (!best_pt_finite ||
+                                compare_batch_finite(cand, *best_pt_finite, "pt")) {
+                                best_pt_finite = cand;
+                                best_pt_finite_idx = p_idx;
+                            }
+                        }
+                    }
+                    if (const Json *shop_plan = rec->find("shop_currency_expected")) {
+                        if (!shop_plan->is_null()) {
+                            Json cand = *shop_plan;
+                            cand.set("song_id", Json(song_id));
+                            if (!best_shop_finite ||
+                                compare_batch_finite(cand, *best_shop_finite,
+                                                     "shop_currency_expected")) {
+                                best_shop_finite = cand;
+                                best_shop_finite_idx = p_idx;
+                            }
+                        }
+                    }
+                }
+                if (const Json *rec = p.find("recommended")) {
+                    if (const Json *pt_cycle = rec->find("pt")) {
+                        if (!pt_cycle->is_null()) {
+                            Json cand = *pt_cycle;
+                            cand.set("song_id", Json(song_id));
+                            if (!best_pt_cycle ||
+                                compare_batch_cycles(cand, *best_pt_cycle, "pt")) {
+                                best_pt_cycle = cand;
+                                best_pt_cycle_idx = p_idx;
+                            }
+                        }
+                    }
+                    if (const Json *shop_cycle = rec->find("shop_currency_expected")) {
+                        if (!shop_cycle->is_null()) {
+                            Json cand = *shop_cycle;
+                            cand.set("song_id", Json(song_id));
+                            if (!best_shop_cycle ||
+                                compare_batch_cycles(cand, *best_shop_cycle,
+                                                     "shop_currency_expected")) {
+                                best_shop_cycle = cand;
+                                best_shop_cycle_idx = p_idx;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (best_pt_cycle) {
+                Json pt_item = *best_pt_cycle;
+                pt_item.set("plan_index", Json(static_cast<int64_t>(best_pt_cycle_idx)));
+                batch_cycle_rec.set("pt", std::move(pt_item));
+            }
+            if (best_shop_cycle) {
+                Json shop_item = *best_shop_cycle;
+                shop_item.set("plan_index", Json(static_cast<int64_t>(best_shop_cycle_idx)));
+                batch_cycle_rec.set("shop_currency_expected", std::move(shop_item));
+            }
+            out.set("recommended", std::move(batch_cycle_rec));
+
+            if (any_finite && best_pt_finite && best_shop_finite) {
+                Json pt_item = *best_pt_finite;
+                pt_item.set("plan_index", Json(static_cast<int64_t>(best_pt_finite_idx)));
+                batch_finite_rec.set("pt", std::move(pt_item));
+
+                Json shop_item = *best_shop_finite;
+                shop_item.set("plan_index", Json(static_cast<int64_t>(best_shop_finite_idx)));
+                batch_finite_rec.set("shop_currency_expected", std::move(shop_item));
+
+                Json tradeoff = Json::object();
+                double pt_at_best_pt = deckcalc::num_field(*best_pt_finite, "pt");
+                double shop_at_best_pt =
+                    deckcalc::num_field(*best_pt_finite, "shop_currency_expected");
+                double pt_at_best_shop = deckcalc::num_field(*best_shop_finite, "pt");
+                double shop_at_best_shop =
+                    deckcalc::num_field(*best_shop_finite, "shop_currency_expected");
+                tradeoff.set("event_points_lost_with_shop_plan",
+                             Json(pt_at_best_pt - pt_at_best_shop));
+                tradeoff.set("event_items_lost_with_pt_plan",
+                             Json(shop_at_best_shop - shop_at_best_pt));
+                batch_finite_rec.set("tradeoff_summary", tradeoff);
+                out.set("recommended_finite_budget", std::move(batch_finite_rec));
+                out.set("finite_budget_tradeoff", std::move(tradeoff));
+            }
+
             out.set("plans", std::move(plans));
             out.set("engine_cache", engine_cache.audit());
             out.set("search_cache", phase_cache.audit());

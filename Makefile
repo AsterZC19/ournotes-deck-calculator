@@ -36,6 +36,7 @@ test: $(BUILD)/deckcalc $(TEST_BINS)
 	python3 tests/test_event_bounds.py
 	python3 tests/test_event_batch.py
 	python3 tests/test_event_coupling.py
+	python3 tests/test_event_budget.py
 	python3 tests/test_search.py
 	python3 tests/test_neighborhood.py
 	python3 tests/test_large_pool.py
