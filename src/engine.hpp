@@ -208,8 +208,16 @@ public:
     Evaluation evaluate(const Formation &formation, const EvalOptions &options) const;
     void populate_estimated_score(Evaluation &evaluation) const;
     void validate_theoretical_scope() const;
+    bool fast_score_applicable() const;
+    double native_base_score(int64_t power) const;
+    double native_min_score(int64_t power, const Formation &formation) const;
     bool for_each_score_order(const Formation &formation,
                               const std::function<bool(const Evaluation &)> &visitor) const;
+    bool for_each_score_order_fast(
+        const Formation &formation,
+        const std::function<bool(double total, double index, const std::vector<int> &permutation)>
+            &visitor,
+        Evaluation *base_out = nullptr) const;
     Evaluation evaluate_theoretical(const Formation &formation, bool detail = false) const;
     Evaluation evaluate_mean(const Formation &formation, bool detail = false) const;
     std::optional<Evaluation> evaluate_best_order(const Formation &formation,

@@ -354,7 +354,28 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                    candidate.yield.pt >= envelope.pt && candidate.yield.shop >= envelope.shop;
         });
     };
-    auto retain = [&](Formation formation, double pt, double drop) {
+    NativeScoreBound score_bound;
+    if (!fixed_rank) {
+        bool supported = true;
+        try {
+            engine.validate_theoretical_scope();
+        } catch (const SpecError &) {
+            supported = false;
+        }
+        if (supported) {
+            double live = 0;
+            for (double v : engine.boosts())
+                live += v;
+            live *= 1 + (engine.members().size() + 2) * std::numeric_limits<float>::epsilon();
+            std::vector<float> live_bound(
+                engine.chart().times.size(),
+                std::nextafter(static_cast<float>(live), std::numeric_limits<float>::infinity()));
+            score_bound = engine.linear_score_bound(live_bound);
+            stats.score_bound_enabled = score_bound.enabled;
+        }
+    }
+    const size_t snapshot_count = engine.snapshots().size();
+    auto retain = [&](Formation formation, double pt, double drop, double power = -1.0) {
         if (options.method != "exact" && !evaluated.insert(formation_key(formation)).second) {
             ++stats.duplicate_formations;
             return;
@@ -466,6 +487,87 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             return;
         }
         if (mean_rewards) {
+            double s_base = -1.0;
+            double s_upper = stats.score_ceiling;
+            int64_t f_power = power >= 0 ? static_cast<int64_t>(power) : -1;
+            if (f_power < 0) {
+                EvalOptions po;
+                po.order_search = "given";
+                po.calculate_score = false;
+                po.validate = false;
+                f_power = engine.evaluate(formation, po).power;
+            }
+            if (engine.fast_score_applicable()) {
+                s_base = engine.native_min_score(f_power, formation);
+            }
+            if (score_bound.enabled) {
+                double slot_gain_sum = 0;
+                for (const auto &slot : formation.slots) {
+                    size_t m = engine.member_pos(slot.member);
+                    size_t snap = engine.snapshot_pos(slot.snapshot);
+                    double max_k = 0;
+                    for (int k = 0; k < engine.team_size(); ++k)
+                        max_k = std::max(max_k, score_bound.gains[m * snapshot_count + snap][k]);
+                    slot_gain_sum += max_k;
+                }
+                const double bound = NativeScoreBound::upper(
+                    static_cast<double>(f_power), slot_gain_sum, score_bound.base,
+                    score_bound.max_power, engine.team_size(), engine.chart().times.size());
+                s_upper = std::min(s_upper, bound);
+            }
+            int rank_lower = 2, rank_upper = 7;
+            if (s_base >= 0) {
+                rank_lower = 2;
+                for (const auto &row : rank_rows->items())
+                    if (s_base >= num_field(row, "required_score"))
+                        rank_lower = std::max(rank_lower, static_cast<int>(int_field(row, "rank")));
+            }
+            if (std::isfinite(s_upper)) {
+                rank_upper = 2;
+                for (const auto &row : rank_rows->items())
+                    if (s_upper >= num_field(row, "required_score"))
+                        rank_upper = std::max(rank_upper, static_cast<int>(int_field(row, "rank")));
+            }
+            const Yield cap_yield = reward_models[rank_upper - 2].calculate(pt, drop);
+            for (const auto &other : pool) {
+                if (dominates(other.yield, cap_yield)) {
+                    ++stats.dominated_before_evaluation;
+                    return;
+                }
+            }
+            int orders = 1;
+            for (int i = 2; i <= engine.team_size(); ++i)
+                orders *= i;
+            if (s_base >= 0 && rank_lower == rank_upper) {
+                EvalOptions rep_options;
+                rep_options.order_search = "given";
+                rep_options.validate = false;
+                Evaluation representative = engine.evaluate(formation, rep_options);
+                ++stats.index_evaluations;
+                ++stats.absolute_score_evaluations;
+                if (representative.index < min_index)
+                    return;
+                const double total = num_field(representative.estimated_score, "total");
+                representative.ranking_objective = "mean_score";
+                representative.ranking_score = total;
+                representative.order_analysis = Json::object();
+                representative.order_analysis.set("activation_order", Json("random_permutation"));
+                representative.order_analysis.set("best_order_is_controllable", Json(false));
+                representative.order_analysis.set("mean_score", Json(total));
+                representative.order_analysis.set("best_score", Json(total));
+                representative.order_analysis.set("worst_score", Json(total));
+                representative.order_analysis.set("score_permutations", Json(orders));
+                representative.order_analysis.set("order_search_complete", Json(true));
+                Json distribution = Json::array();
+                Json row = Json::object();
+                row.set("rank", Json(rank_lower));
+                row.set("orders", Json(orders));
+                row.set("probability", Json(1.0));
+                distribution.push_back(std::move(row));
+                retain_score(std::move(representative), formation, &cap_yield,
+                             std::move(distribution));
+                return;
+            }
             Yield sum;
             int count = 0;
             double score_sum = 0;
@@ -473,16 +575,15 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             double minimum = std::numeric_limits<double>::infinity();
             bool feasible = true;
             std::map<int, int> ranks;
-            Evaluation representative;
-            const bool finished =
-                engine.for_each_score_order(formation, [&](const Evaluation &score) {
+            std::vector<int> best_permutation;
+            const bool finished = engine.for_each_score_order_fast(
+                formation, [&](double total, double index, const std::vector<int> &permutation) {
                     if (expired())
                         return false;
                     ++stats.index_evaluations;
                     ++stats.absolute_score_evaluations;
-                    if (score.index < min_index)
+                    if (index < min_index)
                         feasible = false;
-                    const double total = num_field(score.estimated_score, "total");
                     int achieved = 2;
                     for (const auto &row : rank_rows->items())
                         if (total >= num_field(row, "required_score"))
@@ -493,9 +594,10 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                     sum.shop += y.shop;
                     score_sum += total;
                     ++ranks[achieved];
-                    if (total > maximum)
-                        representative = score;
-                    maximum = std::max(maximum, total);
+                    if (total > maximum) {
+                        maximum = total;
+                        best_permutation = permutation;
+                    }
                     minimum = std::min(minimum, total);
                     ++count;
                     return true;
@@ -509,6 +611,15 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             sum.cp /= count;
             sum.pt /= count;
             sum.shop /= count;
+            Formation best_formation = formation;
+            for (size_t i = 0; i < best_formation.slots.size() && i < best_permutation.size(); ++i)
+                best_formation.slots[i].trigger = best_permutation[i] + 1;
+            EvalOptions rep_options;
+            rep_options.order_search = "given";
+            rep_options.validate = false;
+            Evaluation representative = engine.evaluate(best_formation, rep_options);
+            ++stats.index_evaluations;
+            ++stats.absolute_score_evaluations;
             representative.ranking_objective = "mean_score";
             representative.ranking_score = score_sum / count;
             representative.order_analysis = Json::object();
@@ -664,27 +775,6 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             finalize();
             return pool;
         }
-        NativeScoreBound score_bound;
-        if (!fixed_rank) {
-            bool supported = true;
-            try {
-                engine.validate_theoretical_scope();
-            } catch (const SpecError &) {
-                supported = false;
-            }
-            if (supported) {
-                double live = 0;
-                for (double v : engine.boosts())
-                    live += v;
-                live *= 1 + (engine.members().size() + 2) * std::numeric_limits<float>::epsilon();
-                std::vector<float> live_bound(
-                    engine.chart().times.size(),
-                    std::nextafter(static_cast<float>(live),
-                                   std::numeric_limits<float>::infinity()));
-                score_bound = engine.linear_score_bound(live_bound);
-                stats.score_bound_enabled = score_bound.enabled;
-            }
-        }
         if (score_bound.enabled && engine.team_size() <= 8 && !expired()) {
             RankOptions bound_options = options;
             bound_options.method = "exact";
@@ -740,7 +830,6 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                     max_power[l][m] = *std::max_element(matrix[m].begin(), matrix[m].end());
             }
         }
-        const size_t snapshot_count = engine.snapshots().size();
         auto descending = [&](const auto &value) {
             std::vector<size_t> order(snapshot_count);
             for (size_t snap = 0; snap < snapshot_count; ++snap)
@@ -969,7 +1058,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 return;
             if (depth == scoped_members.size()) {
                 formation.validate(engine.problem());
-                retain(formation, pt, drop);
+                retain(formation, pt, drop, score_bound.enabled ? power : -1.0);
                 return;
             }
             const size_t m = scoped_members[depth];
@@ -1006,6 +1095,35 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 suffix_drop[first].push_back(top_sum(drop_values, count));
             }
         }
+        std::vector<std::vector<std::vector<double>>> suffix_power;
+        std::vector<std::vector<double>> suffix_gain;
+        if (score_bound.enabled) {
+            suffix_power.resize(leaders.size());
+            for (size_t l = 0; l < leaders.size(); ++l) {
+                suffix_power[l].resize(engine.members().size() + 1);
+                for (size_t first = 0; first <= engine.members().size(); ++first) {
+                    std::vector<double> values;
+                    for (size_t m = first; m < engine.members().size(); ++m)
+                        values.push_back(max_power[l][m]);
+                    int limit = std::min(static_cast<int>(values.size()), engine.team_size());
+                    for (int count = 0; count <= limit; ++count)
+                        suffix_power[l][first].push_back(top_sum(values, count));
+                }
+            }
+            suffix_gain.resize(engine.members().size() + 1);
+            for (size_t first = 0; first <= engine.members().size(); ++first) {
+                std::vector<double> values;
+                for (size_t m = first; m < engine.members().size(); ++m) {
+                    double best = 0;
+                    for (int k = 0; k < engine.team_size(); ++k)
+                        best = std::max(best, member_gains[m][k]);
+                    values.push_back(best);
+                }
+                int limit = std::min(static_cast<int>(values.size()), engine.team_size());
+                for (int count = 0; count <= limit; ++count)
+                    suffix_gain[first].push_back(top_sum(values, count));
+            }
+        }
         std::function<void(size_t, double, double)> groups;
         groups = [&](size_t first, double pt, double drop) {
             if (expired()) {
@@ -1015,10 +1133,32 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             const size_t remaining = engine.team_size() - scoped_members.size();
             if (remaining >= suffix_pt[first].size())
                 return;
+            double upper_score = stats.score_ceiling;
+            if (remaining && score_bound.enabled) {
+                double prefix_gain = suffix_gain[first][remaining];
+                for (size_t m : scoped_members) {
+                    double best = 0;
+                    for (int k = 0; k < engine.team_size(); ++k)
+                        best = std::max(best, member_gains[m][k]);
+                    prefix_gain += best;
+                }
+                double power_upper = 0;
+                for (size_t l = 0; l < leaders.size(); ++l) {
+                    double power = suffix_power[l][first][remaining];
+                    for (size_t m : scoped_members)
+                        power += max_power[l][m];
+                    power_upper = std::max(power_upper, power);
+                }
+                upper_score = std::min(
+                    upper_score,
+                    NativeScoreBound::upper(upwards(power_upper), upwards(prefix_gain),
+                                            score_bound.base, score_bound.max_power,
+                                            engine.team_size(), engine.chart().times.size()));
+            }
             if (remaining &&
                 reward_covered(upwards(pt + suffix_pt[first][remaining] + max_pt),
                                upwards(drop + suffix_drop[first][remaining] + max_drop),
-                               stats.score_ceiling)) {
+                               upper_score)) {
                 ++stats.pruned_member_prefixes;
                 return;
             }
