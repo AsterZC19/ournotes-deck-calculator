@@ -56,6 +56,9 @@ def validate_account(document: Any) -> dict:
         "master_id",
         {"master_id": 1, "exp": 0, "rank": 1, "awake": 1, "live_skill_level": 1},
     )
+    for row in document.get("members", []):
+        if "gekisou_skill_level" in row:
+            integer(row.get("gekisou_skill_level"), "account.members.gekisou_skill_level", 1)
     indexed(document, "snapshots", "master_id", {"master_id": 1, "exp": 0, "rank": 1})
     indexed(document, "characters", "character_id", {"character_id": 1, "exp": 0})
     indexed(document, "band_items", "master_id", {"master_id": 1, "level": 0})
@@ -139,6 +142,7 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
             "_awakeCount",
             state["awake"],
         )
+        gekisou_skill_lvl = state.get("gekisou_skill_level", state.get("live_skill_level", 1))
         card.update(
             trained=trained(raw, [level, rank, awake]),
             level=level["_level"],
@@ -146,6 +150,7 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
             awake=state["awake"],
             live_skill_level=state["live_skill_level"],
             leader_skill_level=rank["_leaderSkillLevel"],
+            gekisou_skill_level=gekisou_skill_lvl,
         )
         card["card_rank_bonus_bp"].update(
             music_type=rank["_musicTypeBonusRate"], music_tag=rank["_musicTagBonusRate"]
@@ -176,6 +181,16 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
             str(raw[f"_supportSkillId0{i}"]): rank[f"_supportSkill0{i}Level"]
             for i in (1, 2)
             if raw.get(f"_supportSkillId0{i}", 0)
+        }
+        gk1 = raw.get("_gekisouSupportSkillId01", 0)
+        gk2 = raw.get("_gekisouSupportSkillId02", 0)
+        card["gekisou_support_skills"] = [gk1, gk2]
+        card["gekisou_support_skill_levels"] = {
+            str(raw.get(f"_gekisouSupportSkillId0{i}", 0)): rank.get(
+                f"_gekisouSupportSkill0{i}Level", 1
+            )
+            for i in (1, 2)
+            if raw.get(f"_gekisouSupportSkillId0{i}", 0)
         }
         card["card_rank_bonus_bp"]["type_link"] = rank["_cardTypeLinkBonusRate"]
         snapshots.append(card)

@@ -19,3 +19,9 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Components vendored under `vendor/haneoka/` are licensed under the Mozilla Public
+License Version 2.0 (MPL-2.0). See `vendor/haneoka/LICENSE` and
+`vendor/haneoka/PROVENANCE.md` for upstream attribution and license terms.

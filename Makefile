@@ -44,6 +44,7 @@ test: $(BUILD)/deckcalc $(TEST_BINS)
 	python3 tests/test_game_rules.py
 	python3 tests/test_topk.py
 	python3 tests/test_warm_start.py
+	python3 tests/test_gekisou.py
 
 format:
 	clang-format -i src/*.cpp src/*.hpp tests/*.cpp

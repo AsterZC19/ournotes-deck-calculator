@@ -7,6 +7,10 @@ __pycache__/
 *.o
 *.json.tmp
 compile_commands.json
+uv.lock
 
 # Private account exports
 /imports/
+
+# Local AI workflow handoff
+/LOCAL_DECK_WORKFLOW.md

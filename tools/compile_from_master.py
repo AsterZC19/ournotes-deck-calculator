@@ -70,6 +70,46 @@ REQUIRED_TABLES = (
     "MasterLiveComboScoreBonus",
 )
 
+ALL_GEKISOU_RUNTIME_TABLES = (
+    "MasterCharacter",
+    "MasterLiveMusic",
+    "MasterLiveMusicScore",
+    "MasterMemberCard",
+    "MasterMemberCardAwake",
+    "MasterMemberCardLevel",
+    "MasterMemberCardRank",
+    "MasterSupportCard",
+    "MasterSupportCardLevel",
+    "MasterSupportCardRank",
+    "MasterCharacterRank",
+    "MasterCharacterTotalRank",
+    "MasterVipRankBonus",
+    "MasterLiveSkill",
+    "MasterLiveSkillEffect",
+    "MasterGekisouSkill",
+    "MasterGekisouSkillEffect",
+    "MasterLeaderSkill",
+    "MasterLeaderSkillEffect",
+    "MasterSupportSkill",
+    "MasterSupportSkillEffect",
+    "MasterGekisouSupportSkill",
+    "MasterGekisouSupportSkillEffect",
+    "MasterSkillTarget",
+    "MasterSkillCondition",
+    "MasterSkillConditionSet",
+    "MasterSkillCumulativeCondition",
+    "MasterLiveNoteParameter",
+    "MasterLiveComboScoreBonus",
+    "MasterLiveGekisouRankingScoreBonus",
+    "MasterLiveGekisouLuckBasePoint",
+    "MasterLiveGekisouLuckBonusLot",
+    "MasterParameter",
+    "MasterLiveSettings",
+    "MasterLiveJudgementParameter",
+    "MasterLiveJudgementTiming",
+)
+GEKISOU_REQUIRED_TABLES = ALL_GEKISOU_RUNTIME_TABLES
+
 
 PROBLEM_SETTINGS: dict[str, Any] = {
     "combo_type": 0,
@@ -346,9 +386,11 @@ def build_members(
                 ),
                 "tags": tags,
                 "live_skill": _int(card.get("_liveSkillID")),
+                "live_skill_level": 5,
                 "leader_skill": _int(card.get("_leaderSkillID")),
                 "leader_skill_level": _int(rank_row.get("_leaderSkillLevel")),
                 "gekisou_skill": _int(card.get("_gekisouSkillID")),
+                "gekisou_skill_level": 5,
                 "card_rank_bonus_bp": {
                     "type_link": 0,
                     "music_type": _int(rank_row.get("_musicTypeBonusRate")),
@@ -369,6 +411,7 @@ def build_snapshots(
     event_id: int,
     ideal_level: int | None,
     ideal_rank: int | None,
+    score_mode: str = "normal",
 ) -> list[dict[str, Any]]:
     level_rows = tables.table("MasterSupportCardLevel")
     rank_rows = tables.table("MasterSupportCardRank")
@@ -414,48 +457,58 @@ def build_snapshots(
                 raise CompileError(f"Snapshot {card['_id']} 引用了未知角色 {character_id}")
             bands.add(_int(character.get("_bandID")))
 
-        snapshots.append(
-            {
-                "id": _int(card["_id"]),
-                "name": texts.get(str(card.get("_nameTextID")), str(card.get("_nameTextID") or "")),
-                "title": texts.get(
-                    str(card.get("_descriptionTextID")), str(card.get("_descriptionTextID") or "")
-                ),
-                "characters": character_ids,
-                "bands": sorted(bands),
-                "card_type": _int(card.get("_cardType")),
-                "rarity": _int(card.get("_rarity")),
-                "trained": trained,
-                "event_bonus_bp": _event_bonus_bp(
-                    buckets[3],
-                    3,
-                    card,
-                    set(character_ids),
-                    bands,
-                    _int(card.get("_cardType")),
-                    set(),
-                    _int(rank_row.get("_rank")),
-                ),
-                "rank": _int(rank_row.get("_rank")),
-                "level": _int(level_row.get("_level")),
-                "support_skills": [
-                    _int(card.get("_supportSkillId01")),
-                    _int(card.get("_supportSkillId02")),
-                ],
-                "support_skill_levels": {
-                    str(_int(card.get(f"_supportSkillId0{i}"))): _int(
-                        rank_row.get(f"_supportSkill0{i}Level")
-                    )
-                    for i in (1, 2)
-                    if _int(card.get(f"_supportSkillId0{i}")) != 0
-                },
-                "card_rank_bonus_bp": {
-                    "type_link": _int(rank_row.get("_cardTypeLinkBonusRate")),
-                    "music_type": 0,
-                    "music_tag": 0,
-                },
+        rec: dict[str, Any] = {
+            "id": _int(card["_id"]),
+            "name": texts.get(str(card.get("_nameTextID")), str(card.get("_nameTextID") or "")),
+            "title": texts.get(
+                str(card.get("_descriptionTextID")), str(card.get("_descriptionTextID") or "")
+            ),
+            "characters": character_ids,
+            "bands": sorted(bands),
+            "card_type": _int(card.get("_cardType")),
+            "rarity": _int(card.get("_rarity")),
+            "trained": trained,
+            "event_bonus_bp": _event_bonus_bp(
+                buckets[3],
+                3,
+                card,
+                set(character_ids),
+                bands,
+                _int(card.get("_cardType")),
+                set(),
+                _int(rank_row.get("_rank")),
+            ),
+            "rank": _int(rank_row.get("_rank")),
+            "level": _int(level_row.get("_level")),
+            "support_skills": [
+                _int(card.get("_supportSkillId01")),
+                _int(card.get("_supportSkillId02")),
+            ],
+            "support_skill_levels": {
+                str(_int(card.get(f"_supportSkillId0{i}"))): _int(
+                    rank_row.get(f"_supportSkill0{i}Level")
+                )
+                for i in (1, 2)
+                if _int(card.get(f"_supportSkillId0{i}")) != 0
+            },
+            "card_rank_bonus_bp": {
+                "type_link": _int(rank_row.get("_cardTypeLinkBonusRate")),
+                "music_type": 0,
+                "music_tag": 0,
+            },
+        }
+        if score_mode == "gekisou":
+            gk1 = _int(card.get("_gekisouSupportSkillId01"))
+            gk2 = _int(card.get("_gekisouSupportSkillId02"))
+            rec["gekisou_support_skills"] = [gk1, gk2]
+            rec["gekisou_support_skill_levels"] = {
+                str(_int(card.get(f"_gekisouSupportSkillId0{i}"))): _int(
+                    rank_row.get(f"_gekisouSupportSkill0{i}Level") or 1
+                )
+                for i in (1, 2)
+                if _int(card.get(f"_gekisouSupportSkillId0{i}")) != 0
             }
-        )
+        snapshots.append(rec)
     return snapshots
 
 
@@ -502,6 +555,7 @@ def build_catalog(
     ideal_level: int | None = None,
     ideal_rank: int | None = None,
     ideal_awake: int | None = None,
+    score_mode: str = "normal",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """构建 catalog 与 fix；ideal_* 为 None 时一律取各 group 的表内最大值。"""
     texts = _load_texts(tables)
@@ -509,7 +563,9 @@ def build_catalog(
     members = build_members(
         tables, texts, characters, int(event_id), ideal_level, ideal_rank, ideal_awake
     )
-    snapshots = build_snapshots(tables, texts, characters, int(event_id), ideal_level, ideal_rank)
+    snapshots = build_snapshots(
+        tables, texts, characters, int(event_id), ideal_level, ideal_rank, score_mode
+    )
     fix, ideal_info = build_fix(tables, band_item_bp)
 
     live_skills = [
@@ -536,7 +592,20 @@ def build_catalog(
             "id": _int(row["_id"]),
             "categories": _int_list(row.get("_skillCategories")),
             "mission_type": _int(row.get("_gekisouMissionType")),
-            "effects": [],
+            "effects": (
+                [
+                    {
+                        "level": _int(e.get("_level")),
+                        "effect_type": _int(e.get("_skillEffectType")),
+                        "value": _int(e.get("_effectValue")),
+                        "condition_group": _int(e.get("_skillConditionGroup")),
+                    }
+                    for e in tables.table("MasterGekisouSkillEffect")
+                    if _int(e.get("_gekisouSkillID")) == _int(row["_id"])
+                ]
+                if score_mode == "gekisou"
+                else []
+            ),
         }
         for row in tables.table("MasterGekisouSkill")
     ]
@@ -618,7 +687,7 @@ def build_catalog(
         for row in tables.table("MasterLiveComboScoreBonus")
     ]
 
-    catalog = {
+    catalog: dict[str, Any] = {
         "members": members,
         "snapshots": snapshots,
         "fix": fix,
@@ -632,6 +701,63 @@ def build_catalog(
         "note_parameters": note_parameters,
         "combo_bonuses": combo_bonuses,
     }
+
+    if score_mode == "gekisou":
+        catalog["gekisou_support_skills"] = [
+            {
+                "id": _int(row["_id"]),
+                "categories": [],
+                "mission_type": _int(row.get("_gekisouMissionType")),
+                "effects": [
+                    {
+                        "level": _int(e.get("_level")),
+                        "effect_type": _int(e.get("_skillEffectType")),
+                        "value": _int(e.get("_effectValue")),
+                        "condition_group": _int(e.get("_skillConditionGroup")),
+                    }
+                    for e in tables.table("MasterGekisouSupportSkillEffect")
+                    if _int(e.get("_gekisouSupportSkillID")) == _int(row["_id"])
+                ],
+            }
+            for row in tables.table("MasterGekisouSupportSkill")
+        ]
+        catalog["gekisou_ranking_score_bonuses"] = [
+            {
+                "pattern": _int(row.get("_missionPattern")),
+                "count": _int(row.get("_count")),
+                "rank": _int(row.get("_rank")),
+                "rate": _int(row.get("_scoreBonusRate")),
+            }
+            for row in tables.table("MasterLiveGekisouRankingScoreBonus")
+        ]
+        catalog["gekisou_luck_base_points"] = [
+            {
+                "category": _int(row.get("_noteCategory")),
+                "judgement": _int(row.get("_noteSimulateJudgement")),
+                "weight": _int(row.get("_weight")),
+                "point": _int(row.get("_basePoint")),
+            }
+            for row in tables.table("MasterLiveGekisouLuckBasePoint")
+        ]
+        catalog["gekisou_luck_bonus_lots"] = [
+            {
+                "lot_type": _int(row.get("_chanceLotType")),
+                "result": _int(row.get("_lotResult")),
+                "weight": _int(row.get("_weight")),
+            }
+            for row in tables.table("MasterLiveGekisouLuckBonusLot")
+        ]
+        catalog["cumulative_conditions"] = [
+            {
+                "id": _int(row["_id"]),
+                "type": _int(row.get("_conditionType")),
+                "cap": _int(row.get("_capValue")),
+                "values": _int_list(row.get("_conditionValues")),
+                "targets": _int_list(row.get("_conditionTargetIDs")),
+            }
+            for row in tables.table("MasterSkillCumulativeCondition")
+        ]
+
     return catalog, ideal_info
 
 
@@ -675,7 +801,12 @@ def _load_chart_runtime(charts_dir: Path, code: str) -> dict[str, Any]:
         raise CompileError(f"谱面 {path} 转换失败: {type(exc).__name__}: {exc}") from exc
 
 
-def build_chart(score: Mapping[str, Any], charts_dir: Path, difficulty: str) -> dict[str, Any]:
+def build_chart(
+    score: Mapping[str, Any],
+    charts_dir: Path,
+    difficulty: str,
+    score_mode: str = "normal",
+) -> dict[str, Any]:
     code = score.get("_musicScoreTextFileName")
     if not code:
         raise CompileError(f"MasterLiveMusicScore {score.get('_id')} 缺少 _musicScoreTextFileName")
@@ -716,7 +847,7 @@ def build_chart(score: Mapping[str, Any], charts_dir: Path, difficulty: str) -> 
     if sorted(_int(s.get("index")) for s in skills) != list(range(EXPECTED_SKILL_COUNT)):
         raise CompileError(f"谱面 {code} 的技能 index 不是 0..{EXPECTED_SKILL_COUNT - 1}")
 
-    return {
+    chart_dict: dict[str, Any] = {
         "difficulty": difficulty,
         "level": _int(score.get("_musicScoreLevel")),
         "display_level": float(score.get("_musicScoreDisplayLevel") or 0.0),
@@ -727,6 +858,15 @@ def build_chart(score: Mapping[str, Any], charts_dir: Path, difficulty: str) -> 
         ],
         "skill_times_ms": [_int(s["timeMs"]) for s in skills],
     }
+    if score_mode == "gekisou":
+        chart_dict["fevers"] = [
+            [_int(f["start"]["timeMs"]), _int(f["end"]["timeMs"])]
+            for f in (runtime.get("fever") or [])
+        ]
+        chart_dict["duration_ms"] = (
+            _int(runtime.get("lastNoteTimeMs") or (notes[-1]["timeMs"] if notes else 0)) + 1000
+        )
+    return chart_dict
 
 
 def _songs_for_event(tables: MasterTables, event_id: int) -> dict[int, list[Mapping[str, Any]]]:
@@ -784,6 +924,7 @@ def build_song(
     charts_dir: Path,
     difficulty: str,
     song_context: str = "auto",
+    score_mode: str = "normal",
 ) -> dict[str, Any]:
     if song_context not in ("auto", "normal", "challenge"):
         raise CompileError(f"未知 song_context: {song_context}")
@@ -813,14 +954,19 @@ def build_song(
         )
 
     title_id = str(music.get("_titleTextID") or "")
-    return {
+    song_dict: dict[str, Any] = {
         "id": _int(music["_id"]),
         "title": texts.get(title_id, title_id),
         "type": _int(task.get("_musicType")),
         "bands": _int_list(music.get("_bandIDs")),
         "tags": _int_list(music.get("_bestMusicTagIDs")),
-        "chart": build_chart(score, charts_dir, difficulty),
+        "chart": build_chart(score, charts_dir, difficulty, score_mode=score_mode),
     }
+    if score_mode == "gekisou":
+        song_dict["gekisou_missions"] = [
+            _int(music.get(f"_gekisouMission{i}") or 0) for i in (1, 2, 3)
+        ]
+    return song_dict
 
 
 def validate_problem(problem: Mapping[str, Any]) -> None:
@@ -854,13 +1000,18 @@ def compile_problem(
     generated_at: str | None = None,
     song_context: str = "auto",
     account: dict[str, Any] | None = None,
+    score_mode: str = "normal",
 ) -> dict[str, Any]:
     """编译一首歌的 problem JSON（纯函数：不做文件写入）。"""
     if difficulty not in DIFFICULTIES:
         raise CompileError(f"--difficulty 只支持 {DIFFICULTIES}，收到 {difficulty!r}")
+    if score_mode not in ("normal", "gekisou"):
+        raise CompileError(f"--score-mode 只支持 ('normal', 'gekisou')，收到 {score_mode!r}")
 
     tables = MasterTables(master_dir, latest_dir)
     tables.require(REQUIRED_TABLES)
+    if score_mode == "gekisou":
+        tables.require(GEKISOU_REQUIRED_TABLES)
 
     texts = _load_texts(tables)
     catalog, ideal_info = build_catalog(
@@ -870,6 +1021,7 @@ def compile_problem(
         ideal_level=ideal_level,
         ideal_rank=ideal_rank,
         ideal_awake=ideal_awake,
+        score_mode=score_mode,
     )
     account_info = None
     if account is not None:
@@ -891,7 +1043,20 @@ def compile_problem(
         if song_context == "auto"
         else song_context
     )
-    song = build_song(tables, texts, music, tasks, Path(charts_dir), difficulty, effective_context)
+    song = build_song(
+        tables,
+        texts,
+        music,
+        tasks,
+        Path(charts_dir),
+        difficulty,
+        effective_context,
+        score_mode,
+    )
+
+    song_keys = ["id", "title", "type", "bands", "tags"]
+    if score_mode == "gekisou":
+        song_keys.append("gekisou_missions")
 
     problem: dict[str, Any] = {
         "schema": SCHEMA_PROBLEM,
@@ -909,19 +1074,30 @@ def compile_problem(
                     else "MasterLiveMusic"
                 ),
                 "score_mode": (
-                    "challenge_without_competitive_gekisou"
-                    if effective_context == "challenge"
-                    else "normal"
+                    "gekisou"
+                    if score_mode == "gekisou"
+                    else (
+                        "challenge_without_competitive_gekisou"
+                        if effective_context == "challenge"
+                        else "normal"
+                    )
                 ),
             },
             "tool": TOOL,
             "ideal": ideal_info,
         },
-        "song": {k: song[k] for k in ("id", "title", "type", "bands", "tags")},
+        "song": {k: song[k] for k in song_keys},
         "chart": song["chart"],
         "catalog": catalog,
         "settings": copy.deepcopy(PROBLEM_SETTINGS),
     }
+
+    if score_mode == "gekisou":
+        problem["meta"]["source"]["gekisou_placement_default"] = 1
+        raw_tables: dict[str, Any] = {}
+        for tbl in ALL_GEKISOU_RUNTIME_TABLES:
+            raw_tables[tbl] = tables.table(tbl)
+        problem["gekisou_master_tables"] = raw_tables
 
     if account_info is not None:
         problem["meta"].pop("ideal")
@@ -997,6 +1173,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "normal", "challenge"),
         default="auto",
         help="普通曲使用原曲属性；课题曲使用当前活动属性；auto 自动选择",
+    )
+    parser.add_argument(
+        "--score-mode",
+        choices=("normal", "gekisou"),
+        default="normal",
+        help="评分模式：normal 保持普通 live 模式；gekisou 导出激奏所需技能、任务、判定参数与 Master 表",
     )
     parser.add_argument(
         "--difficulty",
@@ -1097,6 +1279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 validate=not args.no_validate,
                 generated_at=generated_at,
                 song_context=args.song_context,
+                score_mode=args.score_mode,
             )
             path = output_path_for(output, song_id, args.difficulty, multiple)
             write_problem(problem, path)
