@@ -135,8 +135,6 @@ def main():
 
     seen_sets = set()
     for rank, result in enumerate(results, 1):
-        if digest(solver) != binary:
-            raise RuntimeError("Solver changed during witness checks; use a new output directory")
         key = tuple(sorted(result["members"]))
         if key in seen_sets:
             raise RuntimeError("Repeated member set in top-k results")

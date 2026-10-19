@@ -2,7 +2,7 @@
 """激奏评分与组队测试套件。
 
 覆盖：
-1. 适配器评分与上游引擎（tmp/haneoka-reference）底层独立调用严格一致
+1. 合成 fixture 的金标准评分与槽位综合力
 2. 相同基础 power 下激奏技能对得分与组队排名的真实影响
 3. 技能顺序影响分数的歌曲上三个优化目标 min < mean < max 验证
 4. ournotes-deck-formation@1 标准编队 schema 往返复算及队长重排配对保护
@@ -19,7 +19,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,47 +27,26 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SYNTHETIC_FIXTURE_PATH = REPO_ROOT / "tests" / "fixtures" / "synthetic_gekisou.json"
-HANEOKA_REF_DIR = REPO_ROOT / "tmp" / "haneoka-reference"
 MASTER_DIR = REPO_ROOT / "output" / "account-plan-20261010" / "master"
 CHARTS_DIR = REPO_ROOT / "output" / "charts"
+DECKCALC = REPO_ROOT / "build" / "deckcalc"
 
 
 class GekisouTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        if not shutil.which("node"):
-            raise unittest.SkipTest("系统未安装 node，跳过激奏测试")
-
-        # 检查 Node 版本必须 >= 24
-        res = subprocess.run(["node", "-v"], capture_output=True, text=True, check=True)
-        v_str = res.stdout.strip()
-        if v_str.startswith("v"):
-            major = int(v_str[1:].split(".")[0])
-            if major < 24:
-                raise unittest.SkipTest(f"Node 版本过低 ({v_str})，激奏测试需要 Node >= 24")
-
         assert SYNTHETIC_FIXTURE_PATH.is_file(), f"缺少提交的 fixture: {SYNTHETIC_FIXTURE_PATH}"
+        if not DECKCALC.is_file():
+            raise unittest.SkipTest(f"缺少 {DECKCALC}，请先运行 make")
         cls.fixture_path = SYNTHETIC_FIXTURE_PATH
 
     def run_bridge(self, subcommand: str, payload: dict) -> dict:
-        bridge_script = REPO_ROOT / "vendor" / "haneoka" / "bridge.mjs"
-        loader_script = REPO_ROOT / "vendor" / "haneoka" / "loader.mjs"
-
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
             json.dump(payload, tf, ensure_ascii=False)
             tf_path = tf.name
 
         try:
-            cmd = [
-                "node",
-                "--experimental-transform-types",
-                "--import",
-                str(loader_script),
-                str(bridge_script),
-                subcommand,
-                "-i",
-                tf_path,
-            ]
+            cmd = [str(DECKCALC), f"gekisou-{subcommand}", "-i", tf_path]
             proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT))
         finally:
             try:
@@ -82,12 +60,12 @@ class GekisouTestCase(unittest.TestCase):
                 msg = err_doc.get("message", proc.stderr)
             except Exception:
                 msg = proc.stderr
-            raise RuntimeError(f"Bridge error (code {proc.returncode}): {msg}")
+            raise RuntimeError(f"Gekisou error (code {proc.returncode}): {msg}")
 
         return json.loads(proc.stdout)
 
-    def test_01_upstream_parity(self) -> None:
-        """测试 1: 适配器评分与上游引擎底层直接调用结果严格完全一致。"""
+    def test_01_upstream_parity_exact(self) -> None:
+        """测试 1: 合成 fixture 的评分与槽位综合力严格等于金标准。"""
         formation = {
             "schema": "ournotes-deck-formation@1",
             "leader": 1,
@@ -100,77 +78,23 @@ class GekisouTestCase(unittest.TestCase):
             ],
         }
 
-        adapter_res = self.run_bridge(
-            "score",
-            {
-                "problem": str(self.fixture_path),
-                "formation": formation,
-                "options": {"assumed_placement": 1, "seeds": [0]},
-            },
-        )
-        self.assertEqual(adapter_res["status"], "ok")
-        adapter_mean = adapter_res["mean"]
-
-        # 若 tmp/haneoka-reference 存在，直接对真实上游源码进行独立执行比对
-        ref_engine = (
-            "./tmp/haneoka-reference/src/lib/team-builder/engine"
-            if HANEOKA_REF_DIR.is_dir()
-            else "./vendor/haneoka/engine"
-        )
-
-        compare_script = f"""
-import {{ compileFromMasterTables }} from '{ref_engine}/master.ts';
-import {{ gekisoChart, gekisoContext, scoreOrdersGekiso }} from '{ref_engine}/gekiso.ts';
-import {{ performer }} from '{ref_engine}/full/deck.ts';
-import {{ resolveSlotSkill }} from '{ref_engine}/skills.ts';
-import {{ resolveBox }} from '{ref_engine}/box.ts';
-import fs from 'node:fs';
-
-const prob = JSON.parse(fs.readFileSync('{self.fixture_path}', 'utf8'));
-const master = compileFromMasterTables({{ server: 'jp', releaseId: 'deckcalc' }}, (name) => {{
-  return prob.gekisou_master_tables[name] || null;
-}});
-
-const chartSource = {{
-  durationMs: prob.chart.duration_ms,
-  notes: prob.chart.notes.map((n, idx) => ({{ id: idx + 1, timeMs: n.t, operateType: n.op, judgementType: 0, judged: n.scoring }})),
-  skillTimesMs: prob.chart.skill_times_ms,
-  feverMs: prob.chart.fevers,
-  enumeration: prob.chart.notes.map(n => ({{ op: n.op, timeMs: n.t, judgementType: 0 }}))
-}};
-
-const gChart = gekisoChart(master, chartSource, prob.chart.level, prob.song.gekisou_missions, {{ great: 0, just: 100 }}, 1);
-const members = [1, 2, 3, 4, 5].map((id, idx) => ({{ key: 'm' + idx, cardId: id, level: 60, awake: 2, rank: 5, liveSkillLevel: 5, gekisoSkillLevel: 5 }}));
-const snaps = [1, 2, 3, 4, 5].map((id, idx) => ({{ key: 's' + idx, cardId: id, level: 60, rank: 5 }}));
-const box = resolveBox(master, members, snaps, 'max');
-const deck = box.members.map((m, i) => performer(master, m, box.snaps[i]));
-const slotSkills = box.members.map((m, i) => resolveSlotSkill(master, m, box.snaps[i]));
-const ctx = gekisoContext(master, gChart, deck, [0]);
-const scores = scoreOrdersGekiso(master, gChart, ctx, {adapter_res['power']}, slotSkills);
-console.log(JSON.stringify({{ direct_mean: scores.mean }}));
-"""
-        proc = subprocess.run(
-            [
-                "node",
-                "--experimental-transform-types",
-                "--import",
-                "./vendor/haneoka/loader.mjs",
-                "-e",
-                compare_script,
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-        )
-        self.assertEqual(proc.returncode, 0, f"上游独立运行失败: {proc.stderr}")
-        direct_output = json.loads(
-            [line for line in proc.stdout.splitlines() if line.startswith("{")][-1]
-        )
-        self.assertEqual(
-            adapter_mean,
-            direct_output["direct_mean"],
-            f"适配器得分 {adapter_mean} 与上游直接得分 {direct_output['direct_mean']} 不一致！",
-        )
+        for seeds in ([0], []):
+            result = self.run_bridge(
+                "score",
+                {
+                    "problem": str(self.fixture_path),
+                    "formation": formation,
+                    "options": {"assumed_placement": 1, "seeds": seeds},
+                },
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["power"], 134717)
+            self.assertEqual(result["slot_powers"], [26949, 26950, 26921, 26942, 26955])
+            self.assertEqual(result["mean"], 3808362.8)
+            self.assertEqual(result["min"], 3719907)
+            self.assertEqual(result["max"], 4148716)
+            self.assertEqual(result["min_order"], 6)
+            self.assertEqual(result["max_order"], 0)
 
     def test_02_identical_power_skills_change_ranking(self) -> None:
         """测试 2: 相同基础 power 的卡片，不同激奏技能导致得分与队伍排名不同。"""

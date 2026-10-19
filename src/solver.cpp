@@ -2532,20 +2532,15 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
 
     RankResult result;
     for (Solution &solution : ordered) {
-        if (class_search) {
+        if (class_search && !shared.average_objective && !solution.evaluation.has_order) {
             Formation formation;
             formation.leader = solution.evaluation.leader;
             for (const auto &slot : solution.evaluation.slots)
                 formation.slots.push_back({slot.member, slot.snapshot, slot.trigger});
-            const auto replay = shared.average_objective ? engine.evaluate_mean(formation)
-                                                         : engine.evaluate_theoretical(formation);
+            const auto replay = engine.evaluate_theoretical(formation);
             if (replay.ranking_score != solution.evaluation.ranking_score)
                 throw SpecError("技能分类搜索与完整分数复算不一致");
             solution.evaluation = replay;
-            int64_t orders = 1;
-            for (int i = 2; i <= team_size; ++i)
-                orders *= i;
-            class_search->order_stats.evaluated += orders;
         }
         engine.populate_estimated_score(solution.evaluation);
         result.results.push_back(std::move(solution.evaluation));

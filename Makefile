@@ -2,7 +2,7 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Isrc -MMD -MP
 BUILD    := build
 
-CORE      := json model engine solver event
+CORE      := json model engine solver event gekisou
 OBJ       := $(addprefix $(BUILD)/,$(addsuffix .o,$(CORE)))
 TESTS     := json model engine solver cache
 TEST_BINS := $(addprefix $(BUILD)/test_,$(TESTS))

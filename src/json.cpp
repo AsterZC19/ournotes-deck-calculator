@@ -493,6 +493,10 @@ bool Json::as_bool() const {
     return bool_;
 }
 
+bool Json::is_integer() const {
+    return type_ == Type::Number && std::isfinite(number_) && number_ == std::trunc(number_);
+}
+
 double Json::as_double() const {
     if (type_ != Type::Number) {
         throw_type_error("as_double()", "number");

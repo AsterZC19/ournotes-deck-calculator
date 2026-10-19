@@ -22,6 +22,6 @@ SOFTWARE.
 
 ---
 
-Components vendored under `vendor/haneoka/` are licensed under the Mozilla Public
-License Version 2.0 (MPL-2.0). See `vendor/haneoka/LICENSE` and
-`vendor/haneoka/PROVENANCE.md` for upstream attribution and license terms.
+The Gekisou implementation in `src/gekisou.cpp` is ported from
+[haneoka-gakuen/haneoka](https://github.com/haneoka-gakuen/haneoka) and remains
+licensed under the Mozilla Public License Version 2.0 (MPL-2.0).

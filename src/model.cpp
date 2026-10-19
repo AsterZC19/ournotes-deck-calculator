@@ -387,6 +387,13 @@ Json deep_defaults(const Json *value, const Json &defaults, const Path &path, bo
         Json out = Json::object();
         for (const auto &entry : defaults.fields()) {
             const Json *raw = member_ptr(data, entry.first.c_str());
+            const bool explicit_null_alpha =
+                entry.first == "level_alpha" &&
+                (path == "score_model" || path.ends_with(".score_model"));
+            if (explicit_null_alpha && raw != nullptr && raw->is_null()) {
+                out.set(entry.first, *raw);
+                continue;
+            }
             if (raw != nullptr && raw->is_null()) {
                 raw = nullptr;
             }
@@ -544,15 +551,6 @@ Settings parse_settings(const Json *data, const Path &path) {
         out.score.level_alpha = as_num(level_alpha, child(path, "score_model.level_alpha"));
     } else {
         out.score.level_alpha.reset();
-    }
-
-    if (data != nullptr && data->is_object()) {
-        const Json *requested_score = data->find("score_model");
-        if (requested_score != nullptr && requested_score->is_object()) {
-            const Json *requested_alpha = requested_score->find("level_alpha");
-            if (requested_alpha != nullptr && requested_alpha->is_null())
-                out.score.level_alpha.reset();
-        }
     }
 
     const Json &judgement = merged.at("judgement");

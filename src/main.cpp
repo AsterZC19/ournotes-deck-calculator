@@ -10,6 +10,7 @@
 
 #include "engine.hpp"
 #include "event.hpp"
+#include "gekisou.hpp"
 #include "json.hpp"
 #include "model.hpp"
 #include "solver.hpp"
@@ -38,6 +39,8 @@ void usage() {
            "                    [--objective mean|score] (默认平均收益，score 为最佳顺序收益)\n"
            "                    [--challenge-problem challenge.json] [--leaders 61,62]\n"
            "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
+           "  deckcalc gekisou-score -i input.json\n"
+           "  deckcalc gekisou-rank  -i input.json\n"
            "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--prove-top N] "
            "[--time-limit S]\n"
            "                    [--method auto|fast|exact] [--leaders 61,62] [--detail] [--quiet]\n"
@@ -337,9 +340,41 @@ std::vector<int64_t> parse_id_list(const std::string &text) {
     return ids;
 }
 
+int run_gekisou_command(const std::string &command, int argc, char **argv) {
+    std::string input_path;
+    for (int i = 2; i < argc; ++i) {
+        const std::string flag = argv[i];
+        if (flag == "-i" || flag == "--input") {
+            input_path = need_value(argc, argv, i, "--input");
+        } else {
+            throw SpecError("未知参数: " + flag);
+        }
+    }
+    if (input_path.empty()) {
+        throw SpecError("缺少 --input");
+    }
+    const Json input = Json::read(input_path);
+    const Json output = command == "gekisou-score" ? deckcalc::handle_gekisou_score(input)
+                                                   : deckcalc::handle_gekisou_rank(input);
+    std::cout << output.dump(2) << "\n";
+    return 0;
+}
+
 }
 
 int main(int argc, char **argv) {
+    const std::string first = argc > 1 ? argv[1] : "";
+    if (first == "gekisou-score" || first == "gekisou-rank") {
+        try {
+            return run_gekisou_command(first, argc, argv);
+        } catch (const std::exception &error) {
+            Json failure = Json::object();
+            failure.set("status", Json("error"));
+            failure.set("message", Json(error.what()));
+            std::cerr << failure.dump(0) << "\n";
+            return 1;
+        }
+    }
     try {
         Args args = parse_args(argc, argv);
         if (args.command != "validate" && args.command != "score" && args.command != "rank" &&

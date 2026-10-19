@@ -18,6 +18,8 @@ public:
 class Json {
 public:
     enum class Type { Null, Bool, Number, String, Array, Object };
+    using array_t = std::vector<Json>;
+    using object_t = std::vector<std::pair<std::string, Json>>;
 
     Json() = default;
     Json(std::nullptr_t) {}
@@ -46,6 +48,7 @@ public:
     bool is_number() const {
         return type_ == Type::Number;
     }
+    bool is_integer() const;
     bool is_string() const {
         return type_ == Type::String;
     }
@@ -62,9 +65,15 @@ public:
     const std::string &as_string() const;
 
     const std::vector<Json> &items() const;
+    const array_t &as_array() const {
+        return items();
+    }
     const std::vector<std::pair<std::string, Json>> &fields() const;
 
     const Json *find(std::string_view key) const;
+    bool contains(std::string_view key) const {
+        return find(key) != nullptr;
+    }
     const Json &at(std::string_view key) const;
     const Json &at(size_t index) const;
 

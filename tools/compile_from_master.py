@@ -209,6 +209,13 @@ def _index(rows: Sequence[Mapping[str, Any]], key: str = "_id") -> dict[int, Map
     return {_int(r[key]): r for r in rows}
 
 
+def _group_by(rows: Sequence[Mapping[str, Any]], key: str) -> dict[int, list[Mapping[str, Any]]]:
+    grouped: dict[int, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(_int(row.get(key)), []).append(row)
+    return grouped
+
+
 def _max_row(rows: Sequence[Mapping[str, Any]], order: str) -> Mapping[str, Any]:
     if not rows:
         raise CompileError("需要至少一行数据来取最大值")
@@ -567,6 +574,14 @@ def build_catalog(
         tables, texts, characters, int(event_id), ideal_level, ideal_rank, score_mode
     )
     fix, ideal_info = build_fix(tables, band_item_bp)
+    live_effects = _group_by(tables.table("MasterLiveSkillEffect"), "_liveSkillID")
+    gekisou_effects = (
+        _group_by(tables.table("MasterGekisouSkillEffect"), "_gekisouSkillID")
+        if score_mode == "gekisou"
+        else {}
+    )
+    leader_effects = _group_by(tables.table("MasterLeaderSkillEffect"), "_leaderSkillID")
+    support_effects = _group_by(tables.table("MasterSupportSkillEffect"), "_supportSkillID")
 
     live_skills = [
         {
@@ -581,8 +596,7 @@ def build_catalog(
                     "targets": _int_list(e.get("_skillTargetIDs")),
                     "condition_group": _int(e.get("_skillConditionGroup")),
                 }
-                for e in tables.table("MasterLiveSkillEffect")
-                if _int(e.get("_liveSkillID")) == _int(row["_id"])
+                for e in live_effects.get(_int(row["_id"]), [])
             ],
         }
         for row in tables.table("MasterLiveSkill")
@@ -592,20 +606,15 @@ def build_catalog(
             "id": _int(row["_id"]),
             "categories": _int_list(row.get("_skillCategories")),
             "mission_type": _int(row.get("_gekisouMissionType")),
-            "effects": (
-                [
-                    {
-                        "level": _int(e.get("_level")),
-                        "effect_type": _int(e.get("_skillEffectType")),
-                        "value": _int(e.get("_effectValue")),
-                        "condition_group": _int(e.get("_skillConditionGroup")),
-                    }
-                    for e in tables.table("MasterGekisouSkillEffect")
-                    if _int(e.get("_gekisouSkillID")) == _int(row["_id"])
-                ]
-                if score_mode == "gekisou"
-                else []
-            ),
+            "effects": [
+                {
+                    "level": _int(e.get("_level")),
+                    "effect_type": _int(e.get("_skillEffectType")),
+                    "value": _int(e.get("_effectValue")),
+                    "condition_group": _int(e.get("_skillConditionGroup")),
+                }
+                for e in gekisou_effects.get(_int(row["_id"]), [])
+            ],
         }
         for row in tables.table("MasterGekisouSkill")
     ]
@@ -620,8 +629,7 @@ def build_catalog(
                     "value": _int(e.get("_effectValue")),
                     "targets": _int_list(e.get("_skillTargetIDs")),
                 }
-                for e in tables.table("MasterLeaderSkillEffect")
-                if _int(e.get("_leaderSkillID")) == _int(row["_id"])
+                for e in leader_effects.get(_int(row["_id"]), [])
             ],
         }
         for row in tables.table("MasterLeaderSkill")
@@ -637,8 +645,7 @@ def build_catalog(
                     "value": _int(e.get("_effectValue")),
                     "condition_group": _int(e.get("_skillConditionGroup")),
                 }
-                for e in tables.table("MasterSupportSkillEffect")
-                if _int(e.get("_supportSkillID")) == _int(row["_id"])
+                for e in support_effects.get(_int(row["_id"]), [])
             ],
         }
         for row in tables.table("MasterSupportSkill")
@@ -701,62 +708,6 @@ def build_catalog(
         "note_parameters": note_parameters,
         "combo_bonuses": combo_bonuses,
     }
-
-    if score_mode == "gekisou":
-        catalog["gekisou_support_skills"] = [
-            {
-                "id": _int(row["_id"]),
-                "categories": [],
-                "mission_type": _int(row.get("_gekisouMissionType")),
-                "effects": [
-                    {
-                        "level": _int(e.get("_level")),
-                        "effect_type": _int(e.get("_skillEffectType")),
-                        "value": _int(e.get("_effectValue")),
-                        "condition_group": _int(e.get("_skillConditionGroup")),
-                    }
-                    for e in tables.table("MasterGekisouSupportSkillEffect")
-                    if _int(e.get("_gekisouSupportSkillID")) == _int(row["_id"])
-                ],
-            }
-            for row in tables.table("MasterGekisouSupportSkill")
-        ]
-        catalog["gekisou_ranking_score_bonuses"] = [
-            {
-                "pattern": _int(row.get("_missionPattern")),
-                "count": _int(row.get("_count")),
-                "rank": _int(row.get("_rank")),
-                "rate": _int(row.get("_scoreBonusRate")),
-            }
-            for row in tables.table("MasterLiveGekisouRankingScoreBonus")
-        ]
-        catalog["gekisou_luck_base_points"] = [
-            {
-                "category": _int(row.get("_noteCategory")),
-                "judgement": _int(row.get("_noteSimulateJudgement")),
-                "weight": _int(row.get("_weight")),
-                "point": _int(row.get("_basePoint")),
-            }
-            for row in tables.table("MasterLiveGekisouLuckBasePoint")
-        ]
-        catalog["gekisou_luck_bonus_lots"] = [
-            {
-                "lot_type": _int(row.get("_chanceLotType")),
-                "result": _int(row.get("_lotResult")),
-                "weight": _int(row.get("_weight")),
-            }
-            for row in tables.table("MasterLiveGekisouLuckBonusLot")
-        ]
-        catalog["cumulative_conditions"] = [
-            {
-                "id": _int(row["_id"]),
-                "type": _int(row.get("_conditionType")),
-                "cap": _int(row.get("_capValue")),
-                "values": _int_list(row.get("_conditionValues")),
-                "targets": _int_list(row.get("_conditionTargetIDs")),
-            }
-            for row in tables.table("MasterSkillCumulativeCondition")
-        ]
 
     return catalog, ideal_info
 
@@ -1313,6 +1264,9 @@ def build_event(
     event = next((e for e in tables.table("MasterEvent") if _int(e["_id"]) == event_id), None)
     if event is None:
         raise CompileError(f"活动 {event_id} 不存在")
+    bonus_buckets = {
+        bonus_type: _event_bonus_index(tables, event_id, bonus_type) for bonus_type in (0, 1, 2)
+    }
     for kind, key, table in (
         (2, "members", "MasterMemberCard"),
         (3, "snapshots", "MasterSupportCard"),
@@ -1327,7 +1281,7 @@ def build_event(
                 (2, "event_bonus_bp"),
             ):
                 card[field] = _event_bonus_bp(
-                    _event_bonus_index(tables, event_id, bonus_type)[kind],
+                    bonus_buckets[bonus_type][kind],
                     kind,
                     raw[card["id"]],
                     characters,

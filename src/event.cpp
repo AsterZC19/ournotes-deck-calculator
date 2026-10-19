@@ -720,16 +720,20 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                           seed_stats);
             stats.seed_formations = seed_stats.complete_formations;
             const auto seeds = pool;
+            const bool distinct_snapshots = engine.problem().constraints.distinct_snapshots;
+            const auto &required_snapshots = engine.problem().constraints.required_snapshots;
             for (const auto &candidate : seeds) {
                 double pt = 0, drop = 0;
+                std::set<int64_t> used_snapshots;
                 for (const auto &slot : candidate.formation.slots) {
                     pt += member_bonuses.at(slot.member).pt + snapshot_bonuses.at(slot.snapshot).pt;
                     drop += member_bonuses.at(slot.member).drop +
                             snapshot_bonuses.at(slot.snapshot).drop;
+                    used_snapshots.insert(slot.snapshot);
                 }
                 for (size_t slot = 0; slot < candidate.formation.slots.size(); ++slot) {
-                    const auto &before =
-                        snapshot_bonuses.at(candidate.formation.slots[slot].snapshot);
+                    const int64_t before_id = candidate.formation.slots[slot].snapshot;
+                    const auto &before = snapshot_bonuses.at(before_id);
                     for (const Snapshot *snap : engine.snapshots()) {
                         if (expired())
                             break;
@@ -737,13 +741,16 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                         if (after.pt < before.pt || after.drop < before.drop ||
                             (after.pt == before.pt && after.drop == before.drop))
                             continue;
+                        if (distinct_snapshots && snap->id != before_id &&
+                            used_snapshots.count(snap->id))
+                            continue;
+                        if (std::find(required_snapshots.begin(), required_snapshots.end(),
+                                      before_id) != required_snapshots.end() &&
+                            std::find(required_snapshots.begin(), required_snapshots.end(),
+                                      snap->id) == required_snapshots.end())
+                            continue;
                         Formation f = candidate.formation;
                         f.slots[slot].snapshot = snap->id;
-                        try {
-                            f.validate(engine.problem());
-                        } catch (const SpecError &) {
-                            continue;
-                        }
                         retain(f, pt - before.pt + after.pt, drop - before.drop + after.drop);
                     }
                 }
@@ -1057,7 +1064,6 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             if (depth && cached_prunable(depth, pt, drop, power))
                 return;
             if (depth == scoped_members.size()) {
-                formation.validate(engine.problem());
                 retain(formation, pt, drop, score_bound.enabled ? power : -1.0);
                 return;
             }
@@ -1514,14 +1520,30 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     const bool has_boost_budget = na.find("boost_budget") != nullptr;
     if (has_normal_runs && has_boost_budget)
         throw SpecError("event.assumptions 不能同时指定 boost_budget 与 normal_runs");
+    const bool has_finite = has_normal_runs || has_boost_budget;
     constexpr double max_safe_int = 9007199254740991.0;
+    double count = 0, budget_value = 0, initial_cp = 0;
+    int64_t boost_cost = 1;
     if (has_boost_budget) {
-        double budget_val = positive(na, "boost_budget", 0);
-        if (budget_val != std::floor(budget_val) || budget_val > max_safe_int)
+        budget_value = positive(na, "boost_budget", 0);
+        if (budget_value != std::floor(budget_value) || budget_value > max_safe_int)
             throw SpecError("boost_budget 必须为安全整数");
-        int64_t cost_val = int_field(na, "normal_boost_cost", 1);
-        if (cost_val <= 0)
+        boost_cost = int_field(na, "normal_boost_cost", 1);
+        if (boost_cost <= 0)
             throw SpecError("normal_boost_cost 必须为正整数，不能为零");
+    } else if (has_normal_runs) {
+        count = positive(na, "normal_runs", 0);
+        if (count != std::floor(count) || count > max_safe_int)
+            throw SpecError("normal_runs 必须为安全整数");
+    }
+    const double cost = int_field(ca, "challenge_cp_cost", 200);
+    if (cost <= 0)
+        throw SpecError("challenge_cp_cost 必须为正数");
+    if (has_finite) {
+        initial_cp = positive(na, "initial_cp", 0);
+        if (initial_cp != std::floor(initial_cp) || initial_cp > max_safe_int ||
+            cost != std::floor(cost) || cost > max_safe_int)
+            throw SpecError("normal_runs/initial_cp 和 challenge_cp_cost 必须为安全整数");
     }
     bool normal_complete = false, challenge_complete = false;
     PhaseSearchStats normal_stats, challenge_stats;
@@ -1605,9 +1627,6 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         c.push_back(candidate_json(x));
     out.set("normal_frontier", std::move(n));
     out.set("challenge_frontier", std::move(c));
-    double cost = int_field(ca, "challenge_cp_cost", 200);
-    if (cost <= 0)
-        throw SpecError("challenge_cp_cost 必须为正数");
     Json cycles = Json::array();
     for (size_t i = 0; i < normal.size(); ++i)
         for (size_t j = 0; j < challenge.size(); ++j) {
@@ -1658,38 +1677,22 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     recommended.set("cp", best_cp ? candidate_json(*best_cp) : Json());
     out.set("recommended", std::move(recommended));
 
-    double count = 0;
     std::optional<int64_t> unused_boost;
-    const bool has_finite = has_normal_runs || has_boost_budget;
-    constexpr double max_integer = 9007199254740991.0;
     if (has_boost_budget) {
-        double budget_val = positive(na, "boost_budget", 0);
-        if (budget_val != std::floor(budget_val) || budget_val > max_integer)
-            throw SpecError("boost_budget 必须为安全整数");
-        int64_t cost_val = int_field(na, "normal_boost_cost", 1);
-        if (cost_val <= 0)
-            throw SpecError("normal_boost_cost 必须为正整数，不能为零");
-        count = std::floor(budget_val / cost_val);
-        unused_boost = static_cast<int64_t>(budget_val) % cost_val;
-        normal_assumptions.set("boost_budget", Json(static_cast<int64_t>(budget_val)));
+        count = std::floor(budget_value / boost_cost);
+        unused_boost = static_cast<int64_t>(budget_value) % boost_cost;
+        normal_assumptions.set("boost_budget", Json(static_cast<int64_t>(budget_value)));
         normal_assumptions.set("unused_boost", Json(*unused_boost));
         normal_assumptions.set("normal_runs", Json(static_cast<int64_t>(count)));
         out.set("normal_assumptions", normal_assumptions);
-    } else if (has_normal_runs) {
-        count = positive(na, "normal_runs", 0);
-        if (count != std::floor(count) || count > max_integer)
-            throw SpecError("normal_runs 必须为安全整数");
     }
 
     if (has_finite) {
-        double initial = positive(na, "initial_cp", 0);
-        if (initial != std::floor(initial) || initial > max_integer || cost != std::floor(cost) ||
-            cost > max_integer)
-            throw SpecError("normal_runs/initial_cp 和 challenge_cp_cost 必须为安全整数");
         std::vector<FiniteCP> budgets;
         for (const auto &candidate : normal)
             budgets.push_back(finite_cp(candidate, static_cast<uint64_t>(count),
-                                        static_cast<int64_t>(initial), static_cast<int64_t>(cost)));
+                                        static_cast<int64_t>(initial_cp),
+                                        static_cast<int64_t>(cost)));
         out.set("finite_budget_model", Json("independent_skill_orders_expected_rewards"));
         Json finite = Json::array();
         for (size_t i = 0; i < normal.size(); ++i)

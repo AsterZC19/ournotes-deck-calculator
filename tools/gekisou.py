@@ -2,7 +2,7 @@
 """激奏评分与组队 CLI 工具。
 
 提供 score（激奏真实评分）与 rank（激奏最优组队）子命令，
-底层通过薄适配器调用 vendor/haneoka/ Gekisou 引擎。
+底层调用 build/deckcalc 的原生实现。
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,55 +17,19 @@ from pathlib import Path
 from typing import Any
 
 
-def _find_node_binary() -> str:
-    binary = shutil.which("node")
-    if not binary:
-        raise RuntimeError("系统未找到 node 可执行文件 (需要 Node >= 24)")
-    try:
-        res = subprocess.run([binary, "-v"], capture_output=True, text=True, check=True)
-        version_str = res.stdout.strip()
-        if version_str.startswith("v"):
-            major = int(version_str[1:].split(".")[0])
-            if major < 24:
-                raise RuntimeError(f"Node.js 版本必须 >= 24 (当前检测到: {version_str})")
-    except (subprocess.SubprocessError, ValueError) as exc:
-        if isinstance(exc, RuntimeError):
-            raise
-    return binary
-
-
 def _run_bridge(subcommand: str, payload: dict[str, Any]) -> dict[str, Any]:
     repo_root = Path(__file__).resolve().parent.parent
-    bridge_script = repo_root / "vendor" / "haneoka" / "bridge.mjs"
-    loader_script = repo_root / "vendor" / "haneoka" / "loader.mjs"
-
-    if not bridge_script.is_file():
-        raise RuntimeError(f"找不到桥接脚本: {bridge_script}")
-
-    node_bin = _find_node_binary()
+    binary = repo_root / "build" / "deckcalc"
+    if not binary.is_file():
+        raise RuntimeError(f"找不到可执行文件: {binary}，请先运行 make")
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as tf:
         json.dump(payload, tf, ensure_ascii=False)
         tf_path = tf.name
 
     try:
-        cmd = [
-            node_bin,
-            "--experimental-transform-types",
-            "--import",
-            str(loader_script),
-            str(bridge_script),
-            subcommand,
-            "-i",
-            tf_path,
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-        )
+        cmd = [str(binary), f"gekisou-{subcommand}", "-i", tf_path]
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(repo_root))
     finally:
         try:
             os.remove(tf_path)
@@ -81,12 +44,7 @@ def _run_bridge(subcommand: str, payload: dict[str, Any]) -> dict[str, Any]:
                 raise RuntimeError(err_doc["message"])
         except json.JSONDecodeError:
             pass
-        filtered_err = "\n".join(
-            line
-            for line in err_msg.splitlines()
-            if not line.startswith("(node:") and "ExperimentalWarning" not in line
-        ).strip()
-        raise RuntimeError(f"{filtered_err or err_msg}")
+        raise RuntimeError(err_msg or f"deckcalc 退出码 {proc.returncode}")
 
     try:
         return json.loads(proc.stdout)
@@ -303,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gekisou.py",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="激奏模式评分与最优组队计算工具 (调用 Haneoka Gekisou Engine)。",
+        description="激奏模式评分与最优组队计算工具。",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
