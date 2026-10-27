@@ -39,8 +39,11 @@ void usage() {
            "                    [--objective mean|score] (默认平均收益，score 为最佳顺序收益)\n"
            "                    [--challenge-problem challenge.json] [--leaders 61,62]\n"
            "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
-           "  deckcalc gekisou-score -i input.json\n"
-           "  deckcalc gekisou-rank  -i input.json\n"
+           "  deckcalc gekisou-score (-i input.json | -p problem.json -f formation.json) [-o "
+           "out.json]\n"
+           "  deckcalc gekisou-rank  (-i input.json | -p problem.json) [-k N] [--criterion "
+           "mean|max|min]\n"
+           "                         [--oracle] [--time-limit S] [-o out.json]\n"
            "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--prove-top N] "
            "[--time-limit S]\n"
            "                    [--method auto|fast|exact] [--leaders 61,62] [--detail] [--quiet]\n"
@@ -152,6 +155,9 @@ Args parse_args(int argc, char **argv) {
             args.detail = true;
         } else if (flag == "--quiet") {
             args.quiet = true;
+        } else if (flag == "-h" || flag == "--help") {
+            usage();
+            std::exit(0);
         } else {
             throw SpecError("未知参数: " + flag);
         }
@@ -342,21 +348,74 @@ std::vector<int64_t> parse_id_list(const std::string &text) {
 
 int run_gekisou_command(const std::string &command, int argc, char **argv) {
     std::string input_path;
+    std::string problem_path;
+    std::string formation_path;
+    std::string output_path;
+    std::string criterion;
+    std::optional<int64_t> top_k;
+    std::optional<double> time_limit_s;
+    std::optional<int64_t> assumed_placement;
+    bool oracle = false;
+
     for (int i = 2; i < argc; ++i) {
         const std::string flag = argv[i];
-        if (flag == "-i" || flag == "--input") {
+        if (flag == "-h" || flag == "--help") {
+            usage();
+            std::exit(0);
+        } else if (flag == "-i" || flag == "--input") {
             input_path = need_value(argc, argv, i, "--input");
+        } else if (flag == "-p" || flag == "--problem") {
+            problem_path = need_value(argc, argv, i, "--problem");
+        } else if (flag == "-f" || flag == "--formation") {
+            formation_path = need_value(argc, argv, i, "--formation");
+        } else if (flag == "-o" || flag == "--output") {
+            output_path = need_value(argc, argv, i, "--output");
+        } else if (flag == "-k" || flag == "--top") {
+            top_k = std::stoll(need_value(argc, argv, i, "--top"));
+        } else if (flag == "--criterion" || flag == "--objective") {
+            criterion = need_value(argc, argv, i, "--criterion");
+        } else if (flag == "--oracle") {
+            oracle = true;
+        } else if (flag == "--time-limit") {
+            time_limit_s = std::stod(need_value(argc, argv, i, "--time-limit"));
+        } else if (flag == "--assumed-placement") {
+            assumed_placement = std::stoll(need_value(argc, argv, i, "--assumed-placement"));
         } else {
             throw SpecError("未知参数: " + flag);
         }
     }
-    if (input_path.empty()) {
-        throw SpecError("缺少 --input");
+    if (input_path.empty() && problem_path.empty()) {
+        throw SpecError("缺少 --input 或 --problem");
     }
-    const Json input = Json::read(input_path);
+    Json input = input_path.empty() ? Json::object() : Json::read(input_path);
+    if (!problem_path.empty()) {
+        input.set("problem", problem_path == "-" ? Json::read("-") : Json(problem_path));
+    }
+    if (!formation_path.empty()) {
+        input.set("formation", Json::read(formation_path));
+    }
+    if (top_k) {
+        input.set("k", Json(*top_k));
+    }
+    if (!criterion.empty()) {
+        input.set("criterion", Json(criterion));
+    }
+    if (oracle) {
+        input.set("oracle", Json(true));
+    }
+    if (time_limit_s || assumed_placement) {
+        Json opts = input.find("options") && input.find("options")->is_object()
+                        ? *input.find("options")
+                        : Json::object();
+        if (time_limit_s)
+            opts.set("time_limit_ms", Json(*time_limit_s * 1000.0));
+        if (assumed_placement)
+            opts.set("assumed_placement", Json(*assumed_placement));
+        input.set("options", std::move(opts));
+    }
     const Json output = command == "gekisou-score" ? deckcalc::handle_gekisou_score(input)
                                                    : deckcalc::handle_gekisou_rank(input);
-    std::cout << output.dump(2) << "\n";
+    write_output(output, output_path);
     return 0;
 }
 

@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1242,400 +1243,605 @@ struct TeamPowerResult {
     std::vector<double> slots;
 };
 
-TeamPowerResult calc_deckcalc_team_power(const Json *prob, const EngineMaster &master,
-                                         const std::vector<MemberState> &members,
-                                         const std::vector<const SnapState *> &snaps,
-                                         size_t leader_idx) {
-    (void)master;
-    const Json *catalog = (prob && prob->is_object()) ? prob->find("catalog") : nullptr;
-    const Json *settings = (prob && prob->is_object()) ? prob->find("settings") : nullptr;
-    const Json *song = (prob && prob->is_object()) ? prob->find("song") : nullptr;
-    const Json *fix = (catalog && catalog->is_object()) ? catalog->find("fix") : nullptr;
-    const Json *pm = (settings && settings->is_object()) ? settings->find("power_model") : nullptr;
-    const Json *sources = (pm && pm->is_object()) ? pm->find("sources") : nullptr;
+struct PrecomputedProbPower {
+    enum class RoundMode { Float32Floor, Float64Floor, Round, None };
+    enum class TypeLinkSrc { Snapshot, Member, Both, Other };
 
-    auto src_enabled = [&](const std::string &name) -> bool {
-        if (!sources || !sources->is_object())
-            return true;
-        const Json *v = sources->find(name);
-        return !(v && v->is_bool() && !v->as_bool());
-    };
-    bool en_trained = src_enabled("trained");
-    bool en_char_rank = src_enabled("character_rank");
-    bool en_char_total_rank = src_enabled("character_total_rank");
-    bool en_snapshot = src_enabled("snapshot");
-    bool en_type_link = src_enabled("type_link");
-    bool en_leader = src_enabled("leader");
-    bool en_band_item = src_enabled("band_item");
-    bool en_music_type = src_enabled("music_type");
-    bool en_music_tag = src_enabled("music_tag");
-    bool en_vip = src_enabled("vip");
-
-    std::string rounding = "float32_floor";
-    if (pm && pm->is_object()) {
-        if (const Json *r = pm->find("rounding"); r && r->is_string())
-            rounding = r->as_string();
-    }
-    std::string type_link_source = "snapshot";
-    if (settings && settings->is_object()) {
-        if (const Json *tls = settings->find("type_link_bonus_source"); tls && tls->is_string())
-            type_link_source = tls->as_string();
-    }
+    bool valid = false;
+    bool en_trained = true;
+    bool en_char_rank = true;
+    bool en_char_total_rank = true;
+    bool en_snapshot = true;
+    bool en_type_link = true;
+    bool en_leader = true;
+    bool en_band_item = true;
+    bool en_music_type = true;
+    bool en_music_tag = true;
+    bool en_vip = true;
     bool apply_event_power = true;
-    if (settings && settings->is_object()) {
-        if (const Json *ev = settings->find("event"); ev && ev->is_object()) {
-            if (const Json *aep = ev->find("apply_event_power"); aep && aep->is_bool())
-                apply_event_power = aep->as_bool();
+    RoundMode round_mode = RoundMode::Float32Floor;
+    TypeLinkSrc tl_source = TypeLinkSrc::Snapshot;
+
+    int32_t song_type = 0;
+    std::vector<int32_t> song_tags;
+
+    std::array<int64_t, 3> def_cr{0, 0, 0};
+    std::array<int64_t, 3> def_ctr{0, 0, 0};
+    std::array<int64_t, 3> def_bi{0, 0, 0};
+    std::array<int64_t, 3> def_vip{0, 0, 0};
+    int64_t mt_base_bp = 0;
+    int64_t mtag_base_bp = 0;
+    int64_t tl_base_bp = 0;
+
+    std::unordered_map<int32_t, std::array<int64_t, 3>> cr_by_char;
+    std::unordered_map<int32_t, std::array<int64_t, 3>> bi_by_char;
+    std::unordered_map<int32_t, std::array<int64_t, 3>> bi_by_band;
+    std::unordered_map<int32_t, std::array<int64_t, 3>> bi_by_ct;
+
+    struct ExtraSrc {
+        bool is_flat = false;
+        std::array<int64_t, 3> vals{0, 0, 0};
+    };
+    std::vector<ExtraSrc> extra_sources;
+
+    struct CatMember {
+        std::optional<int32_t> leader_skill;
+        int64_t ev_bp = 0;
+        bool has_crb = false;
+        std::optional<int32_t> crb_mt;
+        std::optional<int32_t> crb_mtag;
+        int64_t crb_tl = 0;
+    };
+    struct CatSnap {
+        int64_t ev_bp = 0;
+        std::optional<int32_t> rank;
+        bool has_crb = false;
+        std::optional<int32_t> crb_tl;
+    };
+    struct CatTarget {
+        int32_t band = 0;
+        int32_t character = 0;
+        int32_t card_type = 0;
+        int32_t tag = 0;
+        int32_t gekisou_mission_type = 0;
+        int32_t music_type = 0;
+        std::vector<int32_t> live_skill_categories;
+        std::vector<int32_t> gekisou_skill_categories;
+    };
+    struct CatCond {
+        int32_t condition_type = 0;
+        bool is_pos = true;
+        std::vector<int32_t> targets;
+    };
+    struct CatLeaderEff {
+        int32_t level = 0;
+        int32_t condition_group = 0;
+        int32_t effect_type = 0;
+        int32_t cumulative_type = 0;
+        int32_t max_cumulative_count = 0;
+        int32_t value = 0;
+        int32_t max_value = 0;
+        std::vector<int32_t> cumulative_targets;
+        std::vector<int32_t> targets;
+    };
+
+    std::unordered_map<int32_t, CatMember> cat_members;
+    std::unordered_map<int32_t, CatSnap> cat_snaps;
+    std::unordered_map<int32_t, CatTarget> target_map;
+    std::unordered_map<int32_t, CatCond> cond_map;
+    std::unordered_map<int32_t, std::vector<std::vector<int32_t>>> cg_map;
+    std::unordered_map<int32_t, int32_t> gk_mission_by_skill;
+    std::unordered_map<int32_t, std::vector<CatLeaderEff>> leader_skills;
+
+    explicit PrecomputedProbPower(const Json *prob) {
+        if (!prob || !prob->is_object())
+            return;
+        valid = true;
+        const Json *catalog = prob->find("catalog");
+        const Json *settings = prob->find("settings");
+        const Json *song = prob->find("song");
+        const Json *fix = (catalog && catalog->is_object()) ? catalog->find("fix") : nullptr;
+        const Json *pm =
+            (settings && settings->is_object()) ? settings->find("power_model") : nullptr;
+        const Json *sources = (pm && pm->is_object()) ? pm->find("sources") : nullptr;
+
+        auto src_enabled = [&](const std::string &name) -> bool {
+            if (!sources || !sources->is_object())
+                return true;
+            const Json *v = sources->find(name);
+            return !(v && v->is_bool() && !v->as_bool());
+        };
+        en_trained = src_enabled("trained");
+        en_char_rank = src_enabled("character_rank");
+        en_char_total_rank = src_enabled("character_total_rank");
+        en_snapshot = src_enabled("snapshot");
+        en_type_link = src_enabled("type_link");
+        en_leader = src_enabled("leader");
+        en_band_item = src_enabled("band_item");
+        en_music_type = src_enabled("music_type");
+        en_music_tag = src_enabled("music_tag");
+        en_vip = src_enabled("vip");
+
+        std::string rounding = "float32_floor";
+        if (pm && pm->is_object()) {
+            if (const Json *r = pm->find("rounding"); r && r->is_string())
+                rounding = r->as_string();
+        }
+        if (rounding == "float32_floor")
+            round_mode = RoundMode::Float32Floor;
+        else if (rounding == "float64_floor")
+            round_mode = RoundMode::Float64Floor;
+        else if (rounding == "round")
+            round_mode = RoundMode::Round;
+        else
+            round_mode = RoundMode::None;
+
+        std::string type_link_source = "snapshot";
+        if (settings && settings->is_object()) {
+            if (const Json *tls = settings->find("type_link_bonus_source"); tls && tls->is_string())
+                type_link_source = tls->as_string();
+        }
+        if (type_link_source == "snapshot")
+            tl_source = TypeLinkSrc::Snapshot;
+        else if (type_link_source == "member")
+            tl_source = TypeLinkSrc::Member;
+        else if (type_link_source == "both")
+            tl_source = TypeLinkSrc::Both;
+        else
+            tl_source = TypeLinkSrc::Other;
+
+        if (settings && settings->is_object()) {
+            if (const Json *ev = settings->find("event"); ev && ev->is_object()) {
+                if (const Json *aep = ev->find("apply_event_power"); aep && aep->is_bool())
+                    apply_event_power = aep->as_bool();
+            }
+        }
+
+        auto get_vec3 = [](const Json *obj, const std::string &key,
+                           int64_t def = 0) -> std::array<int64_t, 3> {
+            std::array<int64_t, 3> res{def, def, def};
+            if (!obj || !obj->is_object())
+                return res;
+            const Json *a = obj->find(key);
+            if (!a || !a->is_array())
+                return res;
+            const auto &arr = a->as_array();
+            for (size_t i = 0; i < 3 && i < arr.size(); ++i)
+                res[i] = json_i32(&arr[i], static_cast<int32_t>(def));
+            return res;
+        };
+        auto parse_vec3_map = [&](const Json *obj, const std::string &map_key,
+                                  const std::array<int64_t, 3> &fallback,
+                                  std::unordered_map<int32_t, std::array<int64_t, 3>> &out_map) {
+            if (!obj || !obj->is_object())
+                return;
+            const Json *mp = obj->find(map_key);
+            if (!mp || !mp->is_object())
+                return;
+            for (const auto &[k, entry] : mp->fields()) {
+                if (!entry.is_array())
+                    continue;
+                int32_t id = 0;
+                try {
+                    id = std::stoi(k);
+                } catch (...) {
+                    continue;
+                }
+                std::array<int64_t, 3> res = fallback;
+                const auto &arr = entry.as_array();
+                for (size_t i = 0; i < 3 && i < arr.size(); ++i)
+                    res[i] = json_i32(&arr[i], static_cast<int32_t>(fallback[i]));
+                out_map[id] = res;
+            }
+        };
+
+        song_type = song ? row_i32(*song, "type") : 0;
+        song_tags = song ? row_list(*song, "tags") : std::vector<int32_t>{};
+
+        def_cr = get_vec3(fix, "character_rank_bonus");
+        def_ctr = get_vec3(fix, "character_total_rank_bonus");
+        def_bi = get_vec3(fix, "band_item_bonus_bp");
+        def_vip = get_vec3(fix, "vip_bonus_bp");
+        mt_base_bp = fix ? row_i32(*fix, "music_type_base_bp") : 0;
+        mtag_base_bp = fix ? row_i32(*fix, "music_tag_base_bp") : 0;
+        tl_base_bp = fix ? row_i32(*fix, "type_link_base_bp") : 0;
+
+        parse_vec3_map(fix, "character_rank_bonus_by_character", def_cr, cr_by_char);
+        parse_vec3_map(fix, "band_item_bonus_bp_by_character", {0, 0, 0}, bi_by_char);
+        parse_vec3_map(fix, "band_item_bonus_bp_by_band", def_bi, bi_by_band);
+        parse_vec3_map(fix, "band_item_bonus_bp_by_card_type", {0, 0, 0}, bi_by_ct);
+
+        if (pm && pm->is_object()) {
+            if (const Json *exs = pm->find("extra_sources"); exs && exs->is_array()) {
+                for (const Json &src : exs->as_array()) {
+                    std::string kind = row_str(src, "kind", "rate_bp");
+                    auto vals = get_vec3(&src, "rate_bp");
+                    if (vals[0] == 0 && vals[1] == 0 && vals[2] == 0)
+                        vals = get_vec3(&src, "flat_power");
+                    extra_sources.push_back({kind == "flat", vals});
+                }
+            }
+        }
+
+        if (catalog && catalog->is_object()) {
+            if (const Json *ms = catalog->find("members"); ms && ms->is_array()) {
+                for (const Json &m : ms->as_array()) {
+                    CatMember cm;
+                    if (const Json *ls = m.find("leader_skill"); ls && ls->is_number())
+                        cm.leader_skill = json_i32(ls);
+                    cm.ev_bp = row_i32(m, "event_bonus_bp");
+                    if (const Json *crb = m.find("card_rank_bonus_bp"); crb && crb->is_object()) {
+                        cm.has_crb = true;
+                        if (const Json *v = crb->find("music_type"); v && v->is_number())
+                            cm.crb_mt = json_i32(v);
+                        if (const Json *v = crb->find("music_tag"); v && v->is_number())
+                            cm.crb_mtag = json_i32(v);
+                        cm.crb_tl = row_i32(*crb, "type_link", 0);
+                    }
+                    cat_members[row_i32(m, "id")] = cm;
+                }
+            }
+            if (const Json *ss = catalog->find("snapshots"); ss && ss->is_array()) {
+                for (const Json &s : ss->as_array()) {
+                    CatSnap cs;
+                    cs.ev_bp = row_i32(s, "event_bonus_bp");
+                    if (const Json *rk = s.find("rank"); rk && rk->is_number())
+                        cs.rank = json_i32(rk);
+                    if (const Json *crb = s.find("card_rank_bonus_bp"); crb && crb->is_object()) {
+                        cs.has_crb = true;
+                        if (const Json *v = crb->find("type_link"); v && v->is_number())
+                            cs.crb_tl = json_i32(v);
+                    }
+                    cat_snaps[row_i32(s, "id")] = cs;
+                }
+            }
+            if (const Json *ts = catalog->find("targets"); ts && ts->is_array()) {
+                for (const Json &t : ts->as_array()) {
+                    CatTarget ct;
+                    ct.band = row_i32(t, "band");
+                    ct.character = row_i32(t, "character");
+                    ct.card_type = row_i32(t, "card_type");
+                    ct.tag = row_i32(t, "tag");
+                    ct.gekisou_mission_type = row_i32(t, "gekisou_mission_type");
+                    ct.music_type = row_i32(t, "music_type");
+                    ct.live_skill_categories = row_list(t, "live_skill_categories");
+                    ct.gekisou_skill_categories = row_list(t, "gekisou_skill_categories");
+                    target_map[row_i32(t, "id")] = std::move(ct);
+                }
+            }
+            if (const Json *cs = catalog->find("conditions"); cs && cs->is_array()) {
+                for (const Json &c : cs->as_array()) {
+                    CatCond cc;
+                    cc.condition_type = row_i32(c, "condition_type");
+                    const Json *pos = c.find("positive");
+                    cc.is_pos = !(pos && pos->is_bool() && !pos->as_bool());
+                    cc.targets = row_list(c, "targets");
+                    cond_map[row_i32(c, "id")] = std::move(cc);
+                }
+            }
+            if (const Json *cgs = catalog->find("condition_groups"); cgs && cgs->is_array()) {
+                for (const Json &cg : cgs->as_array()) {
+                    std::vector<std::vector<int32_t>> sets_vec;
+                    if (const Json *sets = cg.find("sets"); sets && sets->is_array()) {
+                        for (const Json &set_item : sets->as_array()) {
+                            const Json *cids_json =
+                                set_item.is_object() ? set_item.find("conditions") : &set_item;
+                            if (!cids_json || !cids_json->is_array())
+                                continue;
+                            std::vector<int32_t> cids;
+                            for (const Json &cid_val : cids_json->as_array())
+                                cids.push_back(json_i32(&cid_val));
+                            sets_vec.push_back(std::move(cids));
+                        }
+                    }
+                    cg_map[row_i32(cg, "id")] = std::move(sets_vec);
+                }
+            }
+            if (const Json *gks = catalog->find("gekisou_skills"); gks && gks->is_array()) {
+                for (const Json &gk : gks->as_array())
+                    gk_mission_by_skill[row_i32(gk, "id")] = row_i32(gk, "mission_type");
+            }
+            if (const Json *lskills = catalog->find("leader_skills");
+                lskills && lskills->is_array()) {
+                for (const Json &sk : lskills->as_array()) {
+                    std::vector<CatLeaderEff> eff_vec;
+                    if (const Json *effs = sk.find("effects"); effs && effs->is_array()) {
+                        for (const Json &eff : effs->as_array()) {
+                            CatLeaderEff ce;
+                            ce.level = row_i32(eff, "level");
+                            ce.condition_group = row_i32(eff, "condition_group");
+                            ce.effect_type = row_i32(eff, "effect_type");
+                            ce.cumulative_type = row_i32(eff, "cumulative_type");
+                            ce.max_cumulative_count = row_i32(eff, "max_cumulative_count");
+                            ce.value = row_i32(eff, "value");
+                            ce.max_value = row_i32(eff, "max_value");
+                            ce.cumulative_targets = row_list(eff, "cumulative_targets");
+                            ce.targets = row_list(eff, "targets");
+                            eff_vec.push_back(std::move(ce));
+                        }
+                    }
+                    leader_skills[row_i32(sk, "id")] = std::move(eff_vec);
+                }
+            }
         }
     }
 
-    auto round_val = [&](double value) -> double {
-        if (rounding == "float32_floor") {
+    double round_val(double value) const {
+        switch (round_mode) {
+        case RoundMode::Float32Floor: {
             int64_t scaled = static_cast<int64_t>(std::trunc(value * 10000.0));
             return std::floor(f32(f32(scaled) / 10000.0f));
         }
-        if (rounding == "float64_floor")
+        case RoundMode::Float64Floor:
             return std::floor(value);
-        if (rounding == "round")
+        case RoundMode::Round:
             return std::round(value);
+        case RoundMode::None:
+            return value;
+        }
         return value;
-    };
-    auto apply_rate = [&](double base_val, int64_t rate_bp) -> double {
+    }
+
+    double apply_rate(double base_val, int64_t rate_bp) const {
         if (rate_bp == 0)
             return 0.0;
-        if (rounding == "float32_floor") {
+        if (round_mode == RoundMode::Float32Floor) {
             int64_t base_scaled = static_cast<int64_t>(std::llround(base_val * 10000.0));
             int64_t mul = static_cast<int64_t>(
                 std::trunc(static_cast<double>(base_scaled * rate_bp) / 10000.0));
             return std::floor(f32(f32(mul) / 10000.0f));
         }
         return round_val((base_val * static_cast<double>(rate_bp)) / 10000.0);
-    };
-
-    auto get_vec3 = [](const Json *obj, const std::string &key,
-                       int64_t def = 0) -> std::array<int64_t, 3> {
-        std::array<int64_t, 3> res{def, def, def};
-        if (!obj || !obj->is_object())
-            return res;
-        const Json *a = obj->find(key);
-        if (!a || !a->is_array())
-            return res;
-        const auto &arr = a->as_array();
-        for (size_t i = 0; i < 3 && i < arr.size(); ++i)
-            res[i] = json_i32(&arr[i], static_cast<int32_t>(def));
-        return res;
-    };
-    auto get_map_vec3 = [&](const Json *obj, const std::string &map_key, int32_t id,
-                            const std::array<int64_t, 3> &fallback) -> std::array<int64_t, 3> {
-        if (!obj || !obj->is_object())
-            return fallback;
-        const Json *mp = obj->find(map_key);
-        if (!mp || !mp->is_object())
-            return fallback;
-        const Json *entry = mp->find(std::to_string(id));
-        if (!entry || !entry->is_array())
-            return fallback;
-        std::array<int64_t, 3> res = fallback;
-        const auto &arr = entry->as_array();
-        for (size_t i = 0; i < 3 && i < arr.size(); ++i)
-            res[i] = json_i32(&arr[i], static_cast<int32_t>(fallback[i]));
-        return res;
-    };
-
-    std::unordered_map<int32_t, const Json *> cat_members;
-    std::unordered_map<int32_t, const Json *> cat_snaps;
-    if (catalog && catalog->is_object()) {
-        if (const Json *ms = catalog->find("members"); ms && ms->is_array()) {
-            for (const Json &m : ms->as_array())
-                cat_members[row_i32(m, "id")] = &m;
-        }
-        if (const Json *ss = catalog->find("snapshots"); ss && ss->is_array()) {
-            for (const Json &s : ss->as_array())
-                cat_snaps[row_i32(s, "id")] = &s;
-        }
     }
 
-    int32_t song_type = song ? row_i32(*song, "type") : 0;
-    std::vector<int32_t> song_tags = song ? row_list(*song, "tags") : std::vector<int32_t>{};
+    bool match_cat_targets(const MemberState &m, const std::vector<int32_t> &tids) const {
+        if (tids.empty())
+            return true;
+        for (int32_t tid : tids) {
+            auto tit = target_map.find(tid);
+            if (tit == target_map.end())
+                continue;
+            const CatTarget &t = tit->second;
+            bool matched = false;
+            if (t.band > 0 && t.band == m.card.band_id)
+                matched = true;
+            if (!matched && t.character > 0 && t.character == m.card.character_id)
+                matched = true;
+            if (!matched && t.card_type > 0 && t.card_type == m.card.card_type)
+                matched = true;
+            if (!matched && t.tag > 0 &&
+                std::find(m.card.best_tags.begin(), m.card.best_tags.end(), t.tag) !=
+                    m.card.best_tags.end())
+                matched = true;
+            if (!matched && t.gekisou_mission_type > 0) {
+                int32_t m_gm = m.gekiso_mission_type;
+                if (m_gm == 0) {
+                    auto gkit = gk_mission_by_skill.find(m.card.gekiso_skill_id);
+                    if (gkit != gk_mission_by_skill.end())
+                        m_gm = gkit->second;
+                }
+                if (m_gm == t.gekisou_mission_type)
+                    matched = true;
+            }
+            if (!matched) {
+                for (int32_t cat : t.live_skill_categories) {
+                    if (cat != 0 &&
+                        std::find(m.live_skill_categories.begin(), m.live_skill_categories.end(),
+                                  cat) != m.live_skill_categories.end()) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (!matched) {
+                for (int32_t cat : t.gekisou_skill_categories) {
+                    if (cat != 0 && std::find(m.gekiso_skill_categories.begin(),
+                                              m.gekiso_skill_categories.end(),
+                                              cat) != m.gekiso_skill_categories.end()) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (matched)
+                return true;
+        }
+        return false;
+    }
 
-    // 计算队长技能每个槽位的三维加成 BP
-    std::vector<std::array<int64_t, 3>> leader_rates(members.size(), {0, 0, 0});
-    if (en_leader && leader_idx < members.size() && catalog && catalog->is_object()) {
+    std::vector<std::array<int64_t, 3>>
+    compute_leader_rates(const std::vector<MemberState> &members, size_t leader_idx) const {
+        std::vector<std::array<int64_t, 3>> leader_rates(members.size(), {0, 0, 0});
+        if (!en_leader || leader_idx >= members.size())
+            return leader_rates;
         const MemberState &leader_m = members[leader_idx];
-        const Json *cat_l =
-            cat_members.count(leader_m.card.id) ? cat_members.at(leader_m.card.id) : nullptr;
-        int32_t l_skill_id = cat_l ? row_i32(*cat_l, "leader_skill", leader_m.card.leader_skill_id)
-                                   : leader_m.card.leader_skill_id;
+        auto cmit = cat_members.find(leader_m.card.id);
+        int32_t l_skill_id = (cmit != cat_members.end() && cmit->second.leader_skill.has_value())
+                                 ? *cmit->second.leader_skill
+                                 : leader_m.card.leader_skill_id;
         int32_t l_level = leader_m.leader_skill_level > 0 ? leader_m.leader_skill_level : 5;
+        auto lsit = leader_skills.find(l_skill_id);
+        if (lsit == leader_skills.end())
+            return leader_rates;
 
-        const Json *l_skill = nullptr;
-        if (const Json *lskills = catalog->find("leader_skills"); lskills && lskills->is_array()) {
-            for (const Json &sk : lskills->as_array()) {
-                if (row_i32(sk, "id") == l_skill_id) {
-                    l_skill = &sk;
-                    break;
-                }
-            }
-        }
-        if (l_skill) {
-            std::unordered_map<int32_t, const Json *> target_map;
-            if (const Json *ts = catalog->find("targets"); ts && ts->is_array()) {
-                for (const Json &t : ts->as_array())
-                    target_map[row_i32(t, "id")] = &t;
-            }
-            std::unordered_map<int32_t, const Json *> cond_map;
-            if (const Json *cs = catalog->find("conditions"); cs && cs->is_array()) {
-                for (const Json &c : cs->as_array())
-                    cond_map[row_i32(c, "id")] = &c;
-            }
-            std::unordered_map<int32_t, const Json *> cg_map;
-            if (const Json *cgs = catalog->find("condition_groups"); cgs && cgs->is_array()) {
-                for (const Json &cg : cgs->as_array())
-                    cg_map[row_i32(cg, "id")] = &cg;
-            }
-            std::unordered_map<int32_t, int32_t> gk_mission_by_skill;
-            if (const Json *gks = catalog->find("gekisou_skills"); gks && gks->is_array()) {
-                for (const Json &gk : gks->as_array())
-                    gk_mission_by_skill[row_i32(gk, "id")] = row_i32(gk, "mission_type");
-            }
-
-            auto match_cat_targets = [&](const MemberState &m,
-                                         const std::vector<int32_t> &tids) -> bool {
-                if (tids.empty())
-                    return true;
-                for (int32_t tid : tids) {
-                    auto tit = target_map.find(tid);
-                    if (tit == target_map.end())
-                        continue;
-                    const Json &t = *tit->second;
-                    bool matched = false;
-                    int32_t tb = row_i32(t, "band");
-                    if (tb > 0 && tb == m.card.band_id)
-                        matched = true;
-                    int32_t tc = row_i32(t, "character");
-                    if (!matched && tc > 0 && tc == m.card.character_id)
-                        matched = true;
-                    int32_t tct = row_i32(t, "card_type");
-                    if (!matched && tct > 0 && tct == m.card.card_type)
-                        matched = true;
-                    int32_t ttag = row_i32(t, "tag");
-                    if (!matched && ttag > 0 &&
-                        std::find(m.card.best_tags.begin(), m.card.best_tags.end(), ttag) !=
-                            m.card.best_tags.end())
-                        matched = true;
-                    int32_t tgm = row_i32(t, "gekisou_mission_type");
-                    if (!matched && tgm > 0) {
-                        int32_t m_gm = m.gekiso_mission_type;
-                        if (m_gm == 0 && gk_mission_by_skill.count(m.card.gekiso_skill_id))
-                            m_gm = gk_mission_by_skill.at(m.card.gekiso_skill_id);
-                        if (m_gm == tgm)
-                            matched = true;
+        auto check_cond_group = [&](int32_t group_id) -> bool {
+            if (group_id <= 0)
+                return true;
+            auto git = cg_map.find(group_id);
+            if (git == cg_map.end())
+                return false;
+            for (const auto &cids : git->second) {
+                bool set_ok = true;
+                for (int32_t cid : cids) {
+                    auto cit = cond_map.find(cid);
+                    if (cit == cond_map.end()) {
+                        set_ok = false;
+                        break;
                     }
-                    if (!matched) {
-                        for (int32_t cat : row_list(t, "live_skill_categories")) {
-                            if (cat != 0 && std::find(m.live_skill_categories.begin(),
-                                                      m.live_skill_categories.end(),
-                                                      cat) != m.live_skill_categories.end()) {
-                                matched = true;
+                    const CatCond &cond = cit->second;
+                    bool raw_ok = false;
+                    if (cond.condition_type == 0) {
+                        raw_ok = true;
+                    } else if (cond.condition_type == 3000) {
+                        for (const auto &m : members) {
+                            if (match_cat_targets(m, cond.targets)) {
+                                raw_ok = true;
                                 break;
                             }
                         }
-                    }
-                    if (!matched) {
-                        for (int32_t cat : row_list(t, "gekisou_skill_categories")) {
-                            if (cat != 0 && std::find(m.gekiso_skill_categories.begin(),
-                                                      m.gekiso_skill_categories.end(),
-                                                      cat) != m.gekiso_skill_categories.end()) {
-                                matched = true;
+                    } else if (cond.condition_type == 3001) {
+                        raw_ok = !members.empty();
+                        for (const auto &m : members) {
+                            if (!match_cat_targets(m, cond.targets)) {
+                                raw_ok = false;
                                 break;
                             }
                         }
+                    } else if (cond.condition_type == 4012) {
+                        for (int32_t tid : cond.targets) {
+                            auto tit = target_map.find(tid);
+                            if (tit != target_map.end() && tit->second.music_type == song_type) {
+                                raw_ok = true;
+                                break;
+                            }
+                        }
+                    } else if (cond.condition_type == 5000) {
+                        raw_ok = match_cat_targets(leader_m, cond.targets);
                     }
-                    if (matched)
-                        return true;
+                    if ((cond.is_pos ? raw_ok : !raw_ok) == false) {
+                        set_ok = false;
+                        break;
+                    }
                 }
-                return false;
-            };
-
-            auto check_cond_group = [&](int32_t group_id) -> bool {
-                if (group_id <= 0)
+                if (set_ok)
                     return true;
-                auto git = cg_map.find(group_id);
-                if (git == cg_map.end())
-                    return false;
-                const Json *sets = git->second->find("sets");
-                if (!sets || !sets->is_array())
-                    return false;
-                for (const Json &set_item : sets->as_array()) {
-                    const Json *cids_json =
-                        set_item.is_object() ? set_item.find("conditions") : &set_item;
-                    if (!cids_json || !cids_json->is_array())
-                        continue;
-                    bool set_ok = true;
-                    for (const Json &cid_val : cids_json->as_array()) {
-                        int32_t cid = json_i32(&cid_val);
-                        auto cit = cond_map.find(cid);
-                        if (cit == cond_map.end()) {
-                            set_ok = false;
-                            break;
-                        }
-                        const Json &cond = *cit->second;
-                        int32_t ctype = row_i32(cond, "condition_type");
-                        auto tids = row_list(cond, "targets");
-                        bool raw_ok = false;
-                        if (ctype == 0) {
-                            raw_ok = true;
-                        } else if (ctype == 3000) {
-                            for (const auto &m : members) {
-                                if (match_cat_targets(m, tids)) {
-                                    raw_ok = true;
-                                    break;
-                                }
-                            }
-                        } else if (ctype == 3001) {
-                            raw_ok = !members.empty();
-                            for (const auto &m : members) {
-                                if (!match_cat_targets(m, tids)) {
-                                    raw_ok = false;
-                                    break;
-                                }
-                            }
-                        } else if (ctype == 4012) {
-                            for (int32_t tid : tids) {
-                                if (target_map.count(tid) &&
-                                    row_i32(*target_map.at(tid), "music_type") == song_type) {
-                                    raw_ok = true;
-                                    break;
-                                }
-                            }
-                        } else if (ctype == 5000) {
-                            raw_ok = match_cat_targets(leader_m, tids);
-                        }
-                        const Json *pos = cond.find("positive");
-                        bool is_pos = !(pos && pos->is_bool() && !pos->as_bool());
-                        if ((is_pos ? raw_ok : !raw_ok) == false) {
-                            set_ok = false;
-                            break;
-                        }
-                    }
-                    if (set_ok)
-                        return true;
-                }
-                return false;
-            };
+            }
+            return false;
+        };
 
-            if (const Json *effs = l_skill->find("effects"); effs && effs->is_array()) {
-                for (const Json &eff : effs->as_array()) {
-                    int32_t elv = row_i32(eff, "level");
-                    if (elv != 0 && elv != l_level)
-                        continue;
-                    if (!check_cond_group(row_i32(eff, "condition_group")))
-                        continue;
-                    int32_t et = row_i32(eff, "effect_type");
-                    int64_t mult = 1;
-                    if (et >= 1500 && et <= 1503) {
-                        int32_t cum_type = row_i32(eff, "cumulative_type");
-                        auto cum_tids = row_list(eff, "cumulative_targets");
-                        int64_t count = 0;
-                        if (cum_type == 3000) {
-                            for (const auto &m : members)
-                                if (match_cat_targets(m, cum_tids))
-                                    ++count;
-                        } else if (cum_type == 3001) {
-                            for (size_t i = 0; i < members.size(); ++i)
-                                if (i != leader_idx && match_cat_targets(members[i], cum_tids))
-                                    ++count;
-                        } else if (cum_type == 3002) {
-                            for (const auto &m : members)
-                                if (m.card.band_id == leader_m.card.band_id)
-                                    ++count;
-                        } else if (cum_type == 3003) {
-                            std::unordered_set<int32_t> bands;
-                            for (const auto &m : members)
-                                if (m.card.band_id != leader_m.card.band_id)
-                                    bands.insert(m.card.band_id);
-                            count = static_cast<int64_t>(bands.size());
-                        } else if (cum_type == 3004) {
-                            std::unordered_set<int32_t> bands;
-                            for (const auto &m : members)
-                                bands.insert(m.card.band_id);
-                            count = static_cast<int64_t>(bands.size());
-                        } else if (cum_type == 3005) {
-                            std::unordered_set<int32_t> cts;
-                            for (const auto &m : members)
-                                cts.insert(m.card.card_type);
-                            count = static_cast<int64_t>(cts.size());
-                        }
-                        int32_t max_c = row_i32(eff, "max_cumulative_count");
-                        if (max_c > 0 && count > max_c)
-                            count = max_c;
-                        mult = count;
-                    }
-                    int64_t val = static_cast<int64_t>(row_i32(eff, "value")) * mult;
-                    int32_t max_v = row_i32(eff, "max_value");
-                    if (max_v > 0 && val > max_v)
-                        val = max_v;
-                    auto eff_tids = row_list(eff, "targets");
-                    for (size_t i = 0; i < members.size(); ++i) {
-                        if (!match_cat_targets(members[i], eff_tids))
-                            continue;
-                        if (et == 1000 || et == 1500) {
-                            leader_rates[i][0] += val;
-                            leader_rates[i][1] += val;
-                            leader_rates[i][2] += val;
-                        } else if (et == 1003 || et == 1503) {
-                            leader_rates[i][0] += val;
-                        } else if (et == 1001 || et == 1501) {
-                            leader_rates[i][1] += val;
-                        } else if (et == 1002 || et == 1502) {
-                            leader_rates[i][2] += val;
+        for (const CatLeaderEff &eff : lsit->second) {
+            if (eff.level != 0 && eff.level != l_level)
+                continue;
+            if (!check_cond_group(eff.condition_group))
+                continue;
+            int32_t et = eff.effect_type;
+            int64_t mult = 1;
+            if (et >= 1500 && et <= 1503) {
+                int64_t count = 0;
+                if (eff.cumulative_type == 3000) {
+                    for (const auto &m : members)
+                        if (match_cat_targets(m, eff.cumulative_targets))
+                            ++count;
+                } else if (eff.cumulative_type == 3001) {
+                    for (size_t i = 0; i < members.size(); ++i)
+                        if (i != leader_idx &&
+                            match_cat_targets(members[i], eff.cumulative_targets))
+                            ++count;
+                } else if (eff.cumulative_type == 3002) {
+                    for (const auto &m : members)
+                        if (m.card.band_id == leader_m.card.band_id)
+                            ++count;
+                } else if (eff.cumulative_type == 3003) {
+                    int32_t seen_bands[5];
+                    size_t nb = 0;
+                    for (const auto &m : members) {
+                        if (m.card.band_id != leader_m.card.band_id) {
+                            bool dup = false;
+                            for (size_t b = 0; b < nb; ++b)
+                                if (seen_bands[b] == m.card.band_id)
+                                    dup = true;
+                            if (!dup)
+                                seen_bands[nb++] = m.card.band_id;
                         }
                     }
+                    count = static_cast<int64_t>(nb);
+                } else if (eff.cumulative_type == 3004) {
+                    int32_t seen_bands[5];
+                    size_t nb = 0;
+                    for (const auto &m : members) {
+                        bool dup = false;
+                        for (size_t b = 0; b < nb; ++b)
+                            if (seen_bands[b] == m.card.band_id)
+                                dup = true;
+                        if (!dup)
+                            seen_bands[nb++] = m.card.band_id;
+                    }
+                    count = static_cast<int64_t>(nb);
+                } else if (eff.cumulative_type == 3005) {
+                    int32_t seen_cts[5];
+                    size_t nc = 0;
+                    for (const auto &m : members) {
+                        bool dup = false;
+                        for (size_t c = 0; c < nc; ++c)
+                            if (seen_cts[c] == m.card.card_type)
+                                dup = true;
+                        if (!dup)
+                            seen_cts[nc++] = m.card.card_type;
+                    }
+                    count = static_cast<int64_t>(nc);
+                }
+                if (eff.max_cumulative_count > 0 && count > eff.max_cumulative_count)
+                    count = eff.max_cumulative_count;
+                mult = count;
+            }
+            int64_t val = static_cast<int64_t>(eff.value) * mult;
+            if (eff.max_value > 0 && val > eff.max_value)
+                val = eff.max_value;
+            for (size_t i = 0; i < members.size(); ++i) {
+                if (!match_cat_targets(members[i], eff.targets))
+                    continue;
+                if (et == 1000 || et == 1500) {
+                    leader_rates[i][0] += val;
+                    leader_rates[i][1] += val;
+                    leader_rates[i][2] += val;
+                } else if (et == 1003 || et == 1503) {
+                    leader_rates[i][0] += val;
+                } else if (et == 1001 || et == 1501) {
+                    leader_rates[i][1] += val;
+                } else if (et == 1002 || et == 1502) {
+                    leader_rates[i][2] += val;
                 }
             }
         }
+        return leader_rates;
     }
 
-    auto def_cr = get_vec3(fix, "character_rank_bonus");
-    auto def_ctr = get_vec3(fix, "character_total_rank_bonus");
-    auto def_bi = get_vec3(fix, "band_item_bonus_bp");
-    auto def_vip = get_vec3(fix, "vip_bonus_bp");
-    int64_t mt_base_bp = fix ? row_i32(*fix, "music_type_base_bp") : 0;
-    int64_t mtag_base_bp = fix ? row_i32(*fix, "music_tag_base_bp") : 0;
-    int64_t tl_base_bp = fix ? row_i32(*fix, "type_link_base_bp") : 0;
-
-    TeamPowerResult out;
-    out.slots.resize(members.size(), 0.0);
-    for (size_t idx = 0; idx < members.size(); ++idx) {
-        const MemberState &m = members[idx];
-        const SnapState *s = idx < snaps.size() ? snaps[idx] : nullptr;
-        const Json *cat_m = cat_members.count(m.card.id) ? cat_members.at(m.card.id) : nullptr;
-        const Json *cat_s = (s && cat_snaps.count(s->card.id)) ? cat_snaps.at(s->card.id) : nullptr;
-
-        int64_t m_ev_bp = (apply_event_power && cat_m) ? row_i32(*cat_m, "event_bonus_bp") : 0;
-        int64_t s_ev_bp = (apply_event_power && cat_s) ? row_i32(*cat_s, "event_bonus_bp") : 0;
-
-        const Json *m_crb =
-            (cat_m && cat_m->is_object()) ? cat_m->find("card_rank_bonus_bp") : nullptr;
-        const Json *s_crb =
-            (cat_s && cat_s->is_object()) ? cat_s->find("card_rank_bonus_bp") : nullptr;
-        int64_t m_mt_bp = m_crb ? row_i32(*m_crb, "music_type", m.music_type_rate)
-                                : static_cast<int64_t>(m.music_type_rate);
-        int64_t m_mtag_bp = m_crb ? row_i32(*m_crb, "music_tag", m.music_tag_rate)
-                                  : static_cast<int64_t>(m.music_tag_rate);
-        int64_t m_tl_bp = m_crb ? row_i32(*m_crb, "type_link", 0) : 0;
-        int64_t s_tl_bp = s ? static_cast<int64_t>(s->type_link_rate) : 0;
-        if (s && s_crb && s->growth.rank == row_i32(*cat_s, "rank", s->growth.rank)) {
-            s_tl_bp = row_i32(*s_crb, "type_link", s->type_link_rate);
+    std::array<double, 3> member_base_vals(const MemberState &m) const {
+        auto cmit = cat_members.find(m.card.id);
+        int64_t m_ev_bp = (apply_event_power && cmit != cat_members.end()) ? cmit->second.ev_bp : 0;
+        auto crit = cr_by_char.find(m.card.character_id);
+        const auto &cr_vec = (crit != cr_by_char.end()) ? crit->second : def_cr;
+        std::array<double, 3> out{0.0, 0.0, 0.0};
+        for (int d = 0; d < 3; ++d) {
+            double trained_d = std::round(static_cast<double>(m.own[d]) / 10000.0);
+            double mem_val = en_trained ? trained_d : 0.0;
+            if (en_trained && m_ev_bp != 0)
+                mem_val += apply_rate(mem_val, m_ev_bp);
+            double cr_val = en_char_rank ? static_cast<double>(cr_vec[d]) : 0.0;
+            double ctr_val = en_char_total_rank ? static_cast<double>(def_ctr[d]) : 0.0;
+            out[d] = round_val(mem_val + cr_val + ctr_val);
         }
+        return out;
+    }
 
-        auto cr_vec =
-            get_map_vec3(fix, "character_rank_bonus_by_character", m.card.character_id, def_cr);
-        auto bi_char =
-            get_map_vec3(fix, "band_item_bonus_bp_by_character", m.card.character_id, {0, 0, 0});
-        auto bi_band = get_map_vec3(fix, "band_item_bonus_bp_by_band", m.card.band_id, def_bi);
-        auto bi_ct =
-            get_map_vec3(fix, "band_item_bonus_bp_by_card_type", m.card.card_type, {0, 0, 0});
+    double member_fixed_power(const MemberState &m) const {
+        auto cmit = cat_members.find(m.card.id);
+        const CatMember *cat_m = (cmit != cat_members.end()) ? &cmit->second : nullptr;
+        int64_t m_mt_bp = (cat_m && cat_m->has_crb && cat_m->crb_mt.has_value())
+                              ? *cat_m->crb_mt
+                              : static_cast<int64_t>(m.music_type_rate);
+        int64_t m_mtag_bp = (cat_m && cat_m->has_crb && cat_m->crb_mtag.has_value())
+                                ? *cat_m->crb_mtag
+                                : static_cast<int64_t>(m.music_tag_rate);
+        std::array<int64_t, 3> bi_char{0, 0, 0};
+        if (auto it = bi_by_char.find(m.card.character_id); it != bi_by_char.end())
+            bi_char = it->second;
+        std::array<int64_t, 3> bi_band = def_bi;
+        if (auto it = bi_by_band.find(m.card.band_id); it != bi_by_band.end())
+            bi_band = it->second;
+        std::array<int64_t, 3> bi_ct{0, 0, 0};
+        if (auto it = bi_by_ct.find(m.card.card_type); it != bi_by_ct.end())
+            bi_ct = it->second;
 
         bool tag_matched = false;
         for (int32_t tg : m.card.best_tags) {
@@ -1644,75 +1850,207 @@ TeamPowerResult calc_deckcalc_team_power(const Json *prob, const EngineMaster &m
                 break;
             }
         }
-
-        double slot_total = 0.0;
+        auto base_vals = member_base_vals(m);
+        double total = 0.0;
         for (int d = 0; d < 3; ++d) {
-            double trained_d = std::round(static_cast<double>(m.own[d]) / 10000.0);
-            double mem_val = en_trained ? trained_d : 0.0;
-            if (en_trained && m_ev_bp != 0)
-                mem_val += apply_rate(mem_val, m_ev_bp);
-            double cr_val = en_char_rank ? static_cast<double>(cr_vec[d]) : 0.0;
-            double ctr_val = en_char_total_rank ? static_cast<double>(def_ctr[d]) : 0.0;
-            double base_val = round_val(mem_val + cr_val + ctr_val);
-
-            double snap_val = 0.0;
-            if (en_snapshot && s) {
-                int64_t s_rate = s->percent[d] + s_ev_bp;
-                snap_val = apply_rate(base_val, s_rate);
-            }
-
-            double tl_val = 0.0;
-            if (en_type_link && s && s->card.card_type == m.card.card_type) {
-                int64_t r = tl_base_bp;
-                if (type_link_source == "member")
-                    r += m_tl_bp;
-                else if (type_link_source == "snapshot")
-                    r += s_tl_bp;
-                else if (type_link_source == "both")
-                    r += m_tl_bp + s_tl_bp;
-                tl_val = apply_rate(base_val, r);
-            }
-
-            double ld_val = en_leader ? apply_rate(base_val, leader_rates[idx][d]) : 0.0;
+            double base_val = base_vals[d];
             double bi_val =
                 en_band_item ? apply_rate(base_val, bi_char[d] + bi_band[d] + bi_ct[d]) : 0.0;
-
             double mt_val = 0.0;
             if (en_music_type &&
                 (song_type == 99 || m.card.card_type == 99 || m.card.card_type == song_type)) {
                 mt_val = apply_rate(base_val, mt_base_bp + m_mt_bp);
             }
-
             double mtag_val = 0.0;
             if (en_music_tag && tag_matched) {
                 mtag_val = apply_rate(base_val, mtag_base_bp + m_mtag_bp);
             }
-
             double vip_val = en_vip ? apply_rate(base_val, def_vip[d]) : 0.0;
-
             double extra_val = 0.0;
-            if (pm && pm->is_object()) {
-                if (const Json *exs = pm->find("extra_sources"); exs && exs->is_array()) {
-                    for (const Json &src : exs->as_array()) {
-                        std::string kind = row_str(src, "kind", "rate_bp");
-                        auto vals = get_vec3(&src, "rate_bp");
-                        if (vals[0] == 0 && vals[1] == 0 && vals[2] == 0)
-                            vals = get_vec3(&src, "flat_power");
-                        if (kind == "flat")
-                            extra_val += round_val(static_cast<double>(vals[d]));
-                        else
-                            extra_val += apply_rate(base_val, vals[d]);
-                    }
+            for (const auto &src : extra_sources) {
+                if (src.is_flat)
+                    extra_val += round_val(static_cast<double>(src.vals[d]));
+                else
+                    extra_val += apply_rate(base_val, src.vals[d]);
+            }
+            total += base_val + bi_val + mt_val + mtag_val + vip_val + extra_val;
+        }
+        return total;
+    }
+
+    double snap_add_power(const MemberState &m, const SnapState *s) const {
+        if (!s)
+            return 0.0;
+        auto cmit = cat_members.find(m.card.id);
+        const CatMember *cat_m = (cmit != cat_members.end()) ? &cmit->second : nullptr;
+        auto csit = cat_snaps.find(s->card.id);
+        const CatSnap *cat_s = (csit != cat_snaps.end()) ? &csit->second : nullptr;
+        int64_t s_ev_bp = (apply_event_power && cat_s) ? cat_s->ev_bp : 0;
+        int64_t m_tl_bp = (cat_m && cat_m->has_crb) ? cat_m->crb_tl : 0;
+        int64_t s_tl_bp = static_cast<int64_t>(s->type_link_rate);
+        if (cat_s && cat_s->has_crb && s->growth.rank == cat_s->rank.value_or(s->growth.rank)) {
+            s_tl_bp = cat_s->crb_tl.value_or(s->type_link_rate);
+        }
+        auto base_vals = member_base_vals(m);
+        double total = 0.0;
+        for (int d = 0; d < 3; ++d) {
+            double base_val = base_vals[d];
+            double snap_val = 0.0;
+            if (en_snapshot) {
+                int64_t s_rate = s->percent[d] + s_ev_bp;
+                snap_val = apply_rate(base_val, s_rate);
+            }
+            double tl_val = 0.0;
+            if (en_type_link && s->card.card_type == m.card.card_type) {
+                int64_t r = tl_base_bp;
+                if (tl_source == TypeLinkSrc::Member)
+                    r += m_tl_bp;
+                else if (tl_source == TypeLinkSrc::Snapshot)
+                    r += s_tl_bp;
+                else if (tl_source == TypeLinkSrc::Both)
+                    r += m_tl_bp + s_tl_bp;
+                tl_val = apply_rate(base_val, r);
+            }
+            total += snap_val + tl_val;
+        }
+        return total;
+    }
+
+    std::vector<double> leader_slot_powers(const std::vector<MemberState> &members,
+                                           size_t leader_idx) const {
+        std::vector<double> out(members.size(), 0.0);
+        if (!en_leader || leader_idx >= members.size())
+            return out;
+        auto leader_rates = compute_leader_rates(members, leader_idx);
+        for (size_t idx = 0; idx < members.size(); ++idx) {
+            auto base_vals = member_base_vals(members[idx]);
+            double ld_total = 0.0;
+            for (int d = 0; d < 3; ++d)
+                ld_total += apply_rate(base_vals[d], leader_rates[idx][d]);
+            out[idx] = ld_total;
+        }
+        return out;
+    }
+
+    TeamPowerResult calc(const std::vector<MemberState> &members,
+                         const std::vector<const SnapState *> &snaps, size_t leader_idx) const {
+        auto leader_rates = compute_leader_rates(members, leader_idx);
+        TeamPowerResult out;
+        out.slots.resize(members.size(), 0.0);
+        for (size_t idx = 0; idx < members.size(); ++idx) {
+            const MemberState &m = members[idx];
+            const SnapState *s = idx < snaps.size() ? snaps[idx] : nullptr;
+            auto cmit = cat_members.find(m.card.id);
+            const CatMember *cat_m = (cmit != cat_members.end()) ? &cmit->second : nullptr;
+            auto csit = s ? cat_snaps.find(s->card.id) : cat_snaps.end();
+            const CatSnap *cat_s = (s && csit != cat_snaps.end()) ? &csit->second : nullptr;
+
+            int64_t m_ev_bp = (apply_event_power && cat_m) ? cat_m->ev_bp : 0;
+            int64_t s_ev_bp = (apply_event_power && cat_s) ? cat_s->ev_bp : 0;
+
+            int64_t m_mt_bp = (cat_m && cat_m->has_crb && cat_m->crb_mt.has_value())
+                                  ? *cat_m->crb_mt
+                                  : static_cast<int64_t>(m.music_type_rate);
+            int64_t m_mtag_bp = (cat_m && cat_m->has_crb && cat_m->crb_mtag.has_value())
+                                    ? *cat_m->crb_mtag
+                                    : static_cast<int64_t>(m.music_tag_rate);
+            int64_t m_tl_bp = (cat_m && cat_m->has_crb) ? cat_m->crb_tl : 0;
+            int64_t s_tl_bp = s ? static_cast<int64_t>(s->type_link_rate) : 0;
+            if (s && cat_s && cat_s->has_crb &&
+                s->growth.rank == cat_s->rank.value_or(s->growth.rank)) {
+                s_tl_bp = cat_s->crb_tl.value_or(s->type_link_rate);
+            }
+
+            auto crit = cr_by_char.find(m.card.character_id);
+            const auto &cr_vec = (crit != cr_by_char.end()) ? crit->second : def_cr;
+            std::array<int64_t, 3> bi_char{0, 0, 0};
+            if (auto it = bi_by_char.find(m.card.character_id); it != bi_by_char.end())
+                bi_char = it->second;
+            std::array<int64_t, 3> bi_band = def_bi;
+            if (auto it = bi_by_band.find(m.card.band_id); it != bi_by_band.end())
+                bi_band = it->second;
+            std::array<int64_t, 3> bi_ct{0, 0, 0};
+            if (auto it = bi_by_ct.find(m.card.card_type); it != bi_by_ct.end())
+                bi_ct = it->second;
+
+            bool tag_matched = false;
+            for (int32_t tg : m.card.best_tags) {
+                if (std::find(song_tags.begin(), song_tags.end(), tg) != song_tags.end()) {
+                    tag_matched = true;
+                    break;
                 }
             }
 
-            slot_total += base_val + snap_val + tl_val + ld_val + bi_val + mt_val + mtag_val +
-                          vip_val + extra_val;
+            double slot_total = 0.0;
+            for (int d = 0; d < 3; ++d) {
+                double trained_d = std::round(static_cast<double>(m.own[d]) / 10000.0);
+                double mem_val = en_trained ? trained_d : 0.0;
+                if (en_trained && m_ev_bp != 0)
+                    mem_val += apply_rate(mem_val, m_ev_bp);
+                double cr_val = en_char_rank ? static_cast<double>(cr_vec[d]) : 0.0;
+                double ctr_val = en_char_total_rank ? static_cast<double>(def_ctr[d]) : 0.0;
+                double base_val = round_val(mem_val + cr_val + ctr_val);
+
+                double snap_val = 0.0;
+                if (en_snapshot && s) {
+                    int64_t s_rate = s->percent[d] + s_ev_bp;
+                    snap_val = apply_rate(base_val, s_rate);
+                }
+
+                double tl_val = 0.0;
+                if (en_type_link && s && s->card.card_type == m.card.card_type) {
+                    int64_t r = tl_base_bp;
+                    if (tl_source == TypeLinkSrc::Member)
+                        r += m_tl_bp;
+                    else if (tl_source == TypeLinkSrc::Snapshot)
+                        r += s_tl_bp;
+                    else if (tl_source == TypeLinkSrc::Both)
+                        r += m_tl_bp + s_tl_bp;
+                    tl_val = apply_rate(base_val, r);
+                }
+
+                double ld_val = en_leader ? apply_rate(base_val, leader_rates[idx][d]) : 0.0;
+                double bi_val =
+                    en_band_item ? apply_rate(base_val, bi_char[d] + bi_band[d] + bi_ct[d]) : 0.0;
+
+                double mt_val = 0.0;
+                if (en_music_type &&
+                    (song_type == 99 || m.card.card_type == 99 || m.card.card_type == song_type)) {
+                    mt_val = apply_rate(base_val, mt_base_bp + m_mt_bp);
+                }
+
+                double mtag_val = 0.0;
+                if (en_music_tag && tag_matched) {
+                    mtag_val = apply_rate(base_val, mtag_base_bp + m_mtag_bp);
+                }
+
+                double vip_val = en_vip ? apply_rate(base_val, def_vip[d]) : 0.0;
+
+                double extra_val = 0.0;
+                for (const auto &src : extra_sources) {
+                    if (src.is_flat)
+                        extra_val += round_val(static_cast<double>(src.vals[d]));
+                    else
+                        extra_val += apply_rate(base_val, src.vals[d]);
+                }
+
+                slot_total += base_val + snap_val + tl_val + ld_val + bi_val + mt_val + mtag_val +
+                              vip_val + extra_val;
+            }
+            out.slots[idx] = slot_total;
+            out.total += slot_total;
         }
-        out.slots[idx] = slot_total;
-        out.total += slot_total;
+        return out;
     }
-    return out;
+};
+
+TeamPowerResult calc_deckcalc_team_power(const Json *prob, const EngineMaster &master,
+                                         const std::vector<MemberState> &members,
+                                         const std::vector<const SnapState *> &snaps,
+                                         size_t leader_idx) {
+    (void)master;
+    PrecomputedProbPower pre(prob);
+    return pre.calc(members, snaps, leader_idx);
 }
 // 整曲逐帧状态机：Combo、判定改判、体力、分数差分与激奏控制器
 class ComboCounter {
@@ -8184,6 +8522,7 @@ struct GekisoDetail {
 
 struct SearchHit {
     Team team;
+    std::string set_key;
     double power = 0.0;
     std::vector<double> slot_powers;
     Totals totals;
@@ -8212,12 +8551,16 @@ struct SearchInput {
     const std::vector<MemberState> *members = nullptr;
     const std::vector<SnapState> *snaps = nullptr;
     const MusicView *music = nullptr;
+    const PrecomputedProbPower *pre_power = nullptr;
+    const std::vector<int> *snap_skill_class = nullptr;
+    bool prune_snap_classes = false;
     std::function<std::pair<double, double>(int, int)> skill;
     std::function<double(int)> member_bonus;
     std::function<double(int)> snap_bonus;
     std::function<double(const Totals &)> bound;
     std::function<std::pair<double, double>(const Team &, const Totals &)> interval;
     std::function<SearchExact(const Team &)> exact;
+    std::function<SearchExact(const Team &, double, const std::vector<double> &)> exact_with_power;
     SearchConstraints constraints;
     int k = 10;
     double time_limit_ms = 0.0;
@@ -8281,10 +8624,20 @@ SearchOutput search_teams(const SearchInput &input) {
         if (j >= 0 && j < s)
             required_snap.insert(j);
 
+    const bool use_pre_power = input.pre_power != nullptr && input.pre_power->valid;
     std::vector<SlotBase> bases(static_cast<size_t>(n));
-    for (int i = 0; i < n; ++i)
-        bases[static_cast<size_t>(i)] =
-            slot_base(master, player, members[static_cast<size_t>(i)], music);
+    std::vector<double> fixed_member_power(static_cast<size_t>(n), 0.0);
+    for (int i = 0; i < n; ++i) {
+        if (use_pre_power) {
+            fixed_member_power[static_cast<size_t>(i)] =
+                input.pre_power->member_fixed_power(members[static_cast<size_t>(i)]);
+        } else {
+            bases[static_cast<size_t>(i)] =
+                slot_base(master, player, members[static_cast<size_t>(i)], music);
+            fixed_member_power[static_cast<size_t>(i)] =
+                static_cast<double>(bases[static_cast<size_t>(i)].fixed_points);
+        }
+    }
 
     std::vector<char> allowed_snap(static_cast<size_t>(s), 0);
     for (int j = 0; j < s; ++j)
@@ -8298,9 +8651,14 @@ SearchOutput search_teams(const SearchInput &input) {
         for (int j = 0; j < s; ++j) {
             if (!allowed_snap[static_cast<size_t>(j)])
                 continue;
-            snap_power[static_cast<size_t>(i * width + j)] = static_cast<double>(
-                snap_points(master, bases[static_cast<size_t>(i)], members[static_cast<size_t>(i)],
-                            &snaps[static_cast<size_t>(j)]));
+            if (use_pre_power) {
+                snap_power[static_cast<size_t>(i * width + j)] = input.pre_power->snap_add_power(
+                    members[static_cast<size_t>(i)], &snaps[static_cast<size_t>(j)]);
+            } else {
+                snap_power[static_cast<size_t>(i * width + j)] = static_cast<double>(
+                    snap_points(master, bases[static_cast<size_t>(i)],
+                                members[static_cast<size_t>(i)], &snaps[static_cast<size_t>(j)]));
+            }
             if (input.skill) {
                 auto range = input.skill(i, j);
                 skill_low[static_cast<size_t>(i * width + j)] = range.first;
@@ -8359,6 +8717,10 @@ SearchOutput search_teams(const SearchInput &input) {
         }
     }
 
+    const bool can_prune_classes = input.prune_snap_classes && input.snap_skill_class != nullptr &&
+                                   !constraints.min_bonus.has_value() &&
+                                   !constraints.max_bonus.has_value();
+
     std::vector<std::vector<int>> options(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         auto binding = constraints.bindings.find(i);
@@ -8366,11 +8728,39 @@ SearchOutput search_teams(const SearchInput &input) {
             options[static_cast<size_t>(i)].push_back(binding->second);
             continue;
         }
+        auto &opt = options[static_cast<size_t>(i)];
         for (int j = 0; j < s; ++j)
             if (allowed_snap[static_cast<size_t>(j)])
-                options[static_cast<size_t>(i)].push_back(j);
+                opt.push_back(j);
         if (constraints.allow_empty_snaps || constraints.no_snaps)
-            options[static_cast<size_t>(i)].push_back(-1);
+            opt.push_back(-1);
+        std::sort(opt.begin(), opt.end(), [&](int a, int b) {
+            int col_a = a < 0 ? s : a;
+            int col_b = b < 0 ? s : b;
+            double pa = snap_power[static_cast<size_t>(i * width + col_a)];
+            double pb = snap_power[static_cast<size_t>(i * width + col_b)];
+            if (pa != pb)
+                return pa > pb;
+            return a < b;
+        });
+        if (can_prune_classes) {
+            // Pigeonhole principle: at most 4 other slots can consume snapshots from the same
+            // equivalence class, so keeping the top 5 non-required snapshots per class is exact.
+            std::unordered_map<int, int> class_nonreq_count;
+            std::vector<int> filtered;
+            filtered.reserve(opt.size());
+            for (int snap : opt) {
+                if (snap >= 0 && required_snap.count(snap)) {
+                    filtered.push_back(snap);
+                    continue;
+                }
+                int col = snap < 0 ? s : snap;
+                int cls = (*input.snap_skill_class)[static_cast<size_t>(i * width + col)];
+                if (++class_nonreq_count[cls] <= 5)
+                    filtered.push_back(snap);
+            }
+            opt = std::move(filtered);
+        }
     }
 
     std::vector<int> leaders;
@@ -8379,8 +8769,8 @@ SearchOutput search_teams(const SearchInput &input) {
             (!constraints.leader.has_value() || *constraints.leader == i))
             leaders.push_back(i);
     std::sort(leaders.begin(), leaders.end(), [&](int a, int b) {
-        double pa = bases[static_cast<size_t>(a)].fixed_points + best[static_cast<size_t>(a)].power;
-        double pb = bases[static_cast<size_t>(b)].fixed_points + best[static_cast<size_t>(b)].power;
+        double pa = fixed_member_power[static_cast<size_t>(a)] + best[static_cast<size_t>(a)].power;
+        double pb = fixed_member_power[static_cast<size_t>(b)] + best[static_cast<size_t>(b)].power;
         return pa > pb;
     });
     if (input.shard_index && input.shard_count && *input.shard_count > 1) {
@@ -8409,7 +8799,6 @@ SearchOutput search_teams(const SearchInput &input) {
         }
         ++output.stats.leaders;
         const MemberState &leader_member = members[static_cast<size_t>(leader)];
-        LeaderProfile profile = leader_profile(master, leader_member);
         int32_t leader_character = leader_member.card.character_id;
         for (int i : constraints.required_members)
             if (i != leader && i >= 0 && i < n &&
@@ -8447,10 +8836,10 @@ SearchOutput search_teams(const SearchInput &input) {
             std::vector<std::vector<int>> &target = must.empty() ? free : forced;
             std::vector<int> ordered = must.empty() ? list : must;
             std::sort(ordered.begin(), ordered.end(), [&](int a, int b) {
-                double pa = static_cast<double>(bases[static_cast<size_t>(a)].fixed_points) +
-                            best[static_cast<size_t>(a)].power;
-                double pb = static_cast<double>(bases[static_cast<size_t>(b)].fixed_points) +
-                            best[static_cast<size_t>(b)].power;
+                double pa =
+                    fixed_member_power[static_cast<size_t>(a)] + best[static_cast<size_t>(a)].power;
+                double pb =
+                    fixed_member_power[static_cast<size_t>(b)] + best[static_cast<size_t>(b)].power;
                 return pa > pb;
             });
             target.push_back(std::move(ordered));
@@ -8459,12 +8848,10 @@ SearchOutput search_teams(const SearchInput &input) {
             continue;
         std::sort(free.begin(), free.end(),
                   [&](const std::vector<int> &a, const std::vector<int> &b) {
-                      double pa =
-                          static_cast<double>(bases[static_cast<size_t>(a.front())].fixed_points) +
-                          best[static_cast<size_t>(a.front())].power;
-                      double pb =
-                          static_cast<double>(bases[static_cast<size_t>(b.front())].fixed_points) +
-                          best[static_cast<size_t>(b.front())].power;
+                      double pa = fixed_member_power[static_cast<size_t>(a.front())] +
+                                  best[static_cast<size_t>(a.front())].power;
+                      double pb = fixed_member_power[static_cast<size_t>(b.front())] +
+                                  best[static_cast<size_t>(b.front())].power;
                       return pa > pb;
                   });
         std::vector<std::vector<int>> characters = forced;
@@ -8490,19 +8877,29 @@ SearchOutput search_teams(const SearchInput &input) {
                     return;
                 }
 
-                LeaderProfile team_profile = leader_profile(master, leader_member);
                 std::vector<MemberState> team_states;
                 team_states.reserve(team_members.size());
                 for (int member : team_members)
                     team_states.push_back(members[static_cast<size_t>(member)]);
-                std::vector<BP3> percents =
-                    leader_percents(master, team_profile, team_states, 0, music);
                 std::vector<double> base_power(team_members.size(), 0.0);
-                for (size_t slot = 0; slot < team_members.size(); ++slot) {
-                    const auto &base = bases[static_cast<size_t>(team_members[slot])];
-                    base_power[slot] = static_cast<double>(base.fixed_points) +
-                                       static_cast<double>(leader_points(base, percents[slot]));
+                if (use_pre_power) {
+                    auto ld_powers = input.pre_power->leader_slot_powers(team_states, 0);
+                    for (size_t slot = 0; slot < team_members.size(); ++slot) {
+                        base_power[slot] =
+                            fixed_member_power[static_cast<size_t>(team_members[slot])] +
+                            ld_powers[slot];
+                    }
+                } else {
+                    LeaderProfile team_profile = leader_profile(master, leader_member);
+                    std::vector<BP3> percents =
+                        leader_percents(master, team_profile, team_states, 0, music);
+                    for (size_t slot = 0; slot < team_members.size(); ++slot) {
+                        const auto &base = bases[static_cast<size_t>(team_members[slot])];
+                        base_power[slot] = static_cast<double>(base.fixed_points) +
+                                           static_cast<double>(leader_points(base, percents[slot]));
+                    }
                 }
+
                 std::vector<char> used(static_cast<size_t>(std::max(s, 1)), 0);
                 for (const auto &[member, snap] : constraints.bindings) {
                     if (snap >= 0 && snap < s &&
@@ -8514,6 +8911,179 @@ SearchOutput search_teams(const SearchInput &input) {
                 double member_total_bonus = 0.0;
                 for (int member : team_members)
                     member_total_bonus += member_bonus[static_cast<size_t>(member)];
+
+                const std::string cur_set_key = team_set_key(team, members);
+                auto record_exact_hit = [&](const Team &eval_team, const Totals &totals,
+                                            SearchExact &&exact) {
+                    size_t existing = output.hits.size();
+                    for (size_t i = 0; i < output.hits.size(); ++i)
+                        if (output.hits[i].set_key == cur_set_key) {
+                            existing = i;
+                            break;
+                        }
+                    if (existing < output.hits.size() && output.hits[existing].key >= exact.key)
+                        return;
+                    SearchHit hit;
+                    hit.team = eval_team;
+                    hit.set_key = cur_set_key;
+                    hit.power = exact.power;
+                    hit.slot_powers = std::move(exact.slot_powers);
+                    hit.totals = totals;
+                    hit.key = exact.key;
+                    hit.detail = std::move(exact.detail);
+                    if (existing < output.hits.size())
+                        output.hits.erase(output.hits.begin() + static_cast<ptrdiff_t>(existing));
+                    size_t at = output.hits.size();
+                    while (at > 0 && output.hits[at - 1].key < hit.key)
+                        --at;
+                    output.hits.insert(output.hits.begin() + static_cast<ptrdiff_t>(at),
+                                       std::move(hit));
+                    if (static_cast<int>(output.hits.size()) > k)
+                        output.hits.resize(static_cast<size_t>(k));
+                };
+
+                if (can_prune_classes) {
+                    std::array<double, 6> rem_max_snap{};
+                    for (int slot = static_cast<int>(team_members.size()) - 1; slot >= 0; --slot) {
+                        rem_max_snap[static_cast<size_t>(slot)] =
+                            rem_max_snap[static_cast<size_t>(slot + 1)] +
+                            best[static_cast<size_t>(team_members[static_cast<size_t>(slot)])]
+                                .power;
+                    }
+                    bool single_class_team = true;
+                    for (int member : team_members) {
+                        const auto &opt = options[static_cast<size_t>(member)];
+                        if (opt.size() > 1) {
+                            int first_col = opt[0] < 0 ? s : opt[0];
+                            int first_cls = (*input.snap_skill_class)[static_cast<size_t>(
+                                member * width + first_col)];
+                            for (size_t idx = 1; idx < opt.size(); ++idx) {
+                                int col = opt[idx] < 0 ? s : opt[idx];
+                                if ((*input.snap_skill_class)[static_cast<size_t>(
+                                        member * width + col)] != first_cls) {
+                                    single_class_team = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!single_class_team)
+                            break;
+                    }
+
+                    struct ClassCandidate {
+                        uint64_t class_key = 0;
+                        double power = -std::numeric_limits<double>::infinity();
+                        std::vector<int> snaps;
+                        Totals totals;
+                    };
+                    std::vector<ClassCandidate> best_by_class;
+                    double best_single_power = -std::numeric_limits<double>::infinity();
+
+                    std::function<void(size_t, double, double, double, double, uint64_t)>
+                        walk_classes = [&](size_t slot, double power, double weight,
+                                           double weight_low, double bonus, uint64_t class_key) {
+                            if (timed_out)
+                                return;
+                            ++output.stats.snap_nodes;
+                            if ((output.stats.snap_nodes & 1023) == 0 && expired()) {
+                                request_stop();
+                                return;
+                            }
+                            if (single_class_team &&
+                                power + rem_max_snap[slot] <= best_single_power) {
+                                return;
+                            }
+                            if (slot == team_members.size()) {
+                                for (int j : required_snap)
+                                    if (!used[static_cast<size_t>(j)])
+                                        return;
+                                Totals totals{power, weight, weight_low, bonus};
+                                if (input.bound && input.bound(totals) < limit())
+                                    return;
+                                ++output.stats.candidates;
+                                if (single_class_team) {
+                                    best_single_power = power;
+                                    if (best_by_class.empty())
+                                        best_by_class.push_back(
+                                            {class_key, power, assignment, totals});
+                                    else
+                                        best_by_class[0] = {class_key, power, assignment, totals};
+                                    return;
+                                }
+                                for (auto &entry : best_by_class) {
+                                    if (entry.class_key == class_key) {
+                                        if (power > entry.power) {
+                                            entry.power = power;
+                                            entry.snaps = assignment;
+                                            entry.totals = totals;
+                                        }
+                                        return;
+                                    }
+                                }
+                                best_by_class.push_back({class_key, power, assignment, totals});
+                                return;
+                            }
+                            int member = team_members[slot];
+                            for (int snap : options[static_cast<size_t>(member)]) {
+                                if (snap >= 0 && used[static_cast<size_t>(snap)])
+                                    continue;
+                                if (snap >= 0)
+                                    used[static_cast<size_t>(snap)] = 1;
+                                assignment[slot] = snap;
+                                int column = snap < 0 ? s : snap;
+                                uint64_t cls = static_cast<uint64_t>(
+                                    (*input.snap_skill_class)[static_cast<size_t>(member * width +
+                                                                                  column)]);
+                                walk_classes(
+                                    slot + 1,
+                                    power +
+                                        snap_power[static_cast<size_t>(member * width + column)],
+                                    weight +
+                                        skill_high[static_cast<size_t>(member * width + column)],
+                                    weight_low +
+                                        skill_low[static_cast<size_t>(member * width + column)],
+                                    bonus + member_bonus[static_cast<size_t>(member)] +
+                                        (snap < 0 ? 0.0 : snap_bonus[static_cast<size_t>(snap)]),
+                                    (class_key << 12) | (cls & 0xFFFu));
+                                if (snap >= 0)
+                                    used[static_cast<size_t>(snap)] = 0;
+                                if (timed_out)
+                                    return;
+                            }
+                            assignment[slot] = -1;
+                        };
+                    walk_classes(0, std::accumulate(base_power.begin(), base_power.end(), 0.0), 0.0,
+                                 0.0, member_total_bonus, 0);
+
+                    for (const auto &cand : best_by_class) {
+                        if (timed_out)
+                            break;
+                        if (expired()) {
+                            request_stop();
+                            break;
+                        }
+                        team.snaps = cand.snaps;
+                        SearchExact exact;
+                        if (input.exact_with_power &&
+                            (!use_pre_power || input.pre_power->round_mode !=
+                                                   PrecomputedProbPower::RoundMode::None)) {
+                            std::vector<double> slot_powers(team_members.size(), 0.0);
+                            for (size_t slot = 0; slot < team_members.size(); ++slot) {
+                                int member = team_members[slot];
+                                int col = cand.snaps[slot] < 0 ? s : cand.snaps[slot];
+                                slot_powers[slot] =
+                                    base_power[slot] +
+                                    snap_power[static_cast<size_t>(member * width + col)];
+                            }
+                            exact = input.exact_with_power(team, cand.power, slot_powers);
+                        } else {
+                            exact = input.exact(team);
+                        }
+                        ++output.stats.exact;
+                        record_exact_hit(team, cand.totals, std::move(exact));
+                    }
+                    return;
+                }
 
                 std::function<void(size_t, double, double, double, double)> walk =
                     [&](size_t slot, double power, double weight, double weight_low, double bonus) {
@@ -8547,33 +9117,7 @@ SearchOutput search_teams(const SearchInput &input) {
                             team.snaps = assignment;
                             SearchExact exact = input.exact(team);
                             ++output.stats.exact;
-                            std::string set_key = team_set_key(team, members);
-                            size_t existing = output.hits.size();
-                            for (size_t i = 0; i < output.hits.size(); ++i)
-                                if (team_set_key(output.hits[i].team, members) == set_key) {
-                                    existing = i;
-                                    break;
-                                }
-                            if (existing < output.hits.size() &&
-                                output.hits[existing].key >= exact.key)
-                                return;
-                            SearchHit hit;
-                            hit.team = team;
-                            hit.power = exact.power;
-                            hit.slot_powers = exact.slot_powers;
-                            hit.totals = totals;
-                            hit.key = exact.key;
-                            hit.detail = std::move(exact.detail);
-                            if (existing < output.hits.size())
-                                output.hits.erase(output.hits.begin() +
-                                                  static_cast<ptrdiff_t>(existing));
-                            size_t at = output.hits.size();
-                            while (at > 0 && output.hits[at - 1].key < hit.key)
-                                --at;
-                            output.hits.insert(output.hits.begin() + static_cast<ptrdiff_t>(at),
-                                               std::move(hit));
-                            if (static_cast<int>(output.hits.size()) > k)
-                                output.hits.resize(static_cast<size_t>(k));
+                            record_exact_hit(team, totals, std::move(exact));
                             return;
                         }
                         int member = team_members[slot];
@@ -8663,57 +9207,256 @@ SearchOutput gekiso_search(const EngineMaster &master, const PlayerState &player
                            const GekisoChart &chart, const std::vector<int32_t> &seeds,
                            const std::string &criterion, const SearchConstraints &constraints,
                            int k, double time_limit_ms, const Json *prob, bool allow_empty_snaps) {
-    std::unordered_map<std::string, LuckCurve> curve_cache;
-    SearchInput input;
-    input.master = &master;
-    input.player = &player;
-    input.members = &members;
-    input.snaps = &snaps;
-    input.music = music;
-    input.constraints = constraints;
-    input.constraints.allow_empty_snaps = allow_empty_snaps;
-    input.k = std::max(k, 10);
-    input.time_limit_ms = time_limit_ms > 0 ? time_limit_ms : 10000.0;
-    input.skill = [](int, int) {
-        return std::make_pair(0.0, std::numeric_limits<double>::max() / 16);
-    };
-    input.member_bonus = [](int) { return 0.0; };
-    input.snap_bonus = [](int) { return 0.0; };
-    input.bound = [](const Totals &) { return std::numeric_limits<double>::max() / 16; };
-    input.interval = [](const Team &, const Totals &) {
-        return std::make_pair(0.0, std::numeric_limits<double>::max() / 16);
-    };
-    input.exact = [&](const Team &team) {
-        SearchExact result;
-        std::vector<MemberState> ordered;
-        std::vector<const SnapState *> selected;
-        std::vector<SlotSkill> skills;
-        ordered.reserve(team.members.size());
-        selected.reserve(team.members.size());
-        skills.reserve(team.members.size());
-        for (size_t slot = 0; slot < team.members.size(); ++slot) {
-            const MemberState &member = members[static_cast<size_t>(team.members[slot])];
-            const SnapState *snap =
-                team.snaps[slot] < 0 ? nullptr : &snaps[static_cast<size_t>(team.snaps[slot])];
-            ordered.push_back(member);
-            selected.push_back(snap);
-            skills.push_back(resolve_slot_skill(master, member, snap));
+    PrecomputedProbPower pre_power(prob);
+
+    const size_t n = members.size();
+    const size_t s = snaps.size();
+    const size_t width = s + 1;
+
+    std::vector<SlotSkill> slot_skill_table(n * width);
+    std::vector<char> has_gk_skill(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        has_gk_skill[i] = (members[i].card.gekiso_skill_id != 0 &&
+                           master.gekiso_skills.count(members[i].card.gekiso_skill_id))
+                              ? 1
+                              : 0;
+        for (size_t j = 0; j < s; ++j)
+            slot_skill_table[i * width + j] = resolve_slot_skill(master, members[i], &snaps[j]);
+        slot_skill_table[i * width + s] = resolve_slot_skill(master, members[i], nullptr);
+    }
+
+    std::vector<int> snap_gk_sup_id(width, 0);
+    std::vector<std::array<int32_t, 4>> gk_sup_sigs;
+    for (size_t j = 0; j < s; ++j) {
+        std::array<int32_t, 4> sig{
+            snaps[j].card.gekiso_support_skill_ids[0],
+            snaps[j].card.gekiso_support_skill_ids[0] ? snaps[j].gekiso_skill_levels[0] : 0,
+            snaps[j].card.gekiso_support_skill_ids[1],
+            snaps[j].card.gekiso_support_skill_ids[1] ? snaps[j].gekiso_skill_levels[1] : 0};
+        if (sig[0] == 0 && sig[2] == 0) {
+            snap_gk_sup_id[j] = 0;
+        } else {
+            size_t found = 0;
+            while (found < gk_sup_sigs.size() && gk_sup_sigs[found] != sig)
+                ++found;
+            if (found == gk_sup_sigs.size())
+                gk_sup_sigs.push_back(sig);
+            snap_gk_sup_id[j] = static_cast<int>(found + 1);
         }
-        std::vector<Performer> deck;
-        deck.reserve(ordered.size());
-        for (size_t slot = 0; slot < ordered.size(); ++slot)
-            deck.push_back(make_performer(master, ordered[slot], selected[slot]));
-        GekisoContext context = gekiso_context(master, chart, deck, seeds, curve_cache);
-        TeamPower power = team_power(prob, master, player, ordered, selected, 0, music);
-        result.power = power.total;
-        result.slot_powers = power.slots;
-        result.detail.scores = score_orders_gekiso(master, chart, context, power.total, skills);
-        result.key = order_key(result.detail.scores, criterion);
-        result.detail.skills = std::move(skills);
-        result.detail.seeds = context.seeds;
-        return result;
+    }
+
+    std::vector<int> snap_skill_class(n * width, 0);
+    for (size_t i = 0; i < n; ++i) {
+        std::vector<size_t> rep_cols;
+        for (size_t col = 0; col < width; ++col) {
+            int gk_id = has_gk_skill[i] ? snap_gk_sup_id[col] : 0;
+            const SlotSkill &sk = slot_skill_table[i * width + col];
+            int assigned = -1;
+            for (size_t c_idx = 0; c_idx < rep_cols.size(); ++c_idx) {
+                size_t rcol = rep_cols[c_idx];
+                int rgk = has_gk_skill[i] ? snap_gk_sup_id[rcol] : 0;
+                if (gk_id == rgk && equal_slot_skill(sk, slot_skill_table[i * width + rcol])) {
+                    assigned = static_cast<int>(c_idx);
+                    break;
+                }
+            }
+            if (assigned < 0) {
+                assigned = static_cast<int>(rep_cols.size());
+                rep_cols.push_back(col);
+            }
+            snap_skill_class[i * width + col] = assigned;
+        }
+    }
+
+    const int eff_k = std::max(k, 10);
+    auto run_shard = [&](std::optional<int> shard_idx,
+                         std::optional<int> shard_cnt) -> SearchOutput {
+        std::unordered_map<std::string, LuckCurve> local_curve_cache;
+        std::array<int, 5> last_members{-1, -1, -1, -1, -1};
+        std::vector<std::pair<uint64_t, GekisoContext>> team_ctx_cache;
+
+        auto eval_team = [&](const Team &team, const double *pre_total,
+                             const std::vector<double> *pre_slots) {
+            SearchExact result;
+            std::vector<SlotSkill> skills;
+            skills.reserve(team.members.size());
+            std::array<int, 5> cur_members{-1, -1, -1, -1, -1};
+            uint64_t gk_sup_key = 0;
+            for (size_t slot = 0; slot < team.members.size(); ++slot) {
+                size_t m_idx = static_cast<size_t>(team.members[slot]);
+                size_t col = team.snaps[slot] < 0 ? s : static_cast<size_t>(team.snaps[slot]);
+                skills.push_back(slot_skill_table[m_idx * width + col]);
+                if (slot < 5)
+                    cur_members[slot] = team.members[slot];
+                uint64_t eff_gk =
+                    static_cast<uint64_t>(has_gk_skill[m_idx] ? snap_gk_sup_id[col] : 0);
+                gk_sup_key = (gk_sup_key << 12) | (eff_gk & 0xFFFu);
+            }
+
+            if (cur_members != last_members) {
+                last_members = cur_members;
+                team_ctx_cache.clear();
+            }
+            const GekisoContext *ctx_ptr = nullptr;
+            for (const auto &entry : team_ctx_cache) {
+                if (entry.first == gk_sup_key) {
+                    ctx_ptr = &entry.second;
+                    break;
+                }
+            }
+            if (!ctx_ptr) {
+                std::vector<Performer> deck;
+                deck.reserve(team.members.size());
+                for (size_t slot = 0; slot < team.members.size(); ++slot) {
+                    const MemberState &member = members[static_cast<size_t>(team.members[slot])];
+                    const SnapState *snap = team.snaps[slot] < 0
+                                                ? nullptr
+                                                : &snaps[static_cast<size_t>(team.snaps[slot])];
+                    deck.push_back(make_performer(master, member, snap));
+                }
+                team_ctx_cache.emplace_back(
+                    gk_sup_key, gekiso_context(master, chart, deck, seeds, local_curve_cache));
+                ctx_ptr = &team_ctx_cache.back().second;
+            }
+
+            if (pre_total && pre_slots) {
+                result.power = *pre_total;
+                result.slot_powers = *pre_slots;
+            } else {
+                std::vector<MemberState> ordered;
+                std::vector<const SnapState *> selected;
+                ordered.reserve(team.members.size());
+                selected.reserve(team.members.size());
+                for (size_t slot = 0; slot < team.members.size(); ++slot) {
+                    ordered.push_back(members[static_cast<size_t>(team.members[slot])]);
+                    selected.push_back(team.snaps[slot] < 0
+                                           ? nullptr
+                                           : &snaps[static_cast<size_t>(team.snaps[slot])]);
+                }
+                if (pre_power.valid) {
+                    TeamPowerResult pr = pre_power.calc(ordered, selected, 0);
+                    result.power = pr.total;
+                    result.slot_powers = std::move(pr.slots);
+                } else {
+                    TeamPower power = team_power(prob, master, player, ordered, selected, 0, music);
+                    result.power = power.total;
+                    result.slot_powers = std::move(power.slots);
+                }
+            }
+            result.detail.scores =
+                score_orders_gekiso(master, chart, *ctx_ptr, result.power, skills);
+            result.key = order_key(result.detail.scores, criterion);
+            result.detail.skills = std::move(skills);
+            result.detail.seeds = ctx_ptr->seeds;
+            return result;
+        };
+
+        SearchInput input;
+        input.master = &master;
+        input.player = &player;
+        input.members = &members;
+        input.snaps = &snaps;
+        input.music = music;
+        input.pre_power = pre_power.valid ? &pre_power : nullptr;
+        input.snap_skill_class = &snap_skill_class;
+        input.prune_snap_classes = true;
+        input.constraints = constraints;
+        input.constraints.allow_empty_snaps = allow_empty_snaps;
+        input.k = eff_k;
+        input.time_limit_ms = time_limit_ms > 0 ? time_limit_ms : 10000.0;
+        input.shard_index = shard_idx;
+        input.shard_count = shard_cnt;
+        input.skill = [](int, int) {
+            return std::make_pair(0.0, std::numeric_limits<double>::max() / 16);
+        };
+        input.member_bonus = [](int) { return 0.0; };
+        input.snap_bonus = [](int) { return 0.0; };
+        input.bound = [](const Totals &) { return std::numeric_limits<double>::max() / 16; };
+        input.interval = [](const Team &, const Totals &) {
+            return std::make_pair(0.0, std::numeric_limits<double>::max() / 16);
+        };
+        input.exact = [&](const Team &team) { return eval_team(team, nullptr, nullptr); };
+        input.exact_with_power = [&](const Team &team, double total_power,
+                                     const std::vector<double> &slot_powers) {
+            return eval_team(team, &total_power, &slot_powers);
+        };
+        return search_teams(input);
     };
-    return search_teams(input);
+
+    int leader_candidates = constraints.leader ? 1 : static_cast<int>(n);
+    unsigned int hw = std::thread::hardware_concurrency();
+    int num_shards = std::min(leader_candidates, static_cast<int>(hw > 0 ? hw : 4));
+    num_shards = std::min(num_shards, 8);
+    if (num_shards <= 1) {
+        return run_shard(std::nullopt, std::nullopt);
+    }
+
+    std::vector<SearchOutput> shard_outputs(static_cast<size_t>(num_shards));
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(num_shards - 1));
+    std::exception_ptr worker_exception;
+    std::mutex exception_mtx;
+    for (int idx = 1; idx < num_shards; ++idx) {
+        workers.emplace_back([&, idx]() {
+            try {
+                shard_outputs[static_cast<size_t>(idx)] = run_shard(idx, num_shards);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(exception_mtx);
+                if (!worker_exception)
+                    worker_exception = std::current_exception();
+            }
+        });
+    }
+    try {
+        shard_outputs[0] = run_shard(0, num_shards);
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(exception_mtx);
+        if (!worker_exception)
+            worker_exception = std::current_exception();
+    }
+    for (auto &w : workers)
+        w.join();
+    if (worker_exception)
+        std::rethrow_exception(worker_exception);
+
+    SearchOutput merged;
+    merged.proven = true;
+    for (auto &out : shard_outputs) {
+        merged.proven = merged.proven && out.proven;
+        if (out.has_bound) {
+            merged.bound = merged.has_bound ? std::max(merged.bound, out.bound) : out.bound;
+            merged.has_bound = true;
+        }
+        merged.stats.leaders += out.stats.leaders;
+        merged.stats.member_nodes += out.stats.member_nodes;
+        merged.stats.snap_nodes += out.stats.snap_nodes;
+        merged.stats.candidates += out.stats.candidates;
+        merged.stats.exact += out.stats.exact;
+        merged.stats.elapsed_ms = std::max(merged.stats.elapsed_ms, out.stats.elapsed_ms);
+
+        for (auto &hit : out.hits) {
+            if (hit.set_key.empty())
+                hit.set_key = team_set_key(hit.team, members);
+            size_t existing = merged.hits.size();
+            for (size_t i = 0; i < merged.hits.size(); ++i) {
+                if (merged.hits[i].set_key == hit.set_key) {
+                    existing = i;
+                    break;
+                }
+            }
+            if (existing < merged.hits.size() && merged.hits[existing].key >= hit.key)
+                continue;
+            if (existing < merged.hits.size())
+                merged.hits.erase(merged.hits.begin() + static_cast<ptrdiff_t>(existing));
+            size_t at = merged.hits.size();
+            while (at > 0 && merged.hits[at - 1].key < hit.key)
+                --at;
+            merged.hits.insert(merged.hits.begin() + static_cast<ptrdiff_t>(at), std::move(hit));
+            if (static_cast<int>(merged.hits.size()) > eff_k)
+                merged.hits.resize(static_cast<size_t>(eff_k));
+        }
+    }
+    return merged;
 }
 
 // Input parsing helpers.
@@ -9713,28 +10456,6 @@ Json handle_gekisou_rank_impl(const Json &input) {
                           &problem, allow_missing || box.snaps.size() < 5);
     }
 
-    std::unordered_map<std::string, LuckCurve> curve_cache;
-    auto rescore = [&](const Team &team) {
-        std::vector<MemberState> ordered;
-        std::vector<const SnapState *> selected;
-        std::vector<SlotSkill> skills;
-        for (size_t slot = 0; slot < team.members.size(); ++slot) {
-            const MemberState &member = box.members[static_cast<size_t>(team.members[slot])];
-            const SnapState *snap =
-                team.snaps[slot] < 0 ? nullptr : &box.snaps[static_cast<size_t>(team.snaps[slot])];
-            ordered.push_back(member);
-            selected.push_back(snap);
-            skills.push_back(resolve_slot_skill(master, member, snap));
-        }
-        std::vector<Performer> deck;
-        for (size_t slot = 0; slot < ordered.size(); ++slot)
-            deck.push_back(make_performer(master, ordered[slot], selected[slot]));
-        GekisoContext context = gekiso_context(master, chart, deck, seeds, curve_cache);
-        TeamPower power = team_power(&problem, master, player, ordered, selected, 0, &music);
-        OrderScores scores = score_orders_gekiso(master, chart, context, power.total, skills);
-        return std::make_pair(power.total, scores);
-    };
-
     Json hits = Json::array();
     std::vector<SearchHit> sorted = search.hits;
     std::sort(sorted.begin(), sorted.end(), [&](const SearchHit &a, const SearchHit &b) {
@@ -9742,7 +10463,8 @@ Json handle_gekisou_rank_impl(const Json &input) {
     });
     const size_t limit = std::min(static_cast<size_t>(k), sorted.size());
     for (size_t i = 0; i < limit; ++i) {
-        auto [power, scores] = rescore(sorted[i].team);
+        const double power = sorted[i].power;
+        const OrderScores &scores = sorted[i].detail.scores;
         Json hit = Json::object();
         hit.set("rank", Json(static_cast<int64_t>(i + 1)));
         hit.set("score", Json(order_key(scores, criterion)));

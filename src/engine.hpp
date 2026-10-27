@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -150,6 +151,7 @@ public:
 
 private:
     friend class Engine;
+    mutable std::mutex mutex_;
     std::map<std::vector<int64_t>, std::shared_ptr<const PowerMatrix>> matrices_;
     size_t bytes_ = 0;
     int64_t hits_ = 0, misses_ = 0, evictions_ = 0;
@@ -246,6 +248,7 @@ private:
     mutable bool durations_ready_ = false;
     mutable bool boosts_ready_ = false;
     mutable bool gains_ready_ = false;
+    mutable std::mutex power_mutex_;
     mutable std::unordered_map<size_t, std::shared_ptr<const PowerMatrix>> power_matrices_;
 };
 

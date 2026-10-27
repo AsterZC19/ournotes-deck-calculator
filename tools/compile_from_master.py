@@ -952,6 +952,7 @@ def compile_problem(
     song_context: str = "auto",
     account: dict[str, Any] | None = None,
     score_mode: str = "normal",
+    tables: MasterTables | None = None,
 ) -> dict[str, Any]:
     """编译一首歌的 problem JSON（纯函数：不做文件写入）。"""
     if difficulty not in DIFFICULTIES:
@@ -959,7 +960,8 @@ def compile_problem(
     if score_mode not in ("normal", "gekisou"):
         raise CompileError(f"--score-mode 只支持 ('normal', 'gekisou')，收到 {score_mode!r}")
 
-    tables = MasterTables(master_dir, latest_dir)
+    if tables is None:
+        tables = MasterTables(master_dir, latest_dir)
     tables.require(REQUIRED_TABLES)
     if score_mode == "gekisou":
         tables.require(GEKISOU_REQUIRED_TABLES)
@@ -1231,6 +1233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 generated_at=generated_at,
                 song_context=args.song_context,
                 score_mode=args.score_mode,
+                tables=tables,
             )
             path = output_path_for(output, song_id, args.difficulty, multiple)
             write_problem(problem, path)

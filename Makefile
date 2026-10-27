@@ -1,5 +1,5 @@
 CXX      ?= g++
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Isrc -MMD -MP
+CXXFLAGS ?= -std=c++20 -O2 -pthread -Wall -Wextra -Isrc -MMD -MP
 BUILD    := build
 
 CORE      := json model engine solver event gekisou

@@ -2,14 +2,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -460,6 +463,10 @@ struct ClassSearch {
     };
     std::unordered_set<std::array<int, kMaxTeam>, ClassKeyHash> handled_classes_;
     int64_t matching_cache_hits = 0, composition_bound_pruned = 0, order_bound_pruned = 0;
+    int64_t score_evaluations = 0;
+    std::mutex *pool_mutex = nullptr;
+    TopKPool *shared_pool = nullptr;
+    std::atomic<double> *shared_cutoff = nullptr;
     std::vector<std::vector<double>> dfs_powers_, dfs_gains_;
     std::vector<double> rem_gain_order_;
     std::vector<std::vector<int>> order_class_order_;
@@ -535,10 +542,24 @@ struct ClassSearch {
     }
 
     double cutoff() const {
-        return pool.cutoff();
+        double c = pool.cutoff();
+        if (shared_cutoff)
+            c = std::max(c, shared_cutoff->load(std::memory_order_relaxed));
+        return c;
     }
     double current_set_cutoff() const {
-        return std::max(pool.cutoff(), pool.set_score(current_set_));
+        return std::max(cutoff(), pool.set_score(current_set_));
+    }
+    void record_candidate(Solution candidate) {
+        if (pool_mutex && shared_pool && shared_cutoff) {
+            std::lock_guard<std::mutex> lock(*pool_mutex);
+            if (shared_pool->consider(std::move(candidate))) {
+                shared_cutoff->store(shared_pool->cutoff(), std::memory_order_relaxed);
+                pool = *shared_pool;
+            }
+        } else {
+            pool.consider(std::move(candidate));
+        }
     }
     bool expired() {
         if (wall_s() > shared.deadline)
@@ -716,7 +737,7 @@ struct ClassSearch {
             ++pruned;
             return;
         }
-        ++shared.score_evaluations;
+        ++score_evaluations;
         std::optional<Evaluation> evaluation;
         if (shared.average_objective || matched_power < 0) {
             evaluation = shared.average_objective ? shared.engine->evaluate_mean(formation)
@@ -735,7 +756,7 @@ struct ClassSearch {
         candidate.index = *evaluation->ranking_score;
         candidate.member_set = current_set_;
         candidate.evaluation = std::move(*evaluation);
-        pool.consider(std::move(candidate));
+        record_candidate(std::move(candidate));
     }
 
     void order_classes_dfs(const std::vector<int> &ord, int depth, int64_t power, double gain) {
@@ -797,7 +818,7 @@ struct ClassSearch {
             return;
         }
 
-        ++shared.score_evaluations;
+        ++score_evaluations;
         std::optional<Evaluation> evaluation;
         if (matched_power < 0) {
             evaluation = shared.engine->evaluate_theoretical(formation);
@@ -821,7 +842,7 @@ struct ClassSearch {
         candidate.index = *evaluation->ranking_score;
         candidate.member_set = current_set_;
         candidate.evaluation = std::move(*evaluation);
-        pool.consider(std::move(candidate));
+        record_candidate(std::move(candidate));
     }
 
     void orders_search() {
@@ -1995,6 +2016,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
     const std::vector<std::vector<std::vector<double>>> &gains = engine.gains();
     shared.pairs.resize(static_cast<size_t>(shared.member_count) *
                         static_cast<size_t>(shared.snap_count));
+    shared.keep_at.assign(shared.pairs.size() * static_cast<size_t>(team_size), 1);
     shared.gains.assign(shared.pairs.size(),
                         std::vector<double>(static_cast<size_t>(team_size), 0.0));
     for (int member = 0; member < shared.member_count; ++member) {
@@ -2154,14 +2176,14 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
         game.leader_member = leader_member;
         if (use_index_pruning && !engine.rules().formation_leader_conditions())
             prune(shared, matrix);
-        else
+        else if (use_index_pruning)
             shared.keep_at.assign(shared.pairs.size() * static_cast<size_t>(team_size), 1);
         game.by_power.resize(shared.pairs.size());
         for (size_t i = 0; i < shared.pairs.size(); ++i)
             game.by_power[i] = static_cast<int>(i);
         std::stable_sort(game.by_power.begin(), game.by_power.end(),
                          [&](int a, int b) { return game.slot_power(a) > game.slot_power(b); });
-        const double reference_power = std::max(1.0, leader_potential[leader_id] * 0.5);
+        const double reference_power = std::max(1.0, leader_potential.at(leader_id) * 0.5);
         const auto &potential_gains = theoretical && shared.linear_score_bound_enabled
                                           ? shared.score_max_gains
                                           : shared.index_max_gains;
@@ -2390,130 +2412,241 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
 
     shared.deadline = deadline;
     if (exact_mode) {
-        for (int64_t leader_id : leader_ids) {
-            if (wall_s() > deadline) {
-                certified = false;
-                break;
-            }
-            if (class_search) {
-                auto &search = *class_search;
-                const double max_leader_gain =
-                    shared.team_size *
-                    *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end());
+        if (class_search) {
+            auto &search = *class_search;
+            const double max_leader_gain =
+                shared.team_size *
+                *std::max_element(shared.score_max_gains.begin(), shared.score_max_gains.end());
+            auto run_leader = [&](ClassSearch &s, int64_t leader_id) -> bool {
                 const double leader_score_cap =
-                    search.cap(leader_potential[leader_id], max_leader_gain);
-                if (leader_score_cap <= search.pool.cutoff()) {
-                    ++leaders_proven;
-                    continue;
+                    s.cap(leader_potential.at(leader_id), max_leader_gain);
+                if (leader_score_cap <= s.cutoff()) {
+                    return true;
                 }
-                search.game = build_game(leader_id, false);
-                search.candidates.resize(shared.member_count);
-                std::iota(search.candidates.begin(), search.candidates.end(), 0);
-                const double p = std::max(1.0, leader_potential[leader_id] * 0.5);
-                const double g = *std::max_element(search.game.member_max_gain.begin(),
-                                                   search.game.member_max_gain.end()) *
+                s.game = build_game(leader_id, false);
+                s.candidates.resize(shared.member_count);
+                std::iota(s.candidates.begin(), s.candidates.end(), 0);
+                const double p = std::max(1.0, leader_potential.at(leader_id) * 0.5);
+                const double g = *std::max_element(s.game.member_max_gain.begin(),
+                                                   s.game.member_max_gain.end()) *
                                  team_size * 0.5;
-                std::stable_sort(
-                    search.candidates.begin(), search.candidates.end(), [&](int a, int b) {
-                        return search.game.member_max_power[a] * (search.bound.base + g) +
-                                   p * search.game.member_max_gain[a] >
-                               search.game.member_max_power[b] * (search.bound.base + g) +
-                                   p * search.game.member_max_gain[b];
-                    });
-                const int lm = search.game.leader_member;
-                search.members = {lm};
+                std::stable_sort(s.candidates.begin(), s.candidates.end(), [&](int a, int b) {
+                    return s.game.member_max_power[a] * (s.bound.base + g) +
+                               p * s.game.member_max_gain[a] >
+                           s.game.member_max_power[b] * (s.bound.base + g) +
+                               p * s.game.member_max_gain[b];
+                });
+                const int lm = s.game.leader_member;
+                s.members = {lm};
                 std::array<double, kMaxTeam> selected_pos_max{};
                 for (int k = 0; k < shared.team_size; ++k)
-                    selected_pos_max[k] = search.member_pos_gain[lm][k];
-                search.compositions_dfs(0, SelectionSet::single(shared.members[lm]->character),
-                                        search.game.member_max_power[lm],
-                                        search.game.member_max_gain[lm], selected_pos_max);
-                if (search.timed_out) {
+                    selected_pos_max[k] = s.member_pos_gain[lm][k];
+                s.compositions_dfs(0, SelectionSet::single(shared.members[lm]->character),
+                                   s.game.member_max_power[lm], s.game.member_max_gain[lm],
+                                   selected_pos_max);
+                return !s.timed_out;
+            };
+
+            if (!leader_ids.empty()) {
+                if (wall_s() > deadline || !run_leader(search, leader_ids[0])) {
+                    certified = false;
+                } else {
+                    ++leaders_proven;
+                    if (options.progress)
+                        options.progress("proven leader " + std::to_string(leader_ids[0]) +
+                                         " member nodes " + std::to_string(search.nodes));
+                }
+            }
+
+            if (certified && leader_ids.size() > 1) {
+                std::vector<int64_t> rem_leaders;
+                for (size_t i = 1; i < leader_ids.size(); ++i) {
+                    const int64_t lid = leader_ids[i];
+                    const double leader_score_cap =
+                        search.cap(leader_potential.at(lid), max_leader_gain);
+                    if (leader_score_cap <= search.cutoff()) {
+                        ++leaders_proven;
+                        if (options.progress)
+                            options.progress("proven leader " + std::to_string(lid) +
+                                             " member nodes " + std::to_string(search.nodes));
+                    } else {
+                        rem_leaders.push_back(lid);
+                    }
+                }
+                const unsigned int hw = std::thread::hardware_concurrency();
+                const size_t num_workers =
+                    std::min<size_t>(rem_leaders.size(), std::min<size_t>(8, std::max(1u, hw)));
+                if (num_workers <= 1 || engine.rules().formation_leader_conditions() ||
+                    static_cast<bool>(options.progress)) {
+                    for (int64_t lid : rem_leaders) {
+                        if (wall_s() > deadline || !run_leader(search, lid)) {
+                            certified = false;
+                            break;
+                        }
+                        ++leaders_proven;
+                        if (options.progress)
+                            options.progress("proven leader " + std::to_string(lid) +
+                                             " member nodes " + std::to_string(search.nodes));
+                    }
+                } else {
+                    for (int64_t lid : rem_leaders) {
+                        engine.power_matrix(static_cast<size_t>(engine.member_pos(lid)));
+                    }
+                    std::mutex pool_mtx;
+                    std::atomic<double> shared_cut(search.pool.cutoff());
+                    std::atomic<size_t> next_idx(0);
+                    std::vector<std::unique_ptr<ClassSearch>> workers(num_workers);
+                    std::vector<int64_t> worker_proven(num_workers, 0);
+                    std::exception_ptr worker_exception;
+                    std::mutex exception_mtx;
+                    for (size_t w = 0; w < num_workers; ++w) {
+                        workers[w] = std::make_unique<ClassSearch>(shared, options.top);
+                        workers[w]->pool = search.pool;
+                        workers[w]->pool_mutex = &pool_mtx;
+                        workers[w]->shared_pool = &search.pool;
+                        workers[w]->shared_cutoff = &shared_cut;
+                    }
+                    auto worker_fn = [&](size_t w) {
+                        try {
+                            ClassSearch &ws = *workers[w];
+                            while (true) {
+                                const size_t idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+                                if (idx >= rem_leaders.size())
+                                    break;
+                                if (wall_s() > deadline) {
+                                    ws.timed_out = true;
+                                    break;
+                                }
+                                {
+                                    std::lock_guard<std::mutex> lock(pool_mtx);
+                                    ws.pool = search.pool;
+                                }
+                                if (!run_leader(ws, rem_leaders[idx])) {
+                                    break;
+                                }
+                                ++worker_proven[w];
+                            }
+                        } catch (...) {
+                            std::lock_guard<std::mutex> lock(exception_mtx);
+                            if (!worker_exception)
+                                worker_exception = std::current_exception();
+                        }
+                    };
+                    std::vector<std::thread> threads;
+                    threads.reserve(num_workers - 1);
+                    for (size_t w = 1; w < num_workers; ++w)
+                        threads.emplace_back(worker_fn, w);
+                    worker_fn(0);
+                    for (auto &t : threads)
+                        t.join();
+                    if (worker_exception)
+                        std::rethrow_exception(worker_exception);
+
+                    for (size_t w = 0; w < num_workers; ++w) {
+                        const ClassSearch &ws = *workers[w];
+                        search.nodes += ws.nodes;
+                        search.compositions += ws.compositions;
+                        search.class_nodes += ws.class_nodes;
+                        search.matchings += ws.matchings;
+                        search.pruned += ws.pruned;
+                        search.matching_cache_hits += ws.matching_cache_hits;
+                        search.composition_bound_pruned += ws.composition_bound_pruned;
+                        search.order_bound_pruned += ws.order_bound_pruned;
+                        search.order_stats.evaluated += ws.order_stats.evaluated;
+                        search.order_stats.pruned += ws.order_stats.pruned;
+                        search.score_evaluations += ws.score_evaluations;
+                        leaders_proven += worker_proven[w];
+                        if (ws.timed_out)
+                            certified = false;
+                    }
+                }
+            }
+        } else {
+            for (int64_t leader_id : leader_ids) {
+                if (wall_s() > deadline) {
+                    certified = false;
+                    break;
+                }
+                auto incumbent = best_by_leader.find(leader_id);
+                Game game = build_game(leader_id, !theoretical);
+                Bnb ctx;
+                ctx.game = &game;
+                ctx.excluded = &shared.excluded_member_sets;
+                ctx.deadline = deadline;
+                if (theoretical && !seeded_exact && incumbent != best_by_leader.end()) {
+                    ctx.neighborhood_seed = incumbent->second;
+                    ctx.neighborhood_stats = &neighborhood_stats;
+                }
+                ctx.best = incumbent == best_by_leader.end()
+                               ? -std::numeric_limits<double>::infinity()
+                               : incumbent->second.index;
+
+                for (const auto &entry : pool)
+                    ctx.best = std::max(ctx.best, entry.second.index);
+                if (theoretical && shared.linear_score_bound_enabled && ctx.best > 0) {
+                    double best_power = 1;
+                    for (const auto &entry : pool)
+                        if (entry.second.index == ctx.best) {
+                            best_power = entry.second.evaluation.power;
+                            break;
+                        }
+                    ctx.lambda = best_power * best_power / ctx.best;
+                    ctx.joint.resize(shared.pairs.size());
+                    for (size_t pair = 0; pair < shared.pairs.size(); ++pair)
+                        for (int k = 0; k < team_size; ++k)
+                            ctx.joint[pair][k] =
+                                static_cast<double>(game.slot_power(pair)) +
+                                ctx.lambda * shared.score_gain_coefficients[pair][k];
+                }
+                std::vector<int> trial;
+                int roots = 0;
+                for (int pair : game.by_potential) {
+                    if (shared.pairs[pair].member != game.leader_member)
+                        continue;
+                    ++roots;
+                    if (!shared.any_kept(pair))
+                        continue;
+                    trial.push_back(pair);
+                    bnb_dfs(ctx, 1, -1, SelectionSet::single(game.leader_member),
+                            SelectionSet::single(shared.pairs[pair].snap),
+                            SelectionSet::single(
+                                shared.members[static_cast<size_t>(game.leader_member)]->character),
+                            game.slot_power(pair), trial);
+                    trial.pop_back();
+                    if (ctx.timed_out)
+                        break;
+                    if (options.progress && (roots % 8 == 0 || roots == shared.snap_count))
+                        options.progress("leader " + std::to_string(leader_id) +
+                                         " Snapshot roots " + std::to_string(roots) + "/" +
+                                         std::to_string(shared.snap_count) + " nodes " +
+                                         std::to_string(ctx.nodes));
+                }
+                dfs_nodes += ctx.nodes;
+                cheap_bound_pruned += ctx.cheap_bound_pruned;
+                if (ctx.best_pairs.size() == static_cast<size_t>(team_size)) {
+                    Solution solution = ctx.neighborhood_seed.found
+                                            ? std::move(ctx.neighborhood_seed)
+                                            : make_solution(game, ctx.best_pairs, true);
+                    auto existing = pool.find(solution.member_set);
+                    if (existing == pool.end() || existing->second.index < solution.index) {
+                        pool[solution.member_set] = std::move(solution);
+                    }
+                }
+                if (ctx.timed_out) {
                     certified = false;
                     break;
                 }
                 ++leaders_proven;
                 if (options.progress)
-                    options.progress("proven leader " + std::to_string(leader_id) +
-                                     " member nodes " + std::to_string(search.nodes));
-                continue;
+                    options.progress("proven leader " + std::to_string(leader_id) + " nodes " +
+                                     std::to_string(ctx.nodes) + " global lower bound " +
+                                     std::to_string(ctx.best));
             }
-            auto incumbent = best_by_leader.find(leader_id);
-            Game game = build_game(leader_id, !theoretical);
-            Bnb ctx;
-            ctx.game = &game;
-            ctx.excluded = &shared.excluded_member_sets;
-            ctx.deadline = deadline;
-            if (theoretical && !seeded_exact && incumbent != best_by_leader.end()) {
-                ctx.neighborhood_seed = incumbent->second;
-                ctx.neighborhood_stats = &neighborhood_stats;
-            }
-            ctx.best = incumbent == best_by_leader.end() ? -std::numeric_limits<double>::infinity()
-                                                         : incumbent->second.index;
-
-            for (const auto &entry : pool)
-                ctx.best = std::max(ctx.best, entry.second.index);
-            if (theoretical && shared.linear_score_bound_enabled && ctx.best > 0) {
-                double best_power = 1;
-                for (const auto &entry : pool)
-                    if (entry.second.index == ctx.best) {
-                        best_power = entry.second.evaluation.power;
-                        break;
-                    }
-                ctx.lambda = best_power * best_power / ctx.best;
-                ctx.joint.resize(shared.pairs.size());
-                for (size_t pair = 0; pair < shared.pairs.size(); ++pair)
-                    for (int k = 0; k < team_size; ++k)
-                        ctx.joint[pair][k] = static_cast<double>(game.slot_power(pair)) +
-                                             ctx.lambda * shared.score_gain_coefficients[pair][k];
-            }
-            std::vector<int> trial;
-            int roots = 0;
-            for (int pair : game.by_potential) {
-                if (shared.pairs[pair].member != game.leader_member)
-                    continue;
-                ++roots;
-                if (!shared.any_kept(pair))
-                    continue;
-                trial.push_back(pair);
-                bnb_dfs(ctx, 1, -1, SelectionSet::single(game.leader_member),
-                        SelectionSet::single(shared.pairs[pair].snap),
-                        SelectionSet::single(
-                            shared.members[static_cast<size_t>(game.leader_member)]->character),
-                        game.slot_power(pair), trial);
-                trial.pop_back();
-                if (ctx.timed_out)
-                    break;
-                if (options.progress && (roots % 8 == 0 || roots == shared.snap_count))
-                    options.progress("leader " + std::to_string(leader_id) + " Snapshot roots " +
-                                     std::to_string(roots) + "/" +
-                                     std::to_string(shared.snap_count) + " nodes " +
-                                     std::to_string(ctx.nodes));
-            }
-            dfs_nodes += ctx.nodes;
-            cheap_bound_pruned += ctx.cheap_bound_pruned;
-            if (ctx.best_pairs.size() == static_cast<size_t>(team_size)) {
-                Solution solution = ctx.neighborhood_seed.found
-                                        ? std::move(ctx.neighborhood_seed)
-                                        : make_solution(game, ctx.best_pairs, true);
-                auto existing = pool.find(solution.member_set);
-                if (existing == pool.end() || existing->second.index < solution.index) {
-                    pool[solution.member_set] = std::move(solution);
-                }
-            }
-            if (ctx.timed_out) {
-                certified = false;
-                break;
-            }
-            ++leaders_proven;
-            if (options.progress)
-                options.progress("proven leader " + std::to_string(leader_id) + " nodes " +
-                                 std::to_string(ctx.nodes) + " global lower bound " +
-                                 std::to_string(ctx.best));
         }
     }
 
     if (class_search) {
+        shared.score_evaluations += class_search->score_evaluations;
         for (const auto &entry : class_search->pool.pool) {
             auto it = pool.find(entry.first);
             if (it == pool.end() || SolutionBetter{}(entry.second, it->second)) {

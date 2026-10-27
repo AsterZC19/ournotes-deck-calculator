@@ -65,6 +65,8 @@ struct Member {
     int rarity = 0;
     Triple trained{};
     int64_t event_bonus_bp = 0;
+    double event_pt_bonus_bp = 0;
+    double event_drop_bonus_bp = 0;
     std::vector<int> tags;
     int64_t live_skill = 0;
     int64_t leader_skill = 0;
@@ -87,6 +89,8 @@ struct Snapshot {
     int rarity = 0;
     Triple trained{};
     int64_t event_bonus_bp = 0;
+    double event_pt_bonus_bp = 0;
+    double event_drop_bonus_bp = 0;
     int rank = 0;
     int level = 0;
     std::vector<int64_t> support_skills;

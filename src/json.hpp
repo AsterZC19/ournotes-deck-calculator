@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace deckcalc {
@@ -23,12 +24,12 @@ public:
 
     Json() = default;
     Json(std::nullptr_t) {}
-    Json(bool value) : type_(Type::Bool), bool_(value) {}
-    Json(double value) : type_(Type::Number), number_(value) {}
-    Json(int value) : type_(Type::Number), number_(static_cast<double>(value)) {}
-    Json(int64_t value) : type_(Type::Number), number_(static_cast<double>(value)) {}
-    Json(const char *value) : type_(Type::String), string_(value) {}
-    Json(std::string value) : type_(Type::String), string_(std::move(value)) {}
+    Json(bool value) : value_(value) {}
+    Json(double value) : value_(value) {}
+    Json(int value) : value_(static_cast<double>(value)) {}
+    Json(int64_t value) : value_(static_cast<double>(value)) {}
+    Json(const char *value) : value_(std::string(value)) {}
+    Json(std::string value) : value_(std::move(value)) {}
 
     static Json object();
     static Json array();
@@ -37,26 +38,26 @@ public:
     static Json read(const std::string &path);
 
     Type type() const {
-        return type_;
+        return static_cast<Type>(value_.index());
     }
     bool is_null() const {
-        return type_ == Type::Null;
+        return type() == Type::Null;
     }
     bool is_bool() const {
-        return type_ == Type::Bool;
+        return type() == Type::Bool;
     }
     bool is_number() const {
-        return type_ == Type::Number;
+        return type() == Type::Number;
     }
     bool is_integer() const;
     bool is_string() const {
-        return type_ == Type::String;
+        return type() == Type::String;
     }
     bool is_array() const {
-        return type_ == Type::Array;
+        return type() == Type::Array;
     }
     bool is_object() const {
-        return type_ == Type::Object;
+        return type() == Type::Object;
     }
 
     bool as_bool() const;
@@ -84,14 +85,11 @@ public:
     std::string dump(int indent = 2) const;
 
 private:
+    using storage_t = std::variant<std::monostate, bool, double, std::string, array_t, object_t>;
+    explicit Json(storage_t value) : value_(std::move(value)) {}
     void dump_to(std::ostream &out, int indent, int depth) const;
 
-    Type type_ = Type::Null;
-    bool bool_ = false;
-    double number_ = 0.0;
-    std::string string_;
-    std::vector<Json> array_;
-    std::vector<std::pair<std::string, Json>> object_;
+    storage_t value_;
 };
 
 }

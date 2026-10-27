@@ -1622,6 +1622,7 @@ Json Engine::slot_breakdown(size_t leader_index, size_t member_index, size_t sna
 }
 
 Json EngineCache::audit() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     Json out = Json::object();
     out.set("power_matrix_hits", Json(hits_));
     out.set("power_matrix_misses", Json(misses_));
@@ -1632,6 +1633,7 @@ Json EngineCache::audit() const {
 }
 
 const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_index) const {
+    std::lock_guard<std::mutex> self_lock(power_mutex_);
     const auto cached = power_matrices_.find(leader_index);
     if (cached != power_matrices_.end()) {
         return *cached->second;
@@ -1721,12 +1723,15 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
             cache_key.insert(cache_key.end(), snapshot_rate[s].begin(), snapshot_rate[s].end());
             cache_key.push_back(snapshot_link[s]);
         }
-        const auto shared = cache_->matrices_.find(cache_key);
-        if (shared != cache_->matrices_.end()) {
-            ++cache_->hits_;
-            return *power_matrices_.emplace(leader_index, shared->second).first->second;
+        {
+            std::lock_guard<std::mutex> cache_lock(cache_->mutex_);
+            const auto shared = cache_->matrices_.find(cache_key);
+            if (shared != cache_->matrices_.end()) {
+                ++cache_->hits_;
+                return *power_matrices_.emplace(leader_index, shared->second).first->second;
+            }
+            ++cache_->misses_;
         }
-        ++cache_->misses_;
     }
 
     struct ExtraPlan {
@@ -1818,10 +1823,11 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
         }
     }
     auto shared = std::make_shared<const PowerMatrix>(std::move(matrix));
-    if (!cache_key.empty()) {
+    if (!cache_key.empty() && cache_) {
         constexpr size_t capacity = 32 * 1024 * 1024;
         const size_t bytes = member_count * snapshot_count * sizeof(int64_t);
         if (bytes <= capacity) {
+            std::lock_guard<std::mutex> cache_lock(cache_->mutex_);
             while (!cache_->matrices_.empty() &&
                    (cache_->bytes_ + bytes > capacity || cache_->matrices_.size() >= 512)) {
                 const auto entry = cache_->matrices_.begin();

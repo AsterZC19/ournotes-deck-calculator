@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <set>
+#include <thread>
 #include <tuple>
 
 namespace deckcalc {
@@ -213,10 +215,23 @@ struct CardBonus {
     double pt = 0, drop = 0;
 };
 std::map<int64_t, CardBonus> card_bonuses(const Engine &engine, const char *key) {
+    auto check_nonneg = [](double n, const char *field) {
+        if (!std::isfinite(n) || n < 0)
+            throw SpecError(std::string("event 非负数值无效: ") + field);
+        return n;
+    };
     std::map<int64_t, CardBonus> out;
-    for (const auto &card : engine.problem().raw.at("catalog").at(key).items())
-        out.emplace(int_field(card, "id"), CardBonus{positive(card, "event_pt_bonus_bp", 0),
-                                                     positive(card, "event_drop_bonus_bp", 0)});
+    if (std::string(key) == "members") {
+        for (const auto &card : engine.problem().catalog.members)
+            out.emplace(card.id,
+                        CardBonus{check_nonneg(card.event_pt_bonus_bp, "event_pt_bonus_bp"),
+                                  check_nonneg(card.event_drop_bonus_bp, "event_drop_bonus_bp")});
+    } else {
+        for (const auto &card : engine.problem().catalog.snapshots)
+            out.emplace(card.id,
+                        CardBonus{check_nonneg(card.event_pt_bonus_bp, "event_pt_bonus_bp"),
+                                  check_nonneg(card.event_drop_bonus_bp, "event_drop_bonus_bp")});
+    }
     return out;
 }
 Json yield_json(const Yield &y) {
@@ -1549,43 +1564,88 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
     PhaseSearchStats normal_stats, challenge_stats;
     const double phase_seconds = options.time_limit_s == 0 ? std::numeric_limits<double>::infinity()
                                                            : options.time_limit_s / 2;
-    auto phase_search = [&](const Engine &model, const std::string &phase, bool &complete,
-                            PhaseSearchStats &stats) {
+    auto sorted_leaders = options.leaders;
+    std::sort(sorted_leaders.begin(), sorted_leaders.end());
+    sorted_leaders.erase(std::unique(sorted_leaders.begin(), sorted_leaders.end()),
+                         sorted_leaders.end());
+    auto lookup_cache = [&](const Engine &model, const std::string &phase, bool &complete,
+                            PhaseSearchStats &stats, std::vector<Candidate> &out_cands) -> bool {
         if (!cache || options.method != "exact")
-            return search(model, options, phase, phase_seconds, complete, stats);
+            return false;
         auto &entries = cache->impl_->entries;
         entries.erase(std::remove_if(entries.begin(), entries.end(),
                                      [](const auto &entry) { return entry.identity.expired(); }),
                       entries.end());
-        auto leaders = options.leaders;
-        std::sort(leaders.begin(), leaders.end());
-        leaders.erase(std::unique(leaders.begin(), leaders.end()), leaders.end());
         const auto identity = model.cache_identity().lock();
         for (const auto &entry : entries) {
             if (entry.identity.lock() == identity && entry.phase == phase &&
-                entry.objective == options.objective && entry.leaders == leaders) {
+                entry.objective == options.objective && entry.leaders == sorted_leaders) {
                 ++cache->impl_->hits;
                 complete = true;
                 stats.phase_cache_hit = true;
                 stats.reward_ceiling_certified = entry.proof.reward_ceiling_certified;
                 stats.score_bound_enabled = entry.proof.score_bound_enabled;
                 stats.score_ceiling = entry.proof.score_ceiling;
-                return entry.candidates;
+                out_cands = entry.candidates;
+                return true;
             }
         }
         ++cache->impl_->misses;
-        auto candidates = search(model, options, phase, phase_seconds, complete, stats);
-        if (complete) {
-            if (entries.size() >= 64)
-                entries.erase(entries.begin());
-            entries.push_back({model.cache_identity(), phase, options.objective, std::move(leaders),
-                               candidates, stats});
-        }
-        return candidates;
+        return false;
     };
-    auto normal = phase_search(engine, "normal", normal_complete, normal_stats);
-    auto challenge =
-        phase_search(challenge_model, "challenge", challenge_complete, challenge_stats);
+    auto store_cache = [&](const Engine &model, const std::string &phase, bool complete,
+                           const PhaseSearchStats &stats, const std::vector<Candidate> &cands) {
+        if (!cache || options.method != "exact" || !complete)
+            return;
+        auto &entries = cache->impl_->entries;
+        if (entries.size() >= 64)
+            entries.erase(entries.begin());
+        entries.push_back(
+            {model.cache_identity(), phase, options.objective, sorted_leaders, cands, stats});
+    };
+
+    std::vector<Candidate> normal, challenge;
+    const bool normal_cached =
+        lookup_cache(engine, "normal", normal_complete, normal_stats, normal);
+    const bool challenge_cached =
+        lookup_cache(challenge_model, "challenge", challenge_complete, challenge_stats, challenge);
+
+    if (!normal_cached && !challenge_cached && &engine != &challenge_model) {
+        std::exception_ptr normal_ex, challenge_ex;
+        std::thread normal_thread([&]() {
+            try {
+                normal =
+                    search(engine, options, "normal", phase_seconds, normal_complete, normal_stats);
+            } catch (...) {
+                normal_ex = std::current_exception();
+            }
+        });
+        try {
+            challenge = search(challenge_model, options, "challenge", phase_seconds,
+                               challenge_complete, challenge_stats);
+        } catch (...) {
+            challenge_ex = std::current_exception();
+        }
+        normal_thread.join();
+        if (normal_ex)
+            std::rethrow_exception(normal_ex);
+        store_cache(engine, "normal", normal_complete, normal_stats, normal);
+        if (challenge_ex)
+            std::rethrow_exception(challenge_ex);
+        store_cache(challenge_model, "challenge", challenge_complete, challenge_stats, challenge);
+    } else {
+        if (!normal_cached) {
+            normal =
+                search(engine, options, "normal", phase_seconds, normal_complete, normal_stats);
+            store_cache(engine, "normal", normal_complete, normal_stats, normal);
+        }
+        if (!challenge_cached) {
+            challenge = search(challenge_model, options, "challenge", phase_seconds,
+                               challenge_complete, challenge_stats);
+            store_cache(challenge_model, "challenge", challenge_complete, challenge_stats,
+                        challenge);
+        }
+    }
     if (normal.empty() || challenge.empty())
         throw SpecError("活动搜索未找到满足约束的完整组队，请增加 time-limit 或检查约束");
     Json out = Json::object();

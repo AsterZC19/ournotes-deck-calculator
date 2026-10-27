@@ -732,6 +732,10 @@ Member parse_member(const Json &data, const Path &path) {
     member.trained =
         as_triple(member_ptr(object, "trained"), child(path, "trained"), Triple{0, 0, 0}, false);
     member.event_bonus_bp = int_default(object, "event_bonus_bp", 0, child(path, "event_bonus_bp"));
+    member.event_pt_bonus_bp =
+        num_default(object, "event_pt_bonus_bp", 0, child(path, "event_pt_bonus_bp"));
+    member.event_drop_bonus_bp =
+        num_default(object, "event_drop_bonus_bp", 0, child(path, "event_drop_bonus_bp"));
     member.tags = int_array_or_empty<int>(object, "tags", child(path, "tags"));
     member.live_skill = int_default(object, "live_skill", 0, child(path, "live_skill"));
     member.leader_skill = int_default(object, "leader_skill", 0, child(path, "leader_skill"));
@@ -780,6 +784,10 @@ Snapshot parse_snapshot(const Json &data, const Path &path) {
         as_triple(member_ptr(object, "trained"), child(path, "trained"), Triple{0, 0, 0}, false);
     snapshot.event_bonus_bp =
         int_default(object, "event_bonus_bp", 0, child(path, "event_bonus_bp"));
+    snapshot.event_pt_bonus_bp =
+        num_default(object, "event_pt_bonus_bp", 0, child(path, "event_pt_bonus_bp"));
+    snapshot.event_drop_bonus_bp =
+        num_default(object, "event_drop_bonus_bp", 0, child(path, "event_drop_bonus_bp"));
     snapshot.rank = static_cast<int>(int_default(object, "rank", 0, child(path, "rank")));
     snapshot.level = static_cast<int>(int_default(object, "level", 0, child(path, "level")));
     snapshot.support_skills =
@@ -1289,7 +1297,10 @@ Problem parse_problem(const Json &document) {
     problem.settings = parse_settings(member_ptr(data, "settings"), "settings");
     problem.constraints = parse_constraints(member_ptr(data, "constraints"), "constraints");
     problem.search = parse_search(member_ptr(data, "search"), "search");
-    problem.raw = data;
+    problem.raw = Json::object();
+    if (const Json *ev = member_ptr(data, "event")) {
+        problem.raw.set("event", *ev);
+    }
     problem.validate();
     return problem;
 }

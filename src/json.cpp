@@ -112,7 +112,7 @@ void write_indent(std::ostream &out, int indent, int depth) {
     }
 }
 
-double to_double(const std::string &literal, size_t offset) {
+double to_double(std::string_view literal, size_t offset) {
     double value = 0.0;
     const char *first = literal.data();
     const char *last = first + literal.size();
@@ -124,7 +124,8 @@ double to_double(const std::string &literal, size_t offset) {
         throw_error(offset, "invalid number");
     }
     errno = 0;
-    double fallback = std::strtod(literal.c_str(), nullptr);
+    const std::string copy(literal);
+    double fallback = std::strtod(copy.c_str(), nullptr);
     if (!std::isfinite(fallback)) {
         throw_error(offset, "number out of range");
     }
@@ -437,7 +438,7 @@ private:
                 ++pos_;
             }
         }
-        return Json(to_double(std::string(text_.substr(start, pos_ - start)), start));
+        return Json(to_double(text_.substr(start, pos_ - start), start));
     }
 
     std::string_view text_;
@@ -463,15 +464,11 @@ std::string read_whole(const std::string &path) {
 }
 
 Json Json::object() {
-    Json value;
-    value.type_ = Type::Object;
-    return value;
+    return Json(storage_t(std::in_place_type<object_t>));
 }
 
 Json Json::array() {
-    Json value;
-    value.type_ = Type::Array;
-    return value;
+    return Json(storage_t(std::in_place_type<array_t>));
 }
 
 Json Json::parse(std::string_view text) {
@@ -487,74 +484,79 @@ Json Json::parse_file(const std::string &path) {
 }
 
 bool Json::as_bool() const {
-    if (type_ != Type::Bool) {
+    if (!is_bool()) {
         throw_type_error("as_bool()", "bool");
     }
-    return bool_;
+    return std::get<bool>(value_);
 }
 
 bool Json::is_integer() const {
-    return type_ == Type::Number && std::isfinite(number_) && number_ == std::trunc(number_);
+    if (!is_number()) {
+        return false;
+    }
+    const double number = std::get<double>(value_);
+    return std::isfinite(number) && number == std::trunc(number);
 }
 
 double Json::as_double() const {
-    if (type_ != Type::Number) {
+    if (!is_number()) {
         throw_type_error("as_double()", "number");
     }
-    return number_;
+    return std::get<double>(value_);
 }
 
 int64_t Json::as_int64() const {
-    if (type_ != Type::Number) {
+    if (!is_number()) {
         throw_type_error("as_int64()", "number");
     }
-    if (!std::isfinite(number_)) {
+    const double number = std::get<double>(value_);
+    if (!std::isfinite(number)) {
         throw JsonError("json: as_int64() cannot convert a non-finite number");
     }
-    if (number_ != std::trunc(number_)) {
+    if (number != std::trunc(number)) {
         throw JsonError("json: as_int64() requires an integral value");
     }
 
     constexpr double kInt64Min = -9223372036854775808.0;
     constexpr double kInt64Max = 9223372036854775808.0;
-    if (number_ < kInt64Min || number_ > kInt64Max) {
+    if (number < kInt64Min || number > kInt64Max) {
         throw JsonError("json: as_int64() value is out of int64 range");
     }
-    if (number_ >= kInt64Max) {
+    if (number >= kInt64Max) {
         return std::numeric_limits<int64_t>::max();
     }
-    if (number_ <= kInt64Min) {
+    if (number <= kInt64Min) {
         return std::numeric_limits<int64_t>::min();
     }
-    return static_cast<int64_t>(number_);
+    return static_cast<int64_t>(number);
 }
 
 const std::string &Json::as_string() const {
-    if (type_ != Type::String) {
+    if (!is_string()) {
         throw_type_error("as_string()", "string");
     }
-    return string_;
+    return std::get<std::string>(value_);
 }
 
 const std::vector<Json> &Json::items() const {
-    if (type_ != Type::Array) {
+    if (!is_array()) {
         throw_type_error("items()", "array");
     }
-    return array_;
+    return std::get<array_t>(value_);
 }
 
 const std::vector<std::pair<std::string, Json>> &Json::fields() const {
-    if (type_ != Type::Object) {
+    if (!is_object()) {
         throw_type_error("fields()", "object");
     }
-    return object_;
+    return std::get<object_t>(value_);
 }
 
 const Json *Json::find(std::string_view key) const {
-    if (type_ != Type::Object) {
+    if (!is_object()) {
         return nullptr;
     }
-    for (const auto &field : object_) {
+    for (const auto &field : std::get<object_t>(value_)) {
         if (field.first == key) {
             return &field.second;
         }
@@ -563,7 +565,7 @@ const Json *Json::find(std::string_view key) const {
 }
 
 const Json &Json::at(std::string_view key) const {
-    if (type_ != Type::Object) {
+    if (!is_object()) {
         throw_type_error("at(key)", "object");
     }
     const Json *found = find(key);
@@ -574,48 +576,48 @@ const Json &Json::at(std::string_view key) const {
 }
 
 const Json &Json::at(size_t index) const {
-    if (type_ != Type::Array) {
+    if (!is_array()) {
         throw_type_error("at(index)", "array");
     }
-    if (index >= array_.size()) {
+    const auto &array = std::get<array_t>(value_);
+    if (index >= array.size()) {
         throw JsonError("json: index out of range: " + std::to_string(index));
     }
-    return array_[index];
+    return array[index];
 }
 
 size_t Json::size() const {
-    switch (type_) {
+    switch (type()) {
     case Type::String:
         return 1;
     case Type::Array:
-        return array_.size();
+        return std::get<array_t>(value_).size();
     case Type::Object:
-        return object_.size();
+        return std::get<object_t>(value_).size();
     default:
         return 0;
     }
 }
 
 void Json::set(std::string key, Json value) {
-    if (type_ != Type::Object) {
-        object_.clear();
-        type_ = Type::Object;
+    if (!is_object()) {
+        value_.emplace<object_t>();
     }
-    for (auto &field : object_) {
+    auto &object = std::get<object_t>(value_);
+    for (auto &field : object) {
         if (field.first == key) {
             field.second = std::move(value);
             return;
         }
     }
-    object_.emplace_back(std::move(key), std::move(value));
+    object.emplace_back(std::move(key), std::move(value));
 }
 
 void Json::push_back(Json value) {
-    if (type_ != Type::Array) {
-        array_.clear();
-        type_ = Type::Array;
+    if (!is_array()) {
+        value_.emplace<array_t>();
     }
-    array_.push_back(std::move(value));
+    std::get<array_t>(value_).push_back(std::move(value));
 }
 
 std::string Json::dump(int indent) const {
@@ -625,26 +627,27 @@ std::string Json::dump(int indent) const {
 }
 
 void Json::dump_to(std::ostream &out, int indent, int depth) const {
-    switch (type_) {
+    switch (type()) {
     case Type::Null:
         out << "null";
         return;
     case Type::Bool:
-        out << (bool_ ? "true" : "false");
+        out << (std::get<bool>(value_) ? "true" : "false");
         return;
     case Type::Number:
-        write_number(out, number_);
+        write_number(out, std::get<double>(value_));
         return;
     case Type::String:
-        write_escaped(out, string_);
+        write_escaped(out, std::get<std::string>(value_));
         return;
-    case Type::Array:
-        if (array_.empty()) {
+    case Type::Array: {
+        const auto &array = std::get<array_t>(value_);
+        if (array.empty()) {
             out << "[]";
             return;
         }
         out.put('[');
-        for (size_t i = 0; i < array_.size(); ++i) {
+        for (size_t i = 0; i < array.size(); ++i) {
             if (i != 0) {
                 out.put(',');
             }
@@ -652,7 +655,7 @@ void Json::dump_to(std::ostream &out, int indent, int depth) const {
                 out.put('\n');
                 write_indent(out, indent, depth + 1);
             }
-            array_[i].dump_to(out, indent, depth + 1);
+            array[i].dump_to(out, indent, depth + 1);
         }
         if (indent > 0) {
             out.put('\n');
@@ -660,13 +663,15 @@ void Json::dump_to(std::ostream &out, int indent, int depth) const {
         }
         out.put(']');
         return;
-    case Type::Object:
-        if (object_.empty()) {
+    }
+    case Type::Object: {
+        const auto &object = std::get<object_t>(value_);
+        if (object.empty()) {
             out << "{}";
             return;
         }
         out.put('{');
-        for (size_t i = 0; i < object_.size(); ++i) {
+        for (size_t i = 0; i < object.size(); ++i) {
             if (i != 0) {
                 out.put(',');
             }
@@ -674,9 +679,9 @@ void Json::dump_to(std::ostream &out, int indent, int depth) const {
                 out.put('\n');
                 write_indent(out, indent, depth + 1);
             }
-            write_escaped(out, object_[i].first);
+            write_escaped(out, object[i].first);
             out << (indent > 0 ? ": " : ":");
-            object_[i].second.dump_to(out, indent, depth + 1);
+            object[i].second.dump_to(out, indent, depth + 1);
         }
         if (indent > 0) {
             out.put('\n');
@@ -684,6 +689,7 @@ void Json::dump_to(std::ostream &out, int indent, int depth) const {
         }
         out.put('}');
         return;
+    }
     }
 }
 
