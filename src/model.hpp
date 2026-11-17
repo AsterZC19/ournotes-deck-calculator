@@ -116,6 +116,9 @@ struct SkillEffect {
     int64_t value = 0;
     std::vector<int64_t> targets;
     int condition_group = 0;
+    int cumulative_type = 0;
+    int max_cumulative_count = 0;
+    std::vector<int64_t> cumulative_targets;
 };
 
 struct Skill {

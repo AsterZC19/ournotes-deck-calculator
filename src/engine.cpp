@@ -13,6 +13,7 @@
 #include <random>
 #include <string>
 #include <system_error>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -904,11 +905,9 @@ Rules::Rules(const Problem &problem, const CatalogIndex &index)
       unmapped_is_error_(problem.settings.leader_unmapped_effect_types == "error") {
     if (problem.settings.leader_effect_axes.empty()) {
 
-        leader_axes_ = {{1000, "all"},
-                        {1001, "technique"},
-                        {1002, "visual"},
-                        {1003, "performance"},
-                        {3000, "all"}};
+        leader_axes_ = {{1000, "all"},         {1001, "technique"},   {1002, "visual"},
+                        {1003, "performance"}, {1500, "all"},         {1501, "technique"},
+                        {1502, "visual"},      {1503, "performance"}, {3000, "all"}};
     }
     for (const auto &entry : problem.settings.leader_effect_axes) {
         const std::string &axis = entry.second;
@@ -918,6 +917,45 @@ Rules::Rules(const Problem &problem, const CatalogIndex &index)
                             quote(axis));
         }
         leader_axes_[entry.first] = axis;
+    }
+    if (problem_.settings.power.leader) {
+        std::unordered_set<int64_t> active_leader_skills;
+        for (const Member &member : problem_.catalog.members) {
+            if (member.leader_skill != 0)
+                active_leader_skills.insert(member.leader_skill);
+        }
+        for (const Skill &skill : problem_.catalog.leader_skills) {
+            if (active_leader_skills.find(skill.id) == active_leader_skills.end())
+                continue;
+            for (const SkillEffect &effect : skill.effects) {
+                if (effect.effect_type == 0 && leader_axes_.find(0) == leader_axes_.end())
+                    continue;
+                if (effect.cumulative_type != 0 ||
+                    (effect.effect_type >= 1500 && effect.effect_type <= 1503)) {
+                    formation_leader_conditions_ = true;
+                    break;
+                }
+                const auto group = index_.condition_group_by_group.find(effect.condition_group);
+                if (group == index_.condition_group_by_group.end())
+                    continue;
+                for (const auto &row : group->second->rows) {
+                    for (int64_t id : row) {
+                        const auto condition = index_.condition_by_id.find(id);
+                        if (condition != index_.condition_by_id.end() &&
+                            (condition->second->type == 3000 || condition->second->type == 3001)) {
+                            formation_leader_conditions_ = true;
+                            break;
+                        }
+                    }
+                    if (formation_leader_conditions_)
+                        break;
+                }
+                if (formation_leader_conditions_)
+                    break;
+            }
+            if (formation_leader_conditions_)
+                break;
+        }
     }
 }
 
@@ -991,22 +1029,7 @@ double Rules::live_boost(const Member &member) const {
 }
 
 bool Rules::formation_leader_conditions() const {
-    if (!problem_.settings.power.leader)
-        return false;
-    for (const auto &skill : problem_.catalog.leader_skills)
-        for (const auto &effect : skill.effects) {
-            auto group = index_.condition_group_by_group.find(effect.condition_group);
-            if (group == index_.condition_group_by_group.end())
-                continue;
-            for (const auto &row : group->second->rows)
-                for (auto id : row) {
-                    const auto condition = index_.condition_by_id.find(id);
-                    if (condition != index_.condition_by_id.end() &&
-                        (condition->second->type == 3000 || condition->second->type == 3001))
-                        return true;
-                }
-        }
-    return false;
+    return formation_leader_conditions_;
 }
 
 bool Rules::leader_condition_matches(int group_id, const Member &member,
@@ -1063,6 +1086,90 @@ bool Rules::leader_condition_matches(int group_id, const Member &member,
     return result;
 }
 
+int64_t Rules::cumulative_multiplier(const SkillEffect &effect, const Member &leader,
+                                     const std::vector<const Member *> *team) const {
+    if (effect.cumulative_type < 3000 || effect.cumulative_type > 3005) {
+        throw SpecError("队长技能累计条件类型未支持: " + std::to_string(effect.cumulative_type));
+    }
+    if (effect.cumulative_type == 3000 || effect.cumulative_type == 3001) {
+        for (int64_t target_id : effect.cumulative_targets) {
+            require_target(index_, target_id);
+        }
+    }
+    int64_t count = 0;
+    if (!team) {
+        count = problem_.settings.team_size;
+        if (effect.cumulative_type == 3001 || effect.cumulative_type == 3003) {
+            count = std::max<int64_t>(0, count - 1);
+        }
+    } else {
+        auto matches = [&](const Member &candidate) {
+            if (effect.cumulative_targets.empty()) {
+                return true;
+            }
+            for (int64_t target_id : effect.cumulative_targets) {
+                if (target_matches(require_target(index_, target_id), candidate)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        std::vector<int> seen;
+        switch (effect.cumulative_type) {
+        case 3000:
+            for (const Member *m : *team) {
+                if (matches(*m)) {
+                    ++count;
+                }
+            }
+            break;
+        case 3001:
+            for (const Member *m : *team) {
+                if (m->id != leader.id && matches(*m)) {
+                    ++count;
+                }
+            }
+            break;
+        case 3002:
+            for (const Member *m : *team) {
+                if (m->band == leader.band) {
+                    ++count;
+                }
+            }
+            break;
+        case 3003:
+            for (const Member *m : *team) {
+                if (m->band != leader.band &&
+                    std::find(seen.begin(), seen.end(), m->band) == seen.end()) {
+                    seen.push_back(m->band);
+                }
+            }
+            count = static_cast<int64_t>(seen.size());
+            break;
+        case 3004:
+            for (const Member *m : *team) {
+                if (std::find(seen.begin(), seen.end(), m->band) == seen.end()) {
+                    seen.push_back(m->band);
+                }
+            }
+            count = static_cast<int64_t>(seen.size());
+            break;
+        case 3005:
+            for (const Member *m : *team) {
+                if (std::find(seen.begin(), seen.end(), m->card_type) == seen.end()) {
+                    seen.push_back(m->card_type);
+                }
+            }
+            count = static_cast<int64_t>(seen.size());
+            break;
+        }
+    }
+    if (effect.max_cumulative_count > 0) {
+        count = std::min<int64_t>(count, effect.max_cumulative_count);
+    }
+    return count;
+}
+
 Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                               const std::vector<const Member *> *team) const {
     const uint64_t cache_key = pack_ids(leader.id, member.id);
@@ -1078,10 +1185,6 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                  skill, leader.leader_skill_level.value_or(leader_level_), std::nullopt)) {
             if (!leader_condition_matches(effect->condition_group, member, team))
                 continue;
-            const int64_t value =
-                !team && formation_leader_conditions() && effect->condition_group != 0
-                    ? std::max<int64_t>(0, effect->value)
-                    : effect->value;
             if (!effect->targets.empty()) {
                 bool any = false;
                 for (int64_t target_id : effect->targets) {
@@ -1110,6 +1213,14 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                 }
                 continue;
             }
+            const bool is_cumulative = effect->cumulative_type != 0 ||
+                                       (effect->effect_type >= 1500 && effect->effect_type <= 1503);
+            const int64_t mult = is_cumulative ? cumulative_multiplier(*effect, leader, team) : 1;
+            const int64_t raw_value = effect->value * mult;
+            const int64_t value = !team && formation_leader_conditions_ &&
+                                          (effect->condition_group != 0 || is_cumulative)
+                                      ? std::max<int64_t>(0, raw_value)
+                                      : raw_value;
             if (axis->second == "all") {
                 for (int d = 0; d < kDims; ++d) {
                     out[d] += value;

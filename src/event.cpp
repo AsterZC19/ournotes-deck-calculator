@@ -505,7 +505,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             double s_base = -1.0;
             double s_upper = stats.score_ceiling;
             int64_t f_power = power >= 0 ? static_cast<int64_t>(power) : -1;
-            if (f_power < 0) {
+            if (f_power < 0 || engine.rules().formation_leader_conditions()) {
                 EvalOptions po;
                 po.order_search = "given";
                 po.calculate_score = false;

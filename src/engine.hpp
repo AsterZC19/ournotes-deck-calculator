@@ -51,6 +51,9 @@ public:
     }
 
 private:
+    int64_t cumulative_multiplier(const SkillEffect &effect, const Member &leader,
+                                  const std::vector<const Member *> *team) const;
+
     const Problem &problem_;
     const CatalogIndex &index_;
     int live_level_;
@@ -62,6 +65,7 @@ private:
     std::string live_effect_branch_;
     std::map<int, std::string> leader_axes_;
     bool unmapped_is_error_;
+    bool formation_leader_conditions_ = false;
 
     mutable std::unordered_map<uint64_t, bool> target_cache_;
     mutable std::unordered_map<uint64_t, bool> group_cache_;

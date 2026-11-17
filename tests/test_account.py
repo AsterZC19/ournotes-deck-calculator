@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.account import AccountError, apply_account_catalog, formation_for_deck, validate_account
-from tools.compile_from_master import _load_chart_runtime
+from tools.compile_from_master import _load_chart_runtime, build_fix, compile_problem
 from test_search import fixture, run, expected
 
 
@@ -223,6 +223,359 @@ class AccountTests(unittest.TestCase):
             score = json.loads(scored.stdout)["results"][0]
         self.assertEqual(score["power"], best["power"])
         self.assertAlmostEqual(score["index"], best["index"], places=8)
+
+    def _minimal_master_tables(self, folder: Path, *, band2_max_level: int = 30) -> None:
+        rates = {"_performanceRate": 10000, "_technicRate": 10000, "_visualRate": 10000}
+        tables = {
+            "MasterCharacter": [
+                {
+                    "_id": i,
+                    "_bandID": 1 if i <= 4 else 2,
+                    "_nameTextID": f"c{i}",
+                    "_isNonPlayable": False,
+                }
+                for i in range(1, 6)
+            ]
+            + [{"_id": 1001, "_bandID": 2, "_nameTextID": "npc", "_isNonPlayable": True}],
+            "MasterCharacterRank": [{"_id": 1, "_rank": 50, "_exp": 0, "_bonus": 200}],
+            "MasterCharacterTotalRank": [
+                {"_id": 1, "_totalRank": 250, "_bonus": 90},
+                {"_id": 2, "_totalRank": 300, "_bonus": 95},
+            ],
+            "MasterVip": [{"_id": 1, "_vipRank": 1, "_point": 0}],
+            "MasterVipRankBonus": [{"_id": 1, "_vipRank": 1, "_vipBonusType": 7, "_value": 500}],
+            "MasterBandItem": [
+                {"_id": 101, "_bandId": 1},
+                {"_id": 201, "_bandId": 2},
+            ],
+            "MasterBandItemLevel": [
+                {"_id": 101030, "_bandItemId": 101, "_level": 30, "_playerRank": 1},
+                {"_id": 201030, "_bandItemId": 201, "_level": band2_max_level, "_playerRank": 1},
+            ],
+            "MasterBandItemSkillEffect": [
+                {
+                    "_id": 1,
+                    "_bandItemId": 101,
+                    "_level": 30,
+                    "_skillEffectType": 1000,
+                    "_effectValue": 300,
+                    "_skillTargetIDs": [3],
+                },
+                {
+                    "_id": 2,
+                    "_bandItemId": 101,
+                    "_level": 50,
+                    "_skillEffectType": 1000,
+                    "_effectValue": 500,
+                    "_skillTargetIDs": [3],
+                },
+                {
+                    "_id": 3,
+                    "_bandItemId": 201,
+                    "_level": 20,
+                    "_skillEffectType": 1000,
+                    "_effectValue": 200,
+                    "_skillTargetIDs": [4],
+                },
+                {
+                    "_id": 4,
+                    "_bandItemId": 201,
+                    "_level": 30,
+                    "_skillEffectType": 1000,
+                    "_effectValue": 300,
+                    "_skillTargetIDs": [4],
+                },
+                {
+                    "_id": 5,
+                    "_bandItemId": 201,
+                    "_level": 50,
+                    "_skillEffectType": 1000,
+                    "_effectValue": 500,
+                    "_skillTargetIDs": [4],
+                },
+            ],
+            "MasterMemberCard": [
+                {
+                    "_id": i,
+                    "_characterID": i if i <= 5 else 5,
+                    "_cardType": 1,
+                    "_rarity": 5,
+                    "_nameTextID": f"m{i}",
+                    "_performancePowerMax": 1000,
+                    "_technicPowerMax": 1000,
+                    "_visualPowerMax": 1000,
+                    "_memberCardLevelGroup": 1,
+                    "_memberCardRankGroup": 1,
+                    "_memberCardAwakeGroup": 1,
+                    "_liveSkillID": 1,
+                    "_leaderSkillID": 61 if i == 1 else 1,
+                    "_gekisouSkillID": 0,
+                    "_bestMusicTagIDs": [],
+                }
+                for i in range(1, 7)
+            ],
+            "MasterMemberCardLevel": [{"_id": 1, "_group": 1, "_level": 10, "_exp": 0, **rates}],
+            "MasterMemberCardRank": [
+                {
+                    "_id": 1,
+                    "_group": 1,
+                    "_rank": 1,
+                    "_liveSkillLevel": 5,
+                    "_leaderSkillLevel": 5,
+                    "_musicTypeBonusRate": 0,
+                    "_musicTagBonusRate": 0,
+                    **rates,
+                }
+            ],
+            "MasterMemberCardAwake": [{"_id": 1, "_group": 1, "_awakeCount": 1, **rates}],
+            "MasterSupportCard": [
+                {
+                    "_id": i,
+                    "_characterIDs": [1],
+                    "_cardType": 1,
+                    "_rarity": 5,
+                    "_nameTextID": f"s{i}",
+                    "_performancePowerMax": 500,
+                    "_technicPowerMax": 500,
+                    "_visualPowerMax": 500,
+                    "_supportCardLevelGroup": 1,
+                    "_supportCardRankGroup": 1,
+                    "_supportSkillId01": 1,
+                    "_supportSkillId02": 0,
+                }
+                for i in range(1, 6)
+            ],
+            "MasterSupportCardLevel": [{"_id": 1, "_group": 1, "_level": 10, "_exp": 0, **rates}],
+            "MasterSupportCardRank": [
+                {
+                    "_id": 1,
+                    "_group": 1,
+                    "_rank": 1,
+                    "_limitLevel": 10,
+                    "_supportSkill01Level": 5,
+                    "_supportSkill02Level": 1,
+                    "_cardTypeLinkBonusRate": 0,
+                }
+            ],
+            "MasterLiveSkill": [{"_id": 1, "_skillCategories": []}],
+            "MasterLiveSkillEffect": [
+                {
+                    "_id": 1,
+                    "_liveSkillID": 1,
+                    "_level": 5,
+                    "_skillEffectType": 2000,
+                    "_effectValue": 10000,
+                }
+            ],
+            "MasterLeaderSkill": [{"_id": 1}, {"_id": 61}, {"_id": 90123}],
+            "MasterLeaderSkillEffect": [
+                {
+                    "_id": 1,
+                    "_leaderSkillID": 1,
+                    "_level": 5,
+                    "_skillEffectType": 1000,
+                    "_effectValue": 3000,
+                    "_skillTargetIDs": [3],
+                    "_skillConditionGroup": 0,
+                    "_skillCumulativeConditionID": 0,
+                },
+                {
+                    "_id": 2,
+                    "_leaderSkillID": 61,
+                    "_level": 5,
+                    "_skillEffectType": 1001,
+                    "_effectValue": 10200,
+                    "_skillTargetIDs": [3],
+                    "_skillConditionGroup": 0,
+                    "_skillCumulativeConditionID": 0,
+                },
+                {
+                    "_id": 3,
+                    "_leaderSkillID": 61,
+                    "_level": 5,
+                    "_skillEffectType": 1501,
+                    "_effectValue": 2400,
+                    "_skillTargetIDs": [],
+                    "_skillConditionGroup": 415,
+                    "_skillCumulativeConditionID": 70,
+                },
+                {
+                    "_id": 4,
+                    "_leaderSkillID": 90123,
+                    "_level": 5,
+                    "_skillEffectType": 0,
+                    "_effectValue": 1800,
+                    "_skillTargetIDs": [],
+                    "_skillConditionGroup": 171,
+                    "_skillCumulativeConditionID": 12,
+                },
+            ],
+            "MasterSupportSkill": [{"_id": 1}],
+            "MasterSupportSkillEffect": [],
+            "MasterSkillTarget": [
+                {"_id": 3, "_bandID": 1},
+                {"_id": 4, "_bandID": 2},
+                {"_id": 9, "_bandID": 2},
+            ],
+            "MasterSkillCondition": [
+                {
+                    "_id": 315,
+                    "_conditionType": 3000,
+                    "_isPositive": True,
+                    "_conditionTargetIDs": [9],
+                },
+                {
+                    "_id": 101,
+                    "_conditionType": 1000,
+                    "_isPositive": True,
+                    "_conditionTargetIDs": [],
+                },
+            ],
+            "MasterSkillConditionSet": [
+                {"_id": 1, "_group": 415, "_conditionIds": [315]},
+                {"_id": 2, "_group": 171, "_conditionIds": [101]},
+            ],
+            "MasterSkillCumulativeCondition": [
+                {
+                    "_id": 70,
+                    "_skillCumulativeConditionType": 3000,
+                    "_maxCumulativeCount": 2,
+                    "_conditionTargetIDs": [9],
+                },
+                {
+                    "_id": 12,
+                    "_skillCumulativeConditionType": 1000,
+                    "_maxCumulativeCount": 5,
+                    "_conditionTargetIDs": [],
+                },
+            ],
+            "MasterLiveNoteParameter": [{"_id": 1, "_noteOperateType": 1, "_scorePercent": 100}],
+            "MasterLiveComboScoreBonus": [
+                {"_id": 1, "_comboBonusType": 0, "_requiredComboCount": 0, "_bonusFactor": 1.0}
+            ],
+            "MasterEventEffect": [],
+            "MasterLiveMusic": [
+                {
+                    "_id": 1,
+                    "_titleTextID": "song1",
+                    "_musicType": 1,
+                    "_expertID": 1,
+                    "_bandIDs": [1],
+                    "_tagIDs": [],
+                }
+            ],
+            "MasterLiveMusicScore": [
+                {
+                    "_id": 1,
+                    "_musicScoreTextFileName": "chart1",
+                    "_musicScoreLevel": 25,
+                    "_musicScoreDisplayLevel": 25.0,
+                    "_fullComboCount": 5,
+                }
+            ],
+            "MasterChallengeMusic": [],
+            "MasterGekisouSkill": [],
+            "MasterText": [
+                {"_id": k, "_text": k}
+                for k in (
+                    *(f"c{i}" for i in range(1, 6)),
+                    "npc",
+                    *(f"m{i}" for i in range(1, 7)),
+                    *(f"s{i}" for i in range(1, 6)),
+                    "song1",
+                )
+            ],
+        }
+        master = folder / "master"
+        charts = folder / "charts"
+        master.mkdir(parents=True, exist_ok=True)
+        charts.mkdir(parents=True, exist_ok=True)
+        for name, rows in tables.items():
+            (master / f"{name}.json").write_text(json.dumps(rows), encoding="utf-8")
+        (charts / "chart1.json").write_text(
+            json.dumps(
+                {
+                    "format": "nnnotes.live-score/1",
+                    "log": [],
+                    "judgementNoteCount": 5,
+                    "notes": [
+                        {"timeMs": i * 1000, "op": 1, "judgement": True} for i in range(1, 6)
+                    ],
+                    "skill": [{"index": i, "timeMs": (i + 1) * 1000} for i in range(5)],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_compile_from_master_ignores_non_playable_and_resolves_band_item_caps(self):
+        t = Tables()
+        t.data["MasterCharacter"].append({"_id": 1001, "_bandID": 2, "_isNonPlayable": True})
+        t.data["MasterCharacterTotalRank"].extend(
+            [{"_totalRank": 4, "_bonus": 20}, {"_totalRank": 6, "_bonus": 25}]
+        )
+        fix, ideal = build_fix(t)
+        self.assertEqual(ideal["character_count"], 2)
+        self.assertEqual(ideal["character_total_rank"], 4)
+        self.assertEqual(fix["character_total_rank_bonus"], [20, 20, 20])
+        self.assertEqual(fix["band_item_bonus_bp"], [2500, 2500, 2500])
+
+        a = account()
+        c = catalog()
+        apply_account_catalog(t, c, a)
+        self.assertEqual(c["fix"]["character_total_rank_bonus"], [10, 10, 10])
+        bad = account()
+        bad["characters"].append({"character_id": 1001, "exp": 0})
+        with self.assertRaises(AccountError):
+            apply_account_catalog(t, catalog(), bad)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._minimal_master_tables(root, band2_max_level=30)
+            p = compile_problem(root / "master", root / "charts", 0, "expert", 1)
+            self.assertEqual(p["catalog"]["fix"]["character_total_rank_bonus"], [90, 90, 90])
+            self.assertEqual(p["catalog"]["fix"]["band_item_bonus_bp"], [300, 300, 300])
+            self.assertEqual(p["meta"]["ideal"]["band_item_bp"], 300)
+
+            ls61 = next(s for s in p["catalog"]["leader_skills"] if s["id"] == 61)
+            self.assertEqual(ls61["effects"][1]["condition_group"], 415)
+            self.assertEqual(ls61["effects"][1]["cumulative_type"], 3000)
+            self.assertEqual(ls61["effects"][1]["max_cumulative_count"], 2)
+            self.assertEqual(ls61["effects"][1]["cumulative_targets"], [9])
+
+            pp = root / "problem.json"
+            pp.write_text(json.dumps(p), encoding="utf-8")
+            ranked = subprocess.run(
+                [
+                    str(ROOT / "build/deckcalc"),
+                    "rank",
+                    "-p",
+                    str(pp),
+                    "--method",
+                    "exact",
+                    "--objective",
+                    "score",
+                    "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            winner = json.loads(ranked.stdout)["results"][0]
+            self.assertEqual(winner["leader"], 1)
+            self.assertGreater(winner["power"], 0)
+
+            p_override = compile_problem(
+                root / "master", root / "charts", 0, "expert", 1, band_item_bp=2500
+            )
+            self.assertEqual(p_override["catalog"]["fix"]["band_item_bonus_bp"], [2500, 2500, 2500])
+
+            self._minimal_master_tables(root, band2_max_level=20)
+            p_asym = compile_problem(root / "master", root / "charts", 0, "expert", 1)
+            self.assertEqual(p_asym["catalog"]["fix"]["band_item_bonus_bp"], [0, 0, 0])
+            self.assertEqual(
+                p_asym["catalog"]["fix"]["band_item_bonus_bp_by_band"],
+                {"1": [300, 300, 300], "2": [200, 200, 200]},
+            )
 
 
 if __name__ == "__main__":

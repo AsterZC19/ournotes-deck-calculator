@@ -69,19 +69,31 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
         }
         for row in tables.get("MasterGekisouSkill", [])
     ]
+    cumul_by_id = {int(row["_id"]): row for row in tables.get("MasterSkillCumulativeCondition", [])}
+
+    def _leader_effect_dict(effect: Mapping[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "level": int(_field(effect, "_level", 0)),
+            "effect_type": int(_field(effect, "_skillEffectType", 0)),
+            "value": int(_field(effect, "_effectValue", 0)),
+            "targets": [int(t) for t in (_field(effect, "_skillTargetIDs", []) or [])],
+            "condition_group": int(_field(effect, "_skillConditionGroup", 0)),
+        }
+        cumul_id = int(_field(effect, "_skillCumulativeConditionID", 0))
+        if cumul_id != 0 and cumul_id in cumul_by_id:
+            cumul = cumul_by_id[cumul_id]
+            out["cumulative_type"] = int(_field(cumul, "_skillCumulativeConditionType", 0))
+            out["max_cumulative_count"] = int(_field(cumul, "_maxCumulativeCount", 0))
+            out["cumulative_targets"] = [
+                int(t) for t in (_field(cumul, "_conditionTargetIDs", []) or [])
+            ]
+        return out
+
     leader_skills = [
         {
             "id": int(row["_id"]),
             "categories": [],
-            "effects": [
-                {
-                    "level": int(_field(effect, "_level", 0)),
-                    "effect_type": int(_field(effect, "_skillEffectType", 0)),
-                    "value": int(_field(effect, "_effectValue", 0)),
-                    "targets": [int(t) for t in (_field(effect, "_skillTargetIDs", []) or [])],
-                }
-                for effect in leader_effects.get(int(row["_id"]), [])
-            ],
+            "effects": [_leader_effect_dict(e) for e in leader_effects.get(int(row["_id"]), [])],
         }
         for row in tables.get("MasterLeaderSkill", [])
     ]

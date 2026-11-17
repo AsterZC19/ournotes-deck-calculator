@@ -216,9 +216,384 @@ def main():
         assert exact["audit"]["mean_score_certified"]
         assert exact["audit"]["mean_score_bound_enabled"]
         assert abs(exact["results"][0]["ranking_score"] - oracle(small)["mean_score"]) < 1e-8
+    test_cumulative_leader_skills()
     print(
-        "Game-rule checks passed: five-slot legality, experimental isolation, formation conditions and independent mean-score oracles"
+        "Game-rule checks passed: five-slot legality, experimental isolation, formation conditions, cumulative leader skills and independent mean-score oracles"
     )
+
+
+def test_cumulative_leader_skills():
+    # Standard game mode allows official cumulative axes 1500..1503 while still rejecting 3000.
+    allowed = game_problem()
+    allowed.setdefault("settings", {})["leader_effect_axes"] = {
+        "1500": "all",
+        "1501": "technique",
+        "1502": "visual",
+        "1503": "performance",
+    }
+    res, _ = invoke(allowed, "validate")
+    assert res.returncode == 0, res.stderr
+
+    # Verify all cumulative_types (3000..3005), max_cumulative_count, condition_group, and unused NPC skill.
+    def make_cumul_problem(cumul_type, *, max_count=0, cond_group=0):
+        prob = game_problem()
+        prob["catalog"]["fix"] = {"band_item_bonus_bp": [1500, 1500, 1500]}
+        prob["catalog"]["targets"] = [
+            {"id": 1, "band": 1},
+            {"id": 2, "band": 2},
+            {"id": 3, "band": 3},
+        ]
+        prob["catalog"]["conditions"] = [{"id": 1, "type": 3000, "targets": [2, 3]}]
+        prob["catalog"]["condition_groups"] = [{"group": 415, "rows": [[1]]}]
+        # Assign distinct bands & card_types across 7 members
+        bands = [1, 1, 1, 2, 3, 2, 1]
+        types = [1, 2, 3, 4, 1, 2, 1]
+        for idx, m in enumerate(prob["catalog"]["members"]):
+            m["band"] = bands[idx]
+            m["card_type"] = types[idx]
+            m["character"] = idx + 1
+            m["trained"] = [1000 + idx * 10, 1200 + idx * 20, 900 + idx * 5]
+            m["leader_skill"] = 61 if m["id"] == 1 else 2
+        prob["catalog"]["leader_skills"] = [
+            {
+                "id": 61,
+                "effects": [
+                    {"level": 5, "effect_type": 1001, "value": 10200, "targets": [1]},
+                    {
+                        "level": 5,
+                        "effect_type": 1501,
+                        "value": 2400,
+                        "targets": [],
+                        "condition_group": cond_group,
+                        "cumulative_type": cumul_type,
+                        "max_cumulative_count": max_count,
+                        "cumulative_targets": [2, 3],
+                    },
+                ],
+            },
+            {
+                "id": 2,
+                "effects": [{"level": 5, "effect_type": 1000, "value": 8000, "targets": [1]}],
+            },
+            {
+                "id": 90123,
+                "effects": [
+                    {
+                        "level": 5,
+                        "effect_type": 0,
+                        "value": 1800,
+                        "condition_group": 415,
+                        "cumulative_type": 1000,
+                    }
+                ],
+            },
+        ]
+        return prob
+
+    def py_cumul_count(prob, leader_m, team_ms, eff):
+        ctype = eff["cumulative_type"]
+        targets_by_id = {t["id"]: t for t in prob["catalog"]["targets"]}
+
+        def match_tids(m, tids):
+            if not tids:
+                return True
+            for tid in tids:
+                t = targets_by_id[tid]
+                if t.get("band", 0) in (0, m["band"]) and t.get("card_type", 0) in (
+                    0,
+                    m["card_type"],
+                ):
+                    return True
+            return False
+
+        if ctype == 3000:
+            c = sum(1 for m in team_ms if match_tids(m, eff.get("cumulative_targets", [])))
+        elif ctype == 3001:
+            c = sum(
+                1
+                for m in team_ms
+                if m["id"] != leader_m["id"] and match_tids(m, eff.get("cumulative_targets", []))
+            )
+        elif ctype == 3002:
+            c = sum(1 for m in team_ms if m["band"] == leader_m["band"])
+        elif ctype == 3003:
+            c = len({m["band"] for m in team_ms if m["band"] != leader_m["band"]})
+        elif ctype == 3004:
+            c = len({m["band"] for m in team_ms})
+        elif ctype == 3005:
+            c = len({m["card_type"] for m in team_ms})
+        else:
+            raise ValueError(ctype)
+        cap = eff.get("max_cumulative_count", 0)
+        return min(c, cap) if cap > 0 else c
+
+    def py_power(prob, ids):
+        members = {m["id"]: m for m in prob["catalog"]["members"]}
+        snaps = {s["id"]: s for s in prob["catalog"]["snapshots"]}
+        targets = {t["id"]: t for t in prob["catalog"]["targets"]}
+        skills = {s["id"]: s for s in prob["catalog"]["leader_skills"]}
+        leader_m = members[ids[0]]
+        team_ms = [members[i] for i in ids]
+        ls = skills[leader_m["leader_skill"]]
+        total = 0
+        for idx, mid in enumerate(ids):
+            m = members[mid]
+            s = snaps[idx + 1]
+            # Condition check for 415 (any member matches target 2 or 3)
+            leader_rates = [0, 0, 0]
+            for eff in ls["effects"]:
+                if eff.get("condition_group", 0) == 415:
+                    if not any(tm["band"] in (2, 3) for tm in team_ms):
+                        continue
+                tids = eff.get("targets", [])
+                if tids and not any(targets[tid].get("band") == m["band"] for tid in tids):
+                    continue
+                val = eff["value"]
+                if eff["effect_type"] == 1501:
+                    val *= py_cumul_count(prob, leader_m, team_ms, eff)
+                if eff["effect_type"] in (1000, 1500):
+                    for d in range(3):
+                        leader_rates[d] += val
+                elif eff["effect_type"] in (1001, 1501):
+                    leader_rates[1] += val
+            slot_total = 0
+            for d in range(3):
+                base = m["trained"][d]
+                static_bp = 1500
+                snap_bp = s["trained"][d]
+                type_bp = (
+                    500
+                    if m.get("card_type", 0) != 0 and m.get("card_type", 0) == s.get("card_type", 0)
+                    else 0
+                )
+                common = (
+                    base
+                    + math.floor(f32(base) * f32(static_bp) / f32(10000))
+                    + math.floor(f32(base) * f32(leader_rates[d]) / f32(10000))
+                )
+                slot_total += (
+                    common
+                    + math.floor(f32(common) * f32(snap_bp) / f32(10000))
+                    + math.floor(f32(common) * f32(type_bp) / f32(10000))
+                )
+            total += slot_total
+        return total
+
+    # Check exact power evaluation for all 6 cumulative types (3000..3005) and caps
+    test_ids = (1, 2, 3, 4, 5)
+    for ctype, max_c, cond in (
+        (3000, 0, 0),
+        (3000, 2, 415),
+        (3001, 0, 0),
+        (3002, 0, 0),
+        (3003, 0, 0),
+        (3004, 2, 0),
+        (3005, 0, 0),
+    ):
+        cp = make_cumul_problem(ctype, max_count=max_c, cond_group=cond)
+        f = {
+            "schema": "ournotes-deck-formation@1",
+            "leader": test_ids[0],
+            "slots": [
+                {"member": mid, "snapshot": i + 1, "trigger": i + 1}
+                for i, mid in enumerate(test_ids)
+            ],
+        }
+        res, out = invoke(cp, "score", formation=f)
+        assert res.returncode == 0, (ctype, res.stderr)
+        assert out["results"][0]["power"] == py_power(cp, test_ids), (
+            ctype,
+            out["results"][0]["power"],
+            py_power(cp, test_ids),
+        )
+
+    # Test rank --method exact on mixed 1001 + 1501 (LS 61) vs independent Python power & score oracle.
+    rp = make_cumul_problem(3000, max_count=2, cond_group=415)
+    rp["catalog"]["members"] = rp["catalog"]["members"][:6]
+    rp["catalog"]["snapshots"] = rp["catalog"]["snapshots"][:5]
+    # Give snapshot 1 distinct durations/boosts only via live skills while making bands 2 & 3 trade off.
+    rp["catalog"]["members"][3]["trained"] = [950, 1100, 950]
+    rp["catalog"]["members"][4]["trained"] = [900, 1050, 900]
+    res, exact = invoke(
+        rp,
+        "rank",
+        flags=(
+            "--top",
+            "3",
+            "--method",
+            "exact",
+            "--objective",
+            "theoretical_score",
+            "--time-limit",
+            "0",
+        ),
+    )
+    assert res.returncode == 0 and exact["audit"]["theoretical_max_certified"], exact
+
+    # Check every candidate 5-member subset & leader in Python using exact `py_power` (and compare against `score`).
+    best_th = -1
+    all_m = [m["id"] for m in rp["catalog"]["members"]]
+    for group in itertools.combinations(all_m, 5):
+        for leader_id in group:
+            others = [x for x in group if x != leader_id]
+            ordered = (leader_id, *others)
+            f = {
+                "schema": "ournotes-deck-formation@1",
+                "leader": leader_id,
+                "slots": [
+                    {"member": mid, "snapshot": i + 1, "trigger": i + 1}
+                    for i, mid in enumerate(ordered)
+                ],
+            }
+            _, sc = invoke(rp, "score", formation=f, flags=("--order-search", "given"))
+            slot_res = sc["results"][0]
+            assert slot_res["power"] == py_power(rp, ordered)
+            best_th = max(best_th, slot_res["estimated_score"]["total"])
+    # Exact rank (which also searches over all snapshot permutations) must be >= this canonical assignment
+    assert exact["results"][0]["ranking_score"] >= best_th
+    best_f = {
+        "schema": "ournotes-deck-formation@1",
+        "leader": exact["results"][0]["leader"],
+        "slots": [
+            {"member": s["member"], "snapshot": s["snapshot"], "trigger": s["trigger"]}
+            for s in exact["results"][0]["assignments"]
+        ],
+    }
+    res, scored = invoke(rp, "score", formation=best_f, flags=("--order-search", "given"))
+    assert res.returncode == 0
+    assert scored["results"][0]["estimated_score"]["total"] == exact["results"][0]["ranking_score"]
+    assert any(
+        next(m for m in rp["catalog"]["members"] if m["id"] == mid)["band"] in (2, 3)
+        for mid in exact["results"][0]["members"]
+    )
+    assert exact["results"][0]["power"] == py_power(
+        rp,
+        tuple(
+            s["member"]
+            for s in sorted(exact["results"][0]["assignments"], key=lambda s: s["snapshot"])
+        ),
+    )
+
+    # Test event --objective mean when formation_leader_conditions() is True (ensures event.cpp uses actual power, not power_matrix upper bound).
+    evp = make_cumul_problem(3000, max_count=2, cond_group=415)
+    evp["catalog"]["members"] = [m for m in evp["catalog"]["members"] if m["id"] in (1, 2, 3, 4, 5)]
+    evp["catalog"]["members"][4]["band"] = 1
+    evp["catalog"]["snapshots"] = evp["catalog"]["snapshots"][:5]
+    for s in evp["catalog"]["snapshots"]:
+        s["trained"] = [0, 0, 0]
+        s["card_type"] = 1
+        s["event_bonus_bp"] = 0
+        s["event_pt_bonus_bp"] = 0
+        s["event_drop_bonus_bp"] = 0
+    evp["catalog"]["live_skills"] = [
+        {"id": 1, "categories": [], "effects": [{"level": 5, "effect_type": 2000, "value": 0}]}
+    ]
+    for m in evp["catalog"]["members"]:
+        m["live_skill"] = 1
+        m["character"] = m["id"]
+        m["card_type"] = 1
+        m["trained"] = [1000, 1000, 1000]
+        m["event_bonus_bp"] = 0
+        m["event_pt_bonus_bp"] = 5000 if m["id"] in (2, 3, 5) else 0
+        m["event_drop_bonus_bp"] = 0
+    # Compute exact score with leader=1 and band-2 member #4 present vs absent:
+    res_with, s_with = invoke(
+        evp,
+        "score",
+        formation={
+            "schema": "ournotes-deck-formation@1",
+            "leader": 1,
+            "slots": [
+                {"member": mid, "snapshot": i + 1, "trigger": i + 1}
+                for i, mid in enumerate((1, 2, 3, 4, 5))
+            ],
+        },
+    )
+    assert res_with.returncode == 0, res_with.stderr
+    # Put S-rank threshold equal to s_with total: any formation missing #4 fails S-rank even if its upper-bound power >= S-rank!
+    s_score = s_with["results"][0]["estimated_score"]["total"]
+    # Wait: if evp only has 5 members, add a 6th pure band-1 member with higher pt bonus so skipping #4 strictly wins if rank were wrongly tied!
+    evp["catalog"]["members"].append(
+        {
+            "id": 8,
+            "character": 8,
+            "band": 1,
+            "card_type": 1,
+            "trained": [1000, 1000, 1000],
+            "live_skill": 1,
+            "leader_skill": 2,
+            "event_bonus_bp": 0,
+            "event_pt_bonus_bp": 5000,
+            "event_drop_bonus_bp": 0,
+        }
+    )
+    evp["event"] = {
+        "id": 1,
+        "score_ranks": [
+            {"rank": 2, "required_score": 0},
+            {"rank": 7, "required_score": s_score},
+        ],
+        "assumptions": {
+            "score_rank_mode": "estimated_score",
+            "cp_bonus_source": "pt",
+            "minimum_index": 0,
+            "score_rank": 7,
+            "normal_boost_cost": 1,
+            "challenge_cp_cost": 100,
+            "shop_resource_id": 43,
+        },
+        "normal_boosts": [{"cost": 1, "pt_rate": 1, "reward_rate": 1}],
+        "challenge_boosts": [{"cost": 100, "pt_rate": 1, "reward_rate": 1}],
+        "normal": {
+            "pt": [{"rank": 2, "value": 100}, {"rank": 7, "value": 1000}],
+            "rewards": [
+                {
+                    "rank": 2,
+                    "count": 10,
+                    "resource_type": 1,
+                    "resource_id": 43,
+                    "probability_bp": 10000,
+                },
+                {
+                    "rank": 7,
+                    "count": 100,
+                    "resource_type": 1,
+                    "resource_id": 43,
+                    "probability_bp": 10000,
+                },
+            ],
+            "cp": [{"rank": 2, "value": 0}, {"rank": 7, "value": 0}],
+        },
+        "challenge": {
+            "pt": [{"rank": 2, "value": 100}, {"rank": 7, "value": 1000}],
+            "rewards": [
+                {
+                    "rank": 2,
+                    "count": 10,
+                    "resource_type": 1,
+                    "resource_id": 43,
+                    "probability_bp": 10000,
+                },
+                {
+                    "rank": 7,
+                    "count": 100,
+                    "resource_type": 1,
+                    "resource_id": 43,
+                    "probability_bp": 10000,
+                },
+            ],
+        },
+    }
+    res_ev, out_ev = invoke(
+        evp, "event", flags=("--objective", "mean", "--method", "exact", "--time-limit", "0")
+    )
+    assert res_ev.returncode == 0, res_ev.stderr
+    assert out_ev["optimality_certified"], out_ev
+    # Teams missing #4 only hit rank 2 (pt 300) while keeping #4 hits rank 7 (pt 2500) -> rank 7 must win!
+    top_normal = out_ev["normal_frontier"][0]
+    assert len(out_ev["normal_frontier"]) == 1, out_ev["normal_frontier"]
+    assert top_normal["yield"]["pt"] == 2500, top_normal
+    assert 4 in top_normal["members"], top_normal
 
 
 if __name__ == "__main__":

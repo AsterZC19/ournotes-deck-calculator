@@ -296,6 +296,10 @@ const Json &settings_defaults() {
         axes.set("1001", Json("technique"));
         axes.set("1002", Json("visual"));
         axes.set("1003", Json("performance"));
+        axes.set("1500", Json("all"));
+        axes.set("1501", Json("technique"));
+        axes.set("1502", Json("visual"));
+        axes.set("1503", Json("performance"));
 
         Json select = Json::object();
         select.set("effect_type", Json(nullptr));
@@ -893,6 +897,15 @@ SkillEffect parse_skill_effect(const Json &data, const Path &path) {
     effect.targets = int_array_or_empty<int64_t>(object, "targets", child(path, "targets"));
     effect.condition_group =
         static_cast<int>(int_default(object, "condition_group", 0, child(path, "condition_group")));
+    effect.cumulative_type =
+        static_cast<int>(int_default(object, "cumulative_type", 0, child(path, "cumulative_type")));
+    effect.max_cumulative_count = static_cast<int>(
+        int_default(object, "max_cumulative_count", 0, child(path, "max_cumulative_count")));
+    if (effect.max_cumulative_count < 0) {
+        fail(child(path, "max_cumulative_count"), "max_cumulative_count 不能为负数");
+    }
+    effect.cumulative_targets = int_array_or_empty<int64_t>(object, "cumulative_targets",
+                                                            child(path, "cumulative_targets"));
     return effect;
 }
 
@@ -1345,7 +1358,8 @@ void Problem::validate() const {
                 if (level > 5)
                     fail("catalog.snapshots", "支援技能等级必须在 1..5");
         const std::map<int, std::string> axes{
-            {1000, "all"}, {1001, "technique"}, {1002, "visual"}, {1003, "performance"}};
+            {1000, "all"}, {1001, "technique"}, {1002, "visual"}, {1003, "performance"},
+            {1500, "all"}, {1501, "technique"}, {1502, "visual"}, {1503, "performance"}};
         for (const auto &[type, axis] : settings.leader_effect_axes)
             if (!axes.count(type) || axes.at(type) != axis)
                 fail("settings.leader_effect_axes", "自定义队长效果映射只允许 experimental 模式");
@@ -1461,6 +1475,12 @@ void Problem::validate() const {
                 if (targets.find(target_id) == targets.end()) {
                     fail("catalog.targets", "技能 " + std::to_string(skill->id) +
                                                 " 引用了未知目标 " + std::to_string(target_id));
+                }
+            }
+            for (int64_t target_id : effect.cumulative_targets) {
+                if (targets.find(target_id) == targets.end()) {
+                    fail("catalog.targets", "技能 " + std::to_string(skill->id) +
+                                                " 引用了未知累计目标 " + std::to_string(target_id));
                 }
             }
         }

@@ -196,7 +196,10 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
         snapshots.append(card)
     catalog["members"], catalog["snapshots"] = members, snapshots
     fix = catalog["fix"]
-    characters = {row["_id"] for row in tables.table("MasterCharacter")}
+    playable_characters = [
+        row for row in tables.table("MasterCharacter") if not bool(row.get("_isNonPlayable", False))
+    ]
+    characters = {row["_id"] for row in playable_characters}
     state_characters = {row["character_id"]: row["exp"] for row in account["characters"]}
     if set(state_characters) - characters:
         raise AccountError("账号角色不在当前 Master 中，请更新 Master")
@@ -227,7 +230,9 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
     if len(vip_bonus) > 1:
         raise AccountError("VIP 力量加成存在重复档位")
     fix["vip_bonus_bp"] = [vip_bonus[0] if vip_bonus else 0] * 3
-    bands = {row["_bandID"] for row in tables.table("MasterCharacter")}
+    bands = {row["_bandID"] for row in playable_characters} or {
+        row["_bandID"] for row in tables.table("MasterCharacter")
+    }
     band_bonus = {str(band): [0] * 3 for band in bands}
     items = {row["_id"]: row for row in tables.table("MasterBandItem")}
     targets = {row["_id"]: row for row in tables.table("MasterSkillTarget")}

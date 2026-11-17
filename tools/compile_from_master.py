@@ -519,11 +519,108 @@ def build_snapshots(
     return snapshots
 
 
-def build_fix(tables: MasterTables, band_item_bp: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def _optional_table(tables: Any, name: str) -> list[dict[str, Any]] | None:
+    if hasattr(tables, "path_for") and not tables.path_for(name).is_file():
+        return None
+    try:
+        return tables.table(name)
+    except (KeyError, FileNotFoundError):
+        return None
+
+
+def _playable_characters(tables: Any) -> list[Mapping[str, Any]]:
+    rows = [
+        row for row in tables.table("MasterCharacter") if not bool(row.get("_isNonPlayable", False))
+    ]
+    if not rows:
+        raise CompileError("MasterCharacter 没有可用角色")
+    return rows
+
+
+def _row_band_item_id(row: Mapping[str, Any]) -> int:
+    value = row.get("_bandItemId")
+    if value is None:
+        value = row.get("_bandItemID")
+    return _int(value)
+
+
+def _row_band_id(row: Mapping[str, Any]) -> int:
+    value = row.get("_bandId")
+    if value is None:
+        value = row.get("_bandID")
+    return _int(value)
+
+
+def _ideal_band_item_bonuses(
+    tables: Any, playable_characters: Sequence[Mapping[str, Any]]
+) -> dict[int, int] | None:
+    band_items = _optional_table(tables, "MasterBandItem")
+    item_levels = _optional_table(tables, "MasterBandItemLevel")
+    item_effects = _optional_table(tables, "MasterBandItemSkillEffect")
+    skill_targets = _optional_table(tables, "MasterSkillTarget")
+    if band_items is None or item_levels is None or item_effects is None or skill_targets is None:
+        return None
+
+    bands = {_row_band_id(row) for row in playable_characters if _row_band_id(row) > 0}
+    for row in band_items:
+        band = _row_band_id(row)
+        if band > 0:
+            bands.add(band)
+    if not bands:
+        return None
+
+    max_level_by_item: dict[int, int] = {}
+    for row in item_levels:
+        item_id = _row_band_item_id(row)
+        level = _int(row.get("_level"))
+        if item_id > 0 and level > max_level_by_item.get(item_id, 0):
+            max_level_by_item[item_id] = level
+
+    targets = _index(skill_targets)
+    by_band = {band: 0 for band in sorted(bands)}
+    for effect in item_effects:
+        item_id = _row_band_item_id(effect)
+        max_level = max_level_by_item.get(item_id, 0)
+        if max_level <= 0 or _int(effect.get("_level")) != max_level:
+            continue
+        if _int(effect.get("_skillEffectType")) != 1000:
+            raise CompileError(f"不支持的乐队道具效果类型: {effect.get('_skillEffectType')!r}")
+        effect_bands: set[int] = set()
+        for target_id in _int_list(effect.get("_skillTargetIDs")):
+            target = targets.get(target_id)
+            band = _row_band_id(target) if target is not None else 0
+            if (
+                target is None
+                or band not in by_band
+                or any(
+                    _int(target.get(key)) != 0
+                    for key in (
+                        "_characterID",
+                        "_cardType",
+                        "_tagID",
+                        "_liveMusicType",
+                        "_gekisouMissionType",
+                    )
+                )
+                or target.get("_liveSkillCategories")
+                or target.get("_gekisouSkillCategories")
+            ):
+                raise CompileError(f"乐队道具 {item_id} 目标 {target_id} 不是纯乐队目标")
+            effect_bands.add(band)
+        value = _int(effect.get("_effectValue"))
+        for band in effect_bands:
+            by_band[band] += value
+    return by_band
+
+
+def build_fix(
+    tables: MasterTables, band_item_bp: int | None = None
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """静态加成 + 供 --ideal-* 默认值使用的「表内最大值」信息。"""
     character_rank_rows = tables.table("MasterCharacterRank")
     max_rank_row = _max_row(character_rank_rows, "_rank")
-    character_count = len(tables.table("MasterCharacter"))
+    playable_characters = _playable_characters(tables)
+    character_count = len(playable_characters)
     total_rank = character_count * _int(max_rank_row["_rank"])
     total_rows = [
         r for r in tables.table("MasterCharacterTotalRank") if _int(r["_totalRank"]) <= total_rank
@@ -536,29 +633,47 @@ def build_fix(tables: MasterTables, band_item_bp: int) -> tuple[dict[str, Any], 
         raise CompileError("MasterVipRankBonus 没有 _vipBonusType == 7 的行")
     vip_bonus = max(_int(r["_value"]) for r in vip_rows)
 
-    fix = {
+    fix: dict[str, Any] = {
         "character_rank_bonus": [_int(max_rank_row["_bonus"])] * 3,
         "character_total_rank_bonus": [_int(total_bonus_row["_bonus"])] * 3,
-        "band_item_bonus_bp": [int(band_item_bp)] * 3,
         "vip_bonus_bp": [vip_bonus] * 3,
         "type_link_base_bp": 500,
         "music_type_base_bp": 500,
         "music_tag_base_bp": 500,
     }
-    ideal = {
+    ideal: dict[str, Any] = {
         "character_rank": _int(max_rank_row["_rank"]),
         "character_total_rank": total_rank,
         "character_total_bonus": _int(total_bonus_row["_bonus"]),
         "vip_bonus_bp": vip_bonus,
         "character_count": character_count,
     }
+
+    if band_item_bp is not None:
+        fix["band_item_bonus_bp"] = [int(band_item_bp)] * 3
+        ideal["band_item_bp"] = int(band_item_bp)
+    else:
+        by_band = _ideal_band_item_bonuses(tables, playable_characters)
+        if by_band is None:
+            fix["band_item_bonus_bp"] = [2500] * 3
+            ideal["band_item_bp"] = 2500
+        elif len(set(by_band.values())) == 1:
+            uniform_bp = next(iter(by_band.values()))
+            fix["band_item_bonus_bp"] = [uniform_bp] * 3
+            ideal["band_item_bp"] = uniform_bp
+        else:
+            fix["band_item_bonus_bp"] = [0] * 3
+            fix["band_item_bonus_bp_by_band"] = {
+                str(band): [value] * 3 for band, value in sorted(by_band.items())
+            }
+            ideal["band_item_bp_by_band"] = {str(k): v for k, v in sorted(by_band.items())}
     return fix, ideal
 
 
 def build_catalog(
     tables: MasterTables,
-    band_item_bp: int,
-    event_id: int,
+    band_item_bp: int | None = None,
+    event_id: int = 0,
     ideal_level: int | None = None,
     ideal_rank: int | None = None,
     ideal_awake: int | None = None,
@@ -618,19 +733,32 @@ def build_catalog(
         }
         for row in tables.table("MasterGekisouSkill")
     ]
+    cumulative_rows = _optional_table(tables, "MasterSkillCumulativeCondition")
+    cumulative_by_id = _index(cumulative_rows) if cumulative_rows is not None else {}
+
+    def _leader_effect_dict(effect: Mapping[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "level": _int(effect.get("_level")),
+            "effect_type": _int(effect.get("_skillEffectType")),
+            "value": _int(effect.get("_effectValue")),
+            "targets": _int_list(effect.get("_skillTargetIDs")),
+            "condition_group": _int(effect.get("_skillConditionGroup")),
+        }
+        cumul_id = _int(effect.get("_skillCumulativeConditionID"))
+        if cumul_id != 0:
+            cumul = cumulative_by_id.get(cumul_id)
+            if cumul is None:
+                raise CompileError(f"MasterSkillCumulativeCondition 缺少 _id == {cumul_id}")
+            out["cumulative_type"] = _int(cumul.get("_skillCumulativeConditionType"))
+            out["max_cumulative_count"] = _int(cumul.get("_maxCumulativeCount"))
+            out["cumulative_targets"] = _int_list(cumul.get("_conditionTargetIDs"))
+        return out
+
     leader_skills = [
         {
             "id": _int(row["_id"]),
             "categories": [],
-            "effects": [
-                {
-                    "level": _int(e.get("_level")),
-                    "effect_type": _int(e.get("_skillEffectType")),
-                    "value": _int(e.get("_effectValue")),
-                    "targets": _int_list(e.get("_skillTargetIDs")),
-                }
-                for e in leader_effects.get(_int(row["_id"]), [])
-            ],
+            "effects": [_leader_effect_dict(e) for e in leader_effects.get(_int(row["_id"]), [])],
         }
         for row in tables.table("MasterLeaderSkill")
     ]
@@ -946,7 +1074,7 @@ def compile_problem(
     ideal_level: int | None = None,
     ideal_rank: int | None = None,
     ideal_awake: int | None = None,
-    band_item_bp: int = 2500,
+    band_item_bp: int | None = None,
     validate: bool = True,
     generated_at: str | None = None,
     song_context: str = "auto",
@@ -1171,7 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--band-item-bp",
         type=int,
         default=None,
-        help="乐队道具加成 bp（默认 2500 = 5 件 Lv50 合计 +25%%）",
+        help="乐队道具加成 bp（默认按 MasterBandItemLevel 最大等级自动推导，缺表时回退 2500）",
     )
     parser.add_argument(
         "--no-validate",
@@ -1227,7 +1355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ideal_level=args.ideal_level,
                 ideal_rank=args.ideal_rank,
                 ideal_awake=args.ideal_awake,
-                band_item_bp=2500 if args.band_item_bp is None else args.band_item_bp,
+                band_item_bp=args.band_item_bp,
                 account=account,
                 validate=not args.no_validate,
                 generated_at=generated_at,
