@@ -14,5 +14,8 @@ uv.lock
 # Private account exports
 /imports/
 
-# Local AI workflow handoff
+# Local AI workflow handoff & helper scripts
 /LOCAL_DECK_WORKFLOW.md
+/tools/inspect_workspace.py
+/tools/deck_pipeline.py
+/tests/test_workflow_tools.py
