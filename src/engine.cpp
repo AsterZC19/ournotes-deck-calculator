@@ -928,10 +928,9 @@ Rules::Rules(const Problem &problem, const CatalogIndex &index)
             if (active_leader_skills.find(skill.id) == active_leader_skills.end())
                 continue;
             for (const SkillEffect &effect : skill.effects) {
-                if (effect.effect_type == 0 && leader_axes_.find(0) == leader_axes_.end())
+                if (leader_axes_.find(effect.effect_type) == leader_axes_.end())
                     continue;
-                if (effect.cumulative_type != 0 ||
-                    (effect.effect_type >= 1500 && effect.effect_type <= 1503)) {
+                if (effect.cumulative_type != 0) {
                     formation_leader_conditions_ = true;
                     break;
                 }
@@ -1172,10 +1171,13 @@ int64_t Rules::cumulative_multiplier(const SkillEffect &effect, const Member &le
 
 Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                               const std::vector<const Member *> *team) const {
-    const uint64_t cache_key = pack_ids(leader.id, member.id);
-    const auto cached = leader_cache_.find(cache_key);
-    if (!team && cached != leader_cache_.end()) {
-        return cached->second;
+    uint64_t cache_key = 0;
+    if (!team) {
+        cache_key = pack_ids(leader.id, member.id);
+        const auto cached = leader_cache_.find(cache_key);
+        if (cached != leader_cache_.end()) {
+            return cached->second;
+        }
     }
     Triple out{0, 0, 0};
     const auto found = index_.leader_skill_by_id.find(leader.leader_skill);
@@ -1213,8 +1215,7 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                 }
                 continue;
             }
-            const bool is_cumulative = effect->cumulative_type != 0 ||
-                                       (effect->effect_type >= 1500 && effect->effect_type <= 1503);
+            const bool is_cumulative = effect->cumulative_type != 0;
             const int64_t mult = is_cumulative ? cumulative_multiplier(*effect, leader, team) : 1;
             const int64_t raw_value = effect->value * mult;
             const int64_t value = !team && formation_leader_conditions_ &&

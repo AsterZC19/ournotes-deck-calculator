@@ -326,10 +326,26 @@ Solution make_solution(const Game &game, const std::vector<int> &pairs, bool wit
         return solution;
     std::vector<int> triggers;
     const double gain = assign_triggers(shared, pairs, triggers);
+    const bool exact_team_power =
+        !with_evaluation && shared.engine->rules().formation_leader_conditions();
+    std::vector<const Member *> team;
+    if (exact_team_power) {
+        team.reserve(pairs.size());
+        for (int pair : pairs) {
+            const Pair &item = shared.pairs[static_cast<size_t>(pair)];
+            team.push_back(shared.members[static_cast<size_t>(item.member)]);
+        }
+    }
     int64_t power_sum = 0;
     for (size_t i = 0; i < pairs.size(); ++i) {
         const int pair = pairs[i];
-        const int64_t slot = game.slot_power(pair);
+        const int64_t slot =
+            exact_team_power
+                ? shared.engine->slot_power(
+                      static_cast<size_t>(game.leader_member),
+                      static_cast<size_t>(shared.pairs[static_cast<size_t>(pair)].member),
+                      static_cast<size_t>(shared.pairs[static_cast<size_t>(pair)].snap), &team)
+                : game.slot_power(pair);
         power_sum += slot;
         solution.picks.push_back(
             Pick{pair, triggers[i], slot,

@@ -11,7 +11,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.account import AccountError, apply_account_catalog, formation_for_deck, validate_account
-from tools.compile_from_master import _load_chart_runtime, build_fix, compile_problem
+from tools.compile_from_inputs import build_catalog as build_inputs_catalog
+from tools.compile_from_master import (
+    CompileError,
+    _load_chart_runtime,
+    build_fix,
+    compile_problem,
+)
 from test_search import fixture, run, expected
 
 
@@ -575,6 +581,39 @@ class AccountTests(unittest.TestCase):
             self.assertEqual(
                 p_asym["catalog"]["fix"]["band_item_bonus_bp_by_band"],
                 {"1": [300, 300, 300], "2": [200, 200, 200]},
+            )
+
+            # Empty band item targets must fail instead of silently producing zero.
+            t_empty = Tables()
+            t_empty.data["MasterBandItemLevel"] = [{"_bandItemId": 101, "_level": 2}]
+            t_empty.data["MasterBandItemSkillEffect"][0]["_skillTargetIDs"] = []
+            with self.assertRaises(CompileError):
+                build_fix(t_empty)
+
+        # compile_from_inputs must also reject unknown cumulative condition IDs.
+        with self.assertRaises(ValueError):
+            build_inputs_catalog(
+                {
+                    "tables": {
+                        "MasterLeaderSkill": [{"_id": 61}],
+                        "MasterLeaderSkillEffect": [
+                            {
+                                "_leaderSkillID": 61,
+                                "_level": 5,
+                                "_skillEffectType": 1501,
+                                "_effectValue": 2400,
+                                "_skillCumulativeConditionID": 999,
+                            }
+                        ],
+                    },
+                    "ideal": {
+                        "character_rank": {"_bonus": 0},
+                        "character_total_bonus": {"_bonus": 0},
+                        "vip_power_bonus_bp": 0,
+                    },
+                    "members": [],
+                    "snaps": [],
+                }
             )
 
 

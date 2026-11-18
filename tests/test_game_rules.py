@@ -349,13 +349,17 @@ def test_cumulative_leader_skills():
                 if tids and not any(targets[tid].get("band") == m["band"] for tid in tids):
                     continue
                 val = eff["value"]
-                if eff["effect_type"] == 1501:
+                if eff.get("cumulative_type", 0) != 0:
                     val *= py_cumul_count(prob, leader_m, team_ms, eff)
                 if eff["effect_type"] in (1000, 1500):
                     for d in range(3):
                         leader_rates[d] += val
                 elif eff["effect_type"] in (1001, 1501):
                     leader_rates[1] += val
+                elif eff["effect_type"] in (1002, 1502):
+                    leader_rates[2] += val
+                elif eff["effect_type"] in (1003, 1503):
+                    leader_rates[0] += val
             slot_total = 0
             for d in range(3):
                 base = m["trained"][d]
@@ -594,6 +598,99 @@ def test_cumulative_leader_skills():
     assert len(out_ev["normal_frontier"]) == 1, out_ev["normal_frontier"]
     assert top_normal["yield"]["pt"] == 2500, top_normal
     assert 4 in top_normal["members"], top_normal
+
+    # Flat 1500..1503 leader skill without cumulative condition (cumulative_type == 0, e.g. LS 90088) uses 1x multiplier.
+    flat1503 = game_problem()
+    flat1503["catalog"]["fix"] = {"band_item_bonus_bp": [1500, 1500, 1500]}
+    flat1503["catalog"]["targets"] = [{"id": 1, "band": 1}]
+    flat1503["catalog"]["members"][0]["leader_skill"] = 90088
+    flat1503["catalog"]["leader_skills"] = [
+        {
+            "id": 90088,
+            "effects": [{"level": 5, "effect_type": 1503, "value": 8000, "targets": [1]}],
+        }
+    ]
+    for m in flat1503["catalog"]["members"]:
+        m["band"] = 1
+        m["card_type"] = 1
+        m["trained"] = [1000, 1000, 1000]
+        if m["id"] != 1:
+            m["leader_skill"] = 90088
+    for s in flat1503["catalog"]["snapshots"]:
+        s["trained"] = [1000, 1000, 1000]
+        s["card_type"] = 1
+    res_f, out_f = invoke(
+        flat1503,
+        "rank",
+        flags=("--method", "exact", "--objective", "score", "--time-limit", "0"),
+    )
+    assert res_f.returncode == 0, res_f.stderr
+    flat1003 = {
+        **flat1503,
+        "catalog": {
+            **flat1503["catalog"],
+            "leader_skills": [
+                {
+                    "id": 90088,
+                    "effects": [{"level": 5, "effect_type": 1003, "value": 8000, "targets": [1]}],
+                }
+            ],
+        },
+    }
+    res_1003, out_1003 = invoke(
+        flat1003,
+        "rank",
+        flags=("--method", "exact", "--objective", "score", "--time-limit", "0"),
+    )
+    assert res_1003.returncode == 0, res_1003.stderr
+    assert out_f["results"][0]["power"] == out_1003["results"][0]["power"] == 22750, out_f
+
+    # Heuristic --method fast must optimize exact team power rather than upper-bound power_matrix under cumulative leader skills.
+    fast_p = make_cumul_problem(3000, max_count=2, cond_group=415)
+    fast_p["input_mode"] = "experimental"
+    fast_p["catalog"]["leader_skills"] = [
+        {
+            "id": 61,
+            "effects": [
+                {"level": 5, "effect_type": 1000, "value": 1000, "targets": [1]},
+                {
+                    "level": 5,
+                    "effect_type": 1500,
+                    "value": 2400,
+                    "targets": [],
+                    "condition_group": 415,
+                    "cumulative_type": 3000,
+                    "max_cumulative_count": 2,
+                    "cumulative_targets": [2, 3],
+                },
+            ],
+        }
+    ]
+    fast_p["catalog"]["members"] = [
+        {
+            "id": i,
+            "character": i,
+            "band": 1 if i <= 15 else 2,
+            "card_type": 1,
+            "trained": [1000, 1000, 1000] if i <= 15 else [900, 900, 900],
+            "live_skill": 1,
+            "leader_skill": 61,
+        }
+        for i in range(1, 21)
+    ]
+    for s in fast_p["catalog"]["snapshots"]:
+        s["trained"] = [1000, 1000, 1000]
+        s["card_type"] = 1
+    res_ex, out_ex = invoke(
+        fast_p,
+        "rank",
+        flags=("--experimental", "--method", "exact", "--objective", "index", "--time-limit", "0"),
+    )
+    res_fa, out_fa = invoke(
+        fast_p, "rank", flags=("--experimental", "--method", "fast", "--objective", "index")
+    )
+    assert res_ex.returncode == 0 and res_fa.returncode == 0, (res_ex.stderr, res_fa.stderr)
+    assert out_fa["results"][0]["power"] == out_ex["results"][0]["power"], (out_fa, out_ex)
 
 
 if __name__ == "__main__":

@@ -80,8 +80,10 @@ def build_catalog(inputs: Mapping[str, Any], *, band_item_bp: int = 2500) -> dic
             "condition_group": int(_field(effect, "_skillConditionGroup", 0)),
         }
         cumul_id = int(_field(effect, "_skillCumulativeConditionID", 0))
-        if cumul_id != 0 and cumul_id in cumul_by_id:
-            cumul = cumul_by_id[cumul_id]
+        if cumul_id != 0:
+            cumul = cumul_by_id.get(cumul_id)
+            if cumul is None:
+                raise ValueError(f"MasterSkillCumulativeCondition 缺少 _id == {cumul_id}")
             out["cumulative_type"] = int(_field(cumul, "_skillCumulativeConditionType", 0))
             out["max_cumulative_count"] = int(_field(cumul, "_maxCumulativeCount", 0))
             out["cumulative_targets"] = [

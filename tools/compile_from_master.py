@@ -585,12 +585,16 @@ def _ideal_band_item_bonuses(
             continue
         if _int(effect.get("_skillEffectType")) != 1000:
             raise CompileError(f"不支持的乐队道具效果类型: {effect.get('_skillEffectType')!r}")
+        target_ids = _int_list(effect.get("_skillTargetIDs"))
+        if not target_ids:
+            raise CompileError(f"乐队道具 {item_id} 缺少目标")
         effect_bands: set[int] = set()
-        for target_id in _int_list(effect.get("_skillTargetIDs")):
+        for target_id in target_ids:
             target = targets.get(target_id)
             band = _row_band_id(target) if target is not None else 0
             if (
                 target is None
+                or target.get("_skillTargetType") not in (None, 3)
                 or band not in by_band
                 or any(
                     _int(target.get(key)) != 0

@@ -748,6 +748,360 @@ class GekisouTestCase(unittest.TestCase):
                     f"开关 {name} 下 power 不一致: Gekisou {gk_sw_res['power']} vs C++ {cpp_sw_power}",
                 )
 
+    def test_12_cumulative_and_conditioned_leader_skill_parity(self) -> None:
+        """测试 12: 带条件组/累计队长技与无累计条件 1500..1503 在 Gekisou 与普通引擎间严格一致。"""
+        base = json.loads(self.fixture_path.read_text(encoding="utf-8"))
+        gmt = base["gekisou_master_tables"]
+        # 对齐 Master 与 catalog 静态加成，使 PrecomputedProbPower、EngineMaster 与 score 完全同基准
+        base["catalog"]["fix"] = {
+            "character_rank_bonus": [0, 0, 0],
+            "character_total_rank_bonus": [0, 0, 0],
+            "band_item_bonus_bp": [0, 0, 0],
+            "vip_bonus_bp": [0, 0, 0],
+            "music_type_base_bp": 500,
+            "music_tag_base_bp": 500,
+            "type_link_base_bp": 500,
+        }
+        # 用 Master 属性表填齐 catalog.members / snapshots 的 trained 与 card_rank_bonus_bp
+        lvl_m = {(r["_group"], r["_level"]): r for r in gmt["MasterMemberCardLevel"]}
+        rk_m = {(r["_group"], r["_rank"]): r for r in gmt["MasterMemberCardRank"]}
+        aw_m = {(r["_group"], r["_awakeCount"]): r for r in gmt["MasterMemberCardAwake"]}
+        card_m = {r["_id"]: r for r in gmt["MasterMemberCard"]}
+        for m in base["catalog"]["members"]:
+            mc = card_m[m["id"]]
+            lr = lvl_m[(mc["_memberCardLevelGroup"], m["level"])]
+            rr = rk_m[(mc["_memberCardRankGroup"], m["rank"])]
+            ar = aw_m[(mc["_memberCardAwakeGroup"], m["awake"])]
+            m["trained"] = [
+                sum(mc[f"_{k}PowerMax"] * row[f"_{k}Rate"] // 10000 for row in (lr, rr, ar))
+                for k in ("performance", "technic", "visual")
+            ]
+            m["card_rank_bonus_bp"] = {
+                "type_link": 0,
+                "music_type": rr["_musicTypeBonusRate"],
+                "music_tag": rr["_musicTagBonusRate"],
+            }
+        lvl_s = {(r["_group"], r["_level"]): r for r in gmt["MasterSupportCardLevel"]}
+        rk_s = {(r["_group"], r["_rank"]): r for r in gmt["MasterSupportCardRank"]}
+        card_s = {r["_id"]: r for r in gmt["MasterSupportCard"]}
+        for s in base["catalog"]["snapshots"]:
+            sc = card_s[s["id"]]
+            lr = lvl_s[(sc["_supportCardLevelGroup"], s["level"])]
+            rr = rk_s[(sc["_supportCardRankGroup"], s["rank"])]
+            s["trained"] = [
+                sc[f"_{k}PowerMax"] * lr[f"_{k}Rate"] // 10000
+                for k in ("performance", "technic", "visual")
+            ]
+            s["card_rank_bonus_bp"] = {
+                "type_link": rr["_cardTypeLinkBonusRate"],
+                "music_type": 0,
+                "music_tag": 0,
+            }
+
+        base["catalog"]["targets"] = [
+            {
+                "id": r["_id"],
+                "character": r["_characterID"],
+                "band": r["_bandID"],
+                "card_type": r["_cardType"],
+                "tag": r["_tagID"],
+                "music_type": r["_liveMusicType"],
+                "gekisou_mission_type": r["_gekisouMissionType"],
+                "live_skill_categories": r["_liveSkillCategories"],
+                "gekisou_skill_categories": r["_gekisouSkillCategories"],
+            }
+            for r in gmt["MasterSkillTarget"]
+        ]
+        base["catalog"]["conditions"] = [
+            {
+                "id": r["_id"],
+                "type": r["_conditionType"],
+                "positive": bool(r["_isPositive"]),
+                "values": r["_conditionValues"],
+                "targets": r["_conditionTargetIDs"],
+            }
+            for r in gmt["MasterSkillCondition"]
+        ]
+        grouped: dict[int, list[list[int]]] = {}
+        for r in gmt["MasterSkillConditionSet"]:
+            grouped.setdefault(r["_group"], []).append(r["_conditionIds"])
+        base["catalog"]["condition_groups"] = [
+            {"group": g, "rows": grouped[g]} for g in sorted(grouped)
+        ]
+        base["catalog"]["note_parameters"] = [
+            {"op": r["_noteOperateType"], "score_percent": r["_scorePercent"]}
+            for r in gmt["MasterLiveNoteParameter"]
+        ]
+        base["catalog"]["combo_bonuses"] = [
+            {
+                "type": r["_comboBonusType"],
+                "required_combo_count": r["_requiredComboCount"],
+                "factor": r["_bonusFactor"],
+            }
+            for r in gmt["MasterLiveComboScoreBonus"]
+        ]
+        base["catalog"]["live_skills"] = [
+            {"id": r["_id"], "effects": [{"level": 5, "effect_type": 2000, "value": 0}]}
+            for r in gmt["MasterLiveSkill"]
+        ]
+        base["catalog"]["gekisou_skills"] = [
+            {"id": r["_id"], "mission_type": r["_gekisouMissionType"]}
+            for r in gmt["MasterGekisouSkill"]
+        ]
+        base["catalog"]["support_skills"] = [
+            {"id": r["_id"], "effects": []} for r in gmt["MasterSupportSkill"]
+        ]
+
+        # 添加测试用条件组 9415（队伍含 card_type 1/2/3/5 任一成员）及 3 类队长技：
+        # 1) LS 61: 1001 + 带条件组 9415 的累计 1501 (type=3000, cap=2)
+        # 2) LS 6003: 累计 1500 (type=3003, 异乐队种类数)
+        # 3) LS 90088: 1503 无累计条件 (cumulative_type=0, 倍率应为 1x)
+        gmt["MasterSkillCondition"].append(
+            {
+                "_id": 9315,
+                "_conditionType": 3000,
+                "_conditionValues": [],
+                "_isPositive": True,
+                "_conditionTargetIDs": [8, 9, 10, 12],
+            }
+        )
+        gmt["MasterSkillConditionSet"].append(
+            {"_id": 9999, "_group": 9415, "_conditionIds": [9315]}
+        )
+        base["catalog"]["conditions"].append(
+            {
+                "id": 9315,
+                "type": 3000,
+                "positive": True,
+                "values": [],
+                "targets": [8, 9, 10, 12],
+            }
+        )
+        base["catalog"]["condition_groups"].append({"group": 9415, "rows": [[9315]]})
+        gmt["MasterSkillCumulativeCondition"].append(
+            {
+                "_id": 9070,
+                "_skillCumulativeConditionType": 3000,
+                "_conditionValues": [1],
+                "_conditionTargetIDs": [8, 9, 10, 12],
+                "_maxCumulativeCount": 2,
+            }
+        )
+        gmt["MasterSkillCumulativeCondition"].append(
+            {
+                "_id": 9002,
+                "_skillCumulativeConditionType": 3003,
+                "_conditionValues": [1],
+                "_conditionTargetIDs": [],
+                "_maxCumulativeCount": 2,
+            }
+        )
+        # 让成员 5 属于乐队 2、成员 4 属于乐队 3，以便验证 3003（异乐队种类数为 2，而非人数）
+        for ch in gmt["MasterCharacter"]:
+            if ch["_id"] == 5:
+                ch["_bandID"] = 2
+            elif ch["_id"] == 4:
+                ch["_bandID"] = 3
+        base["catalog"]["members"][3]["band"] = 3
+        base["catalog"]["members"][4]["band"] = 2
+
+        scenarios = [
+            (
+                61,
+                [
+                    {
+                        "level": 5,
+                        "effect_type": 1001,
+                        "value": 10200,
+                        "targets": [3],
+                        "condition_group": 0,
+                    },
+                    {
+                        "level": 5,
+                        "effect_type": 1501,
+                        "value": 2400,
+                        "targets": [],
+                        "condition_group": 9415,
+                        "cumulative_type": 3000,
+                        "max_cumulative_count": 2,
+                        "cumulative_targets": [8, 9, 10, 12],
+                    },
+                ],
+                [
+                    (1001, 10200, [3], 0, 0),
+                    (1501, 2400, [], 9415, 9070),
+                ],
+            ),
+            (
+                6003,
+                [
+                    {
+                        "level": 5,
+                        "effect_type": 1500,
+                        "value": 2000,
+                        "targets": [],
+                        "condition_group": 0,
+                        "cumulative_type": 3003,
+                        "max_cumulative_count": 5,
+                        "cumulative_targets": [],
+                    }
+                ],
+                [(1500, 2000, [], 0, 9002)],
+            ),
+            (
+                90088,
+                [
+                    {
+                        "level": 5,
+                        "effect_type": 1503,
+                        "value": 8000,
+                        "targets": [3],
+                        "condition_group": 0,
+                    }
+                ],
+                [(1503, 8000, [3], 0, 0)],
+            ),
+        ]
+
+        formation_score = {
+            "schema": "ournotes-deck-formation@1",
+            "leader": 1,
+            "slots": [{"member": i + 1, "snapshot": i + 1, "trigger": i + 1} for i in range(5)],
+        }
+        formation_gk = {
+            "schema": "ournotes-deck-formation@1",
+            "leader": 1,
+            "slots": [
+                {"slot": i, "member": i + 1, "snapshot": i + 1, "trigger": i} for i in range(5)
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            form_path = Path(td) / "form.json"
+            form_path.write_text(json.dumps(formation_score), encoding="utf-8")
+            powers_by_sid: dict[int, int] = {}
+            for sid, cat_effects, master_specs in scenarios:
+                p_case = copy.deepcopy(base)
+                p_case["catalog"]["members"][0]["leader_skill"] = sid
+                p_case["catalog"]["leader_skills"] = [
+                    {"id": r["_id"], "effects": []}
+                    for r in p_case["gekisou_master_tables"]["MasterLeaderSkill"]
+                ] + [{"id": sid, "effects": cat_effects}]
+                p_case["gekisou_master_tables"]["MasterMemberCard"][0]["_leaderSkillID"] = sid
+                p_case["gekisou_master_tables"]["MasterLeaderSkill"].append({"_id": sid})
+                for idx, (et, val, tids, cg, cid) in enumerate(master_specs):
+                    p_case["gekisou_master_tables"]["MasterLeaderSkillEffect"].append(
+                        {
+                            "_id": 99000 + sid * 10 + idx,
+                            "_leaderSkillID": sid,
+                            "_level": 5,
+                            "_skillConditionGroup": cg,
+                            "_skillTargetIDs": tids,
+                            "_skillEffectType": et,
+                            "_effectValue": val,
+                            "_skillCumulativeConditionID": cid,
+                        }
+                    )
+                prob_path = Path(td) / f"prob_{sid}.json"
+                prob_path.write_text(json.dumps(p_case), encoding="utf-8")
+
+                cpp_out = json.loads(
+                    subprocess.run(
+                        [
+                            str(DECKCALC),
+                            "score",
+                            "--experimental",
+                            "-p",
+                            str(prob_path),
+                            "-f",
+                            str(form_path),
+                            "--order-search",
+                            "given",
+                            "--quiet",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout
+                )
+                cpp_power = cpp_out["results"][0]["power"]
+                cpp_slots = [a["power"] for a in cpp_out["results"][0]["assignments"]]
+                powers_by_sid[sid] = cpp_power
+
+                gk_with_cat = self.run_bridge(
+                    "score", {"problem": p_case, "formation": formation_gk}
+                )
+                self.assertEqual(gk_with_cat["power"], cpp_power, f"sid={sid} catalog 分支不一致")
+                self.assertEqual(gk_with_cat["slot_powers"], cpp_slots)
+
+                if sid == 61:
+                    p_false = copy.deepcopy(p_case)
+                    for cond in p_false["catalog"]["conditions"]:
+                        if cond["id"] == 9315:
+                            cond["positive"] = False
+                    prob_false_path = Path(td) / "prob_61_false.json"
+                    prob_false_path.write_text(json.dumps(p_false), encoding="utf-8")
+                    cpp_false = json.loads(
+                        subprocess.run(
+                            [
+                                str(DECKCALC),
+                                "score",
+                                "--experimental",
+                                "-p",
+                                str(prob_false_path),
+                                "-f",
+                                str(form_path),
+                                "--order-search",
+                                "given",
+                                "--quiet",
+                            ],
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        ).stdout
+                    )["results"][0]["power"]
+                    gk_false = self.run_bridge(
+                        "score", {"problem": p_false, "formation": formation_gk}
+                    )
+                    self.assertEqual(gk_false["power"], cpp_false)
+                    self.assertLess(gk_false["power"], gk_with_cat["power"])
+
+            # 进一步验证 LS 61 的 gekisou-rank 也命中相同的累计条件总综合力
+            p_rank = copy.deepcopy(base)
+            p_rank["catalog"]["members"][0]["leader_skill"] = 61
+            p_rank["catalog"]["leader_skills"] = [
+                {"id": r["_id"], "effects": []}
+                for r in p_rank["gekisou_master_tables"]["MasterLeaderSkill"]
+            ] + [{"id": 61, "effects": scenarios[0][1]}]
+            p_rank["gekisou_master_tables"]["MasterMemberCard"][0]["_leaderSkillID"] = 61
+            p_rank["gekisou_master_tables"]["MasterLeaderSkill"].append({"_id": 61})
+            for idx, (et, val, tids, cg, cid) in enumerate(scenarios[0][2]):
+                p_rank["gekisou_master_tables"]["MasterLeaderSkillEffect"].append(
+                    {
+                        "_id": 99610 + idx,
+                        "_leaderSkillID": 61,
+                        "_level": 5,
+                        "_skillConditionGroup": cg,
+                        "_skillTargetIDs": tids,
+                        "_skillEffectType": et,
+                        "_effectValue": val,
+                        "_skillCumulativeConditionID": cid,
+                    }
+                )
+            gk_rank = self.run_bridge(
+                "rank",
+                {
+                    "problem": p_rank,
+                    "candidates": {
+                        "members": [{"id": i} for i in range(1, 6)],
+                        "snaps": [{"id": i} for i in range(1, 6)],
+                    },
+                    "criterion": "mean",
+                    "k": 1,
+                },
+            )
+            self.assertEqual(gk_rank["hits"][0]["power"], powers_by_sid[61])
+
 
 if __name__ == "__main__":
     unittest.main()

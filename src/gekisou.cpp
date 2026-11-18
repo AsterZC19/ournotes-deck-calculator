@@ -1512,7 +1512,7 @@ struct PrecomputedProbPower {
             if (const Json *cs = catalog->find("conditions"); cs && cs->is_array()) {
                 for (const Json &c : cs->as_array()) {
                     CatCond cc;
-                    cc.condition_type = row_i32(c, "condition_type");
+                    cc.condition_type = row_i32(c, "type", 0, "condition_type");
                     const Json *pos = c.find("positive");
                     cc.is_pos = !(pos && pos->is_bool() && !pos->as_bool());
                     cc.targets = row_list(c, "targets");
@@ -1522,7 +1522,10 @@ struct PrecomputedProbPower {
             if (const Json *cgs = catalog->find("condition_groups"); cgs && cgs->is_array()) {
                 for (const Json &cg : cgs->as_array()) {
                     std::vector<std::vector<int32_t>> sets_vec;
-                    if (const Json *sets = cg.find("sets"); sets && sets->is_array()) {
+                    const Json *sets = cg.find("rows");
+                    if (!sets)
+                        sets = cg.find("sets");
+                    if (sets && sets->is_array()) {
                         for (const Json &set_item : sets->as_array()) {
                             const Json *cids_json =
                                 set_item.is_object() ? set_item.find("conditions") : &set_item;
@@ -1534,7 +1537,7 @@ struct PrecomputedProbPower {
                             sets_vec.push_back(std::move(cids));
                         }
                     }
-                    cg_map[row_i32(cg, "id")] = std::move(sets_vec);
+                    cg_map[row_i32(cg, "group", 0, "id")] = std::move(sets_vec);
                 }
             }
             if (const Json *gks = catalog->find("gekisou_skills"); gks && gks->is_array()) {
@@ -1670,6 +1673,8 @@ struct PrecomputedProbPower {
             auto git = cg_map.find(group_id);
             if (git == cg_map.end())
                 return false;
+            if (git->second.empty())
+                return true;
             for (const auto &cids : git->second) {
                 bool set_ok = true;
                 for (int32_t cid : cids) {
@@ -1698,11 +1703,16 @@ struct PrecomputedProbPower {
                             }
                         }
                     } else if (cond.condition_type == 4012) {
-                        for (int32_t tid : cond.targets) {
-                            auto tit = target_map.find(tid);
-                            if (tit != target_map.end() && tit->second.music_type == song_type) {
-                                raw_ok = true;
-                                break;
+                        if (cond.targets.empty()) {
+                            raw_ok = true;
+                        } else {
+                            for (int32_t tid : cond.targets) {
+                                auto tit = target_map.find(tid);
+                                if (tit != target_map.end() &&
+                                    tit->second.music_type == song_type) {
+                                    raw_ok = true;
+                                    break;
+                                }
                             }
                         }
                     } else if (cond.condition_type == 5000) {
@@ -1722,63 +1732,59 @@ struct PrecomputedProbPower {
         for (const CatLeaderEff &eff : lsit->second) {
             if (eff.level != 0 && eff.level != l_level)
                 continue;
+            const int32_t et = eff.effect_type;
+            if (et != 1000 && et != 1001 && et != 1002 && et != 1003 && et != 1500 && et != 1501 &&
+                et != 1502 && et != 1503)
+                continue;
             if (!check_cond_group(eff.condition_group))
                 continue;
-            int32_t et = eff.effect_type;
             int64_t mult = 1;
-            if (et >= 1500 && et <= 1503) {
+            if (eff.cumulative_type != 0) {
                 int64_t count = 0;
-                if (eff.cumulative_type == 3000) {
+                std::vector<int32_t> seen;
+                switch (eff.cumulative_type) {
+                case 3000:
                     for (const auto &m : members)
                         if (match_cat_targets(m, eff.cumulative_targets))
                             ++count;
-                } else if (eff.cumulative_type == 3001) {
+                    break;
+                case 3001:
                     for (size_t i = 0; i < members.size(); ++i)
                         if (i != leader_idx &&
                             match_cat_targets(members[i], eff.cumulative_targets))
                             ++count;
-                } else if (eff.cumulative_type == 3002) {
+                    break;
+                case 3002:
                     for (const auto &m : members)
                         if (m.card.band_id == leader_m.card.band_id)
                             ++count;
-                } else if (eff.cumulative_type == 3003) {
-                    int32_t seen_bands[5];
-                    size_t nb = 0;
+                    break;
+                case 3003:
                     for (const auto &m : members) {
-                        if (m.card.band_id != leader_m.card.band_id) {
-                            bool dup = false;
-                            for (size_t b = 0; b < nb; ++b)
-                                if (seen_bands[b] == m.card.band_id)
-                                    dup = true;
-                            if (!dup)
-                                seen_bands[nb++] = m.card.band_id;
+                        if (m.card.band_id != leader_m.card.band_id &&
+                            std::find(seen.begin(), seen.end(), m.card.band_id) == seen.end()) {
+                            seen.push_back(m.card.band_id);
                         }
                     }
-                    count = static_cast<int64_t>(nb);
-                } else if (eff.cumulative_type == 3004) {
-                    int32_t seen_bands[5];
-                    size_t nb = 0;
+                    count = static_cast<int64_t>(seen.size());
+                    break;
+                case 3004:
                     for (const auto &m : members) {
-                        bool dup = false;
-                        for (size_t b = 0; b < nb; ++b)
-                            if (seen_bands[b] == m.card.band_id)
-                                dup = true;
-                        if (!dup)
-                            seen_bands[nb++] = m.card.band_id;
+                        if (std::find(seen.begin(), seen.end(), m.card.band_id) == seen.end())
+                            seen.push_back(m.card.band_id);
                     }
-                    count = static_cast<int64_t>(nb);
-                } else if (eff.cumulative_type == 3005) {
-                    int32_t seen_cts[5];
-                    size_t nc = 0;
+                    count = static_cast<int64_t>(seen.size());
+                    break;
+                case 3005:
                     for (const auto &m : members) {
-                        bool dup = false;
-                        for (size_t c = 0; c < nc; ++c)
-                            if (seen_cts[c] == m.card.card_type)
-                                dup = true;
-                        if (!dup)
-                            seen_cts[nc++] = m.card.card_type;
+                        if (std::find(seen.begin(), seen.end(), m.card.card_type) == seen.end())
+                            seen.push_back(m.card.card_type);
                     }
-                    count = static_cast<int64_t>(nc);
+                    count = static_cast<int64_t>(seen.size());
+                    break;
+                default:
+                    throw SpecError("队长技能累计条件类型未支持: " +
+                                    std::to_string(eff.cumulative_type));
                 }
                 if (eff.max_cumulative_count > 0 && count > eff.max_cumulative_count)
                     count = eff.max_cumulative_count;
@@ -8083,7 +8089,7 @@ int64_t cumulative_count(const EngineMaster &master, int32_t id,
         return 1;
     const CumulativeRow &row = it->second;
     auto hit = [&](const MemberState &member) {
-        return matches_targets(master, member, row.target_ids);
+        return row.target_ids.empty() || matches_targets(master, member, row.target_ids);
     };
     int64_t count = 1;
     switch (row.type) {
@@ -8103,11 +8109,14 @@ int64_t cumulative_count(const EngineMaster &master, int32_t id,
         for (const auto &member : members)
             count += member.card.band_id == members[leader].card.band_id ? 1 : 0;
         break;
-    case 3003:
-        count = 0;
+    case 3003: {
+        std::set<int32_t> bands;
         for (const auto &member : members)
-            count += member.card.band_id != members[leader].card.band_id ? 1 : 0;
+            if (member.card.band_id != members[leader].card.band_id)
+                bands.insert(member.card.band_id);
+        count = static_cast<int64_t>(bands.size());
         break;
+    }
     case 3004: {
         std::set<int32_t> bands;
         for (const auto &member : members)
@@ -8191,7 +8200,7 @@ LeaderProfile leader_profile(const EngineMaster &master, const MemberState &lead
     }
     profile.simple = true;
     for (const auto &row : profile.effects)
-        if (row.condition_group > 0 || is_cumulative_type(row.type)) {
+        if (row.condition_group > 0 || row.cumulative_id > 0) {
             profile.simple = false;
             break;
         }
@@ -8206,7 +8215,7 @@ std::vector<BP3> leader_percents(const EngineMaster &master, const LeaderProfile
         if (!condition_holds(master, effect.condition_group, members, music))
             continue;
         int64_t value =
-            is_cumulative_type(effect.type)
+            (is_cumulative_type(effect.type) || effect.cumulative_id > 0)
                 ? wrap_mul(effect.value, static_cast<int32_t>(cumulative_count(
                                              master, effect.cumulative_id, members, leader)))
                 : effect.value;
@@ -8227,7 +8236,8 @@ std::vector<BP3> leader_percents(const EngineMaster &master, const LeaderProfile
         if (!effect.target_ids.empty() && !matches_targets(master, member, effect.target_ids))
             continue;
         int64_t value = effect.value;
-        if (is_cumulative_type(effect.type)) {
+        if ((is_cumulative_type(effect.type) || effect.cumulative_id > 0) &&
+            effect.cumulative_id > 0) {
             int32_t cap = 5;
             auto cit = master.cumulative.find(effect.cumulative_id);
             if (cit != master.cumulative.end())
