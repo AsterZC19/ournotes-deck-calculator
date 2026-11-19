@@ -13,3 +13,5 @@ jobs:
         run: make -j4
       - name: test
         run: make test
+      - name: test-asan
+        run: make test-asan

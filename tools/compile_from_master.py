@@ -1068,36 +1068,19 @@ def validate_problem(problem: Mapping[str, Any]) -> None:
         raise CompileError(f"problem 未通过 deckcalc 校验: {completed.stderr.strip()}")
 
 
-def compile_problem(
-    master_dir: Path,
-    charts_dir: Path,
+def _prepare_shared_context(
+    tables: MasterTables,
     event_id: int,
-    difficulty: str,
-    song_id: int,
-    latest_dir: Path | None = None,
-    ideal_level: int | None = None,
-    ideal_rank: int | None = None,
-    ideal_awake: int | None = None,
-    band_item_bp: int | None = None,
-    validate: bool = True,
-    generated_at: str | None = None,
-    song_context: str = "auto",
-    account: dict[str, Any] | None = None,
-    score_mode: str = "normal",
-    tables: MasterTables | None = None,
+    band_item_bp: int | None,
+    ideal_level: int | None,
+    ideal_rank: int | None,
+    ideal_awake: int | None,
+    account: dict[str, Any] | None,
+    score_mode: str,
 ) -> dict[str, Any]:
-    """编译一首歌的 problem JSON（纯函数：不做文件写入）。"""
-    if difficulty not in DIFFICULTIES:
-        raise CompileError(f"--difficulty 只支持 {DIFFICULTIES}，收到 {difficulty!r}")
-    if score_mode not in ("normal", "gekisou"):
-        raise CompileError(f"--score-mode 只支持 ('normal', 'gekisou')，收到 {score_mode!r}")
-
-    if tables is None:
-        tables = MasterTables(master_dir, latest_dir)
     tables.require(REQUIRED_TABLES)
     if score_mode == "gekisou":
         tables.require(GEKISOU_REQUIRED_TABLES)
-
     texts = _load_texts(tables)
     catalog, ideal_info = build_catalog(
         tables,
@@ -1116,8 +1099,70 @@ def compile_problem(
             account_info = apply_account_catalog(tables, catalog, account)
         except AccountError as error:
             raise CompileError(str(error)) from error
-    tasks = _songs_for_event(tables, event_id).get(song_id, [])
-    music = next((m for m in tables.table("MasterLiveMusic") if _int(m["_id"]) == song_id), None)
+    return {
+        "texts": texts,
+        "catalog": catalog,
+        "ideal_info": ideal_info,
+        "account_info": account_info,
+        "tasks_by_song": _songs_for_event(tables, event_id),
+        "music_by_id": {_int(m["_id"]): m for m in tables.table("MasterLiveMusic")},
+        "gekisou_tables": (
+            {tbl: tables.table(tbl) for tbl in ALL_GEKISOU_RUNTIME_TABLES}
+            if score_mode == "gekisou"
+            else None
+        ),
+    }
+
+
+def compile_problem(
+    master_dir: Path,
+    charts_dir: Path,
+    event_id: int,
+    difficulty: str,
+    song_id: int,
+    latest_dir: Path | None = None,
+    ideal_level: int | None = None,
+    ideal_rank: int | None = None,
+    ideal_awake: int | None = None,
+    band_item_bp: int | None = None,
+    validate: bool = True,
+    generated_at: str | None = None,
+    song_context: str = "auto",
+    account: dict[str, Any] | None = None,
+    score_mode: str = "normal",
+    tables: MasterTables | None = None,
+    _shared: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """编译一首歌的 problem JSON（纯函数：不做文件写入）。"""
+    if difficulty not in DIFFICULTIES:
+        raise CompileError(f"--difficulty 只支持 {DIFFICULTIES}，收到 {difficulty!r}")
+    if score_mode not in ("normal", "gekisou"):
+        raise CompileError(f"--score-mode 只支持 ('normal', 'gekisou')，收到 {score_mode!r}")
+
+    if tables is None:
+        tables = MasterTables(master_dir, latest_dir)
+
+    if _shared is None:
+        shared = _prepare_shared_context(
+            tables,
+            event_id=event_id,
+            band_item_bp=band_item_bp,
+            ideal_level=ideal_level,
+            ideal_rank=ideal_rank,
+            ideal_awake=ideal_awake,
+            account=account,
+            score_mode=score_mode,
+        )
+        catalog = shared["catalog"]
+    else:
+        shared = _shared
+        catalog = copy.deepcopy(shared["catalog"])
+
+    texts = shared["texts"]
+    ideal_info = shared["ideal_info"]
+    account_info = shared["account_info"]
+    tasks = shared["tasks_by_song"].get(song_id, [])
+    music = shared["music_by_id"].get(song_id)
     if music is None:
         raise CompileError(f"MasterLiveMusic 里没有 _id == {song_id}")
 
@@ -1179,10 +1224,7 @@ def compile_problem(
 
     if score_mode == "gekisou":
         problem["meta"]["source"]["gekisou_placement_default"] = 1
-        raw_tables: dict[str, Any] = {}
-        for tbl in ALL_GEKISOU_RUNTIME_TABLES:
-            raw_tables[tbl] = tables.table(tbl)
-        problem["gekisou_master_tables"] = raw_tables
+        problem["gekisou_master_tables"] = shared["gekisou_tables"]
 
     if account_info is not None:
         problem["meta"].pop("ideal")
@@ -1347,6 +1389,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         song_ids, _tasks = _resolve_song_ids(tables, args.songs, int(args.event_id))
         generated_at = _isoformat_jst()
         multiple = len(song_ids) > 1
+        shared = (
+            _prepare_shared_context(
+                tables,
+                event_id=int(args.event_id),
+                band_item_bp=args.band_item_bp,
+                ideal_level=args.ideal_level,
+                ideal_rank=args.ideal_rank,
+                ideal_awake=args.ideal_awake,
+                account=account,
+                score_mode=args.score_mode,
+            )
+            if multiple
+            else None
+        )
         written: list[Path] = []
         for song_id in song_ids:
             problem = compile_problem(
@@ -1366,6 +1422,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 song_context=args.song_context,
                 score_mode=args.score_mode,
                 tables=tables,
+                _shared=shared,
             )
             path = output_path_for(output, song_id, args.difficulty, multiple)
             write_problem(problem, path)

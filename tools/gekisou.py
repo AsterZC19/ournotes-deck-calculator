@@ -101,7 +101,6 @@ def cmd_score(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        problem_doc = json.loads(problem_path.read_text(encoding="utf-8"))
         formation_doc = json.loads(formation_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         print(f"错误: JSON 解析失败: {exc}", file=sys.stderr)
@@ -114,7 +113,7 @@ def cmd_score(args: argparse.Namespace) -> int:
         return 2
 
     payload: dict[str, Any] = {
-        "problem": problem_doc,
+        "problem": str(problem_path),
         "formation": formation_doc,
         "options": {
             "assumed_placement": args.assumed_placement,
@@ -167,7 +166,7 @@ def cmd_rank(args: argparse.Namespace) -> int:
     if args.top_k <= 0:
         print(f"错误: top_k 必须为正整数 (当前: {args.top_k})", file=sys.stderr)
         return 2
-    if args.time_limit_ms < 0:
+    if args.time_limit_ms is not None and args.time_limit_ms < 0:
         print(f"错误: time_limit_ms 不能为负数 (当前: {args.time_limit_ms})", file=sys.stderr)
         return 2
     if args.accuracy_just < 0 or args.accuracy_great < 0:
@@ -178,12 +177,6 @@ def cmd_rank(args: argparse.Namespace) -> int:
             f"错误: Just ({args.accuracy_just}%) 与 Great ({args.accuracy_great}%) 判定比例总和不能超过 100%",
             file=sys.stderr,
         )
-        return 2
-
-    try:
-        problem_doc = json.loads(problem_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(f"错误: JSON 解析失败: {exc}", file=sys.stderr)
         return 2
 
     try:
@@ -199,21 +192,24 @@ def cmd_rank(args: argparse.Namespace) -> int:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
 
+    options_doc: dict[str, Any] = {
+        "assumed_placement": args.assumed_placement,
+        "seeds": seeds,
+        "accuracy": {
+            "great": args.accuracy_great,
+            "just": args.accuracy_just,
+        },
+    }
+    if args.time_limit_ms is not None:
+        options_doc["time_limit_ms"] = args.time_limit_ms
+
     payload: dict[str, Any] = {
-        "problem": problem_doc,
+        "problem": str(problem_path),
         "k": args.top_k,
         "criterion": args.criterion,
         "oracle": bool(args.oracle),
         "constraints": constraints,
-        "options": {
-            "assumed_placement": args.assumed_placement,
-            "seeds": seeds,
-            "time_limit_ms": args.time_limit_ms,
-            "accuracy": {
-                "great": args.accuracy_great,
-                "just": args.accuracy_just,
-            },
-        },
+        "options": options_doc,
     }
     if args.master_dir:
         payload["master_dir"] = str(Path(args.master_dir).expanduser().resolve())
@@ -223,7 +219,11 @@ def cmd_rank(args: argparse.Namespace) -> int:
         if not cand_path.is_file():
             print(f"错误: 找不到 candidates 文件: {cand_path}", file=sys.stderr)
             return 2
-        payload["candidates"] = json.loads(cand_path.read_text(encoding="utf-8"))
+        try:
+            payload["candidates"] = json.loads(cand_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            print(f"错误: candidates JSON 解析失败: {exc}", file=sys.stderr)
+            return 2
 
     try:
         result = _run_bridge("rank", payload)
@@ -321,7 +321,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rank.add_argument("--candidates-file", default=None, help="可选候选卡池 JSON 文件")
     p_rank.add_argument(
-        "--time-limit-ms", type=int, default=0, help="搜索超时时间 (毫秒，0 表示不限)"
+        "--time-limit-ms",
+        type=int,
+        default=None,
+        help="搜索超时时间 (毫秒；默认 10000，0 表示不限)",
     )
     p_rank.add_argument("--required-members", default=None, help="必选成员卡牌 ID 列表 (逗号分隔)")
     p_rank.add_argument("--excluded-members", default=None, help="排除成员卡牌 ID 列表 (逗号分隔)")

@@ -104,6 +104,15 @@ def trained(card: dict, rates: list[dict]) -> list[int]:
     ]
 
 
+def _unique_from_index(
+    index: Mapping[tuple[Any, int], list[dict]], group: Any, key: str, value: int
+) -> dict:
+    matches = index.get((group, value), ())
+    if len(matches) != 1:
+        raise AccountError(f"Master 缺少唯一的 group={group} {key}={value} 行，拒绝回退到满养成")
+    return matches[0]
+
+
 def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
     """Resolve experience against Master, never inherit ideal progression or bonuses."""
     validate_account(account)
@@ -118,29 +127,30 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
         missing = set(owned) - set(raw)
         if missing:
             raise AccountError(f"Master 不包含账号持有的{kind} {sorted(missing)}，请更新 Master")
+
+    member_levels_by_group: dict[Any, list[dict]] = {}
+    for row in tables.table("MasterMemberCardLevel"):
+        member_levels_by_group.setdefault(row["_group"], []).append(row)
+    member_ranks_by_key: dict[tuple[Any, int], list[dict]] = {}
+    for row in tables.table("MasterMemberCardRank"):
+        member_ranks_by_key.setdefault((row.get("_group"), row.get("_rank")), []).append(row)
+    member_awakes_by_key: dict[tuple[Any, int], list[dict]] = {}
+    for row in tables.table("MasterMemberCardAwake"):
+        member_awakes_by_key.setdefault((row.get("_group"), row.get("_awakeCount")), []).append(row)
+
     members = []
     for card in catalog["members"]:
         state = owned_members.get(card["id"])
         if state is None:
             continue
         raw = raw_members[card["id"]]
-        level_rows = [
-            row
-            for row in tables.table("MasterMemberCardLevel")
-            if row["_group"] == raw["_memberCardLevelGroup"]
-        ]
+        level_rows = member_levels_by_group.get(raw["_memberCardLevelGroup"], [])
         level = threshold(level_rows, "_exp", state["exp"], "成员等级")
-        rank = row_at(
-            tables.table("MasterMemberCardRank"),
-            raw["_memberCardRankGroup"],
-            "_rank",
-            state["rank"],
+        rank = _unique_from_index(
+            member_ranks_by_key, raw["_memberCardRankGroup"], "_rank", state["rank"]
         )
-        awake = row_at(
-            tables.table("MasterMemberCardAwake"),
-            raw["_memberCardAwakeGroup"],
-            "_awakeCount",
-            state["awake"],
+        awake = _unique_from_index(
+            member_awakes_by_key, raw["_memberCardAwakeGroup"], "_awakeCount", state["awake"]
         )
         gekisou_skill_lvl = state.get("gekisou_skill_level", state.get("live_skill_level", 1))
         card.update(
@@ -156,23 +166,24 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
             music_type=rank["_musicTypeBonusRate"], music_tag=rank["_musicTagBonusRate"]
         )
         members.append(card)
+
+    snap_levels_by_group: dict[Any, list[dict]] = {}
+    for row in tables.table("MasterSupportCardLevel"):
+        snap_levels_by_group.setdefault(row["_group"], []).append(row)
+    snap_ranks_by_key: dict[tuple[Any, int], list[dict]] = {}
+    for row in tables.table("MasterSupportCardRank"):
+        snap_ranks_by_key.setdefault((row.get("_group"), row.get("_rank")), []).append(row)
+
     snapshots = []
     for card in catalog["snapshots"]:
         state = owned_snapshots.get(card["id"])
         if state is None:
             continue
         raw = raw_snapshots[card["id"]]
-        level_rows = [
-            row
-            for row in tables.table("MasterSupportCardLevel")
-            if row["_group"] == raw["_supportCardLevelGroup"]
-        ]
+        level_rows = snap_levels_by_group.get(raw["_supportCardLevelGroup"], [])
         level = threshold(level_rows, "_exp", state["exp"], "Snapshot 等级")
-        rank = row_at(
-            tables.table("MasterSupportCardRank"),
-            raw["_supportCardRankGroup"],
-            "_rank",
-            state["rank"],
+        rank = _unique_from_index(
+            snap_ranks_by_key, raw["_supportCardRankGroup"], "_rank", state["rank"]
         )
         if level["_level"] > rank["_limitLevel"]:
             raise AccountError(f"Snapshot {card['id']} 的经验等级超过 Rank {state['rank']} 上限")
@@ -203,9 +214,10 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
     state_characters = {row["character_id"]: row["exp"] for row in account["characters"]}
     if set(state_characters) - characters:
         raise AccountError("账号角色不在当前 Master 中，请更新 Master")
+    char_rank_rows = tables.table("MasterCharacterRank")
     ranks = {
         character: threshold(
-            tables.table("MasterCharacterRank"),
+            char_rank_rows,
             "_exp",
             state_characters.get(character, 0),
             "角色 Rank",
@@ -236,17 +248,16 @@ def apply_account_catalog(tables: Any, catalog: dict, account: dict) -> dict:
     band_bonus = {str(band): [0] * 3 for band in bands}
     items = {row["_id"]: row for row in tables.table("MasterBandItem")}
     targets = {row["_id"]: row for row in tables.table("MasterSkillTarget")}
+    band_item_effects: dict[tuple[Any, int], list[dict]] = {}
+    for row in tables.table("MasterBandItemSkillEffect"):
+        band_item_effects.setdefault((row["_bandItemId"], row["_level"]), []).append(row)
     for state in account["band_items"]:
         item = items.get(state["master_id"])
         if item is None:
             raise AccountError("账号乐队道具不在当前 Master 中，请更新 Master")
         if state["level"] == 0:
             continue
-        effects = [
-            row
-            for row in tables.table("MasterBandItemSkillEffect")
-            if row["_bandItemId"] == state["master_id"] and row["_level"] == state["level"]
-        ]
+        effects = band_item_effects.get((state["master_id"], state["level"]), [])
         if not effects:
             raise AccountError(f"乐队道具 {state['master_id']} 缺少等级 {state['level']} 的效果")
         for effect in effects:

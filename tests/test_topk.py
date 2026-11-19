@@ -375,6 +375,30 @@ def test_proof_tool():
         wrong = subprocess.run(cmd, capture_output=True, text=True)
         assert wrong.returncode and "another problem" in wrong.stderr
 
+        # Also verify --experimental --objective mean witness replay works cleanly.
+        p_mean = prepared(3)
+        mean_source = root / "problem-mean.json"
+        mean_source.write_text(json.dumps(p_mean))
+        out_mean = root / "proof-mean"
+        cmd_mean = [
+            "python3",
+            str(ROOT / "tools/prove_top_k.py"),
+            "--experimental",
+            "--objective",
+            "mean",
+            "-p",
+            str(mean_source),
+            "-o",
+            str(out_mean),
+            "--count",
+            "2",
+        ]
+        subprocess.run(cmd_mean, capture_output=True, text=True, check=True)
+        d_mean = json.loads((out_mean / "topk-certified.json").read_text())
+        assert d_mean["complete"] and len(d_mean["results"]) == 2
+        assert d_mean["ranking_objective"] == "mean_score"
+        assert all(pr["witness_replayed"] for pr in d_mean["proofs"])
+
 
 def test_class_search_no_conflict():
     p = prepared(3)

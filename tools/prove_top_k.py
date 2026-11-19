@@ -106,9 +106,12 @@ def main():
         raise RuntimeError("Search configuration changed; use a new output directory")
     if audit.get("infeasible_proven") and not results:
         raise RuntimeError("Only 0 legal member sets exist")
-    if not audit.get("top_k_certified") and not (
-        args.count == 1 and audit.get("theoretical_max_certified")
-    ):
+    single_certified = (
+        audit.get("mean_score_certified")
+        if args.objective == "mean"
+        else audit.get("theoretical_max_certified")
+    )
+    if not audit.get("top_k_certified") and not (args.count == 1 and single_certified):
         raise RuntimeError("Incomplete certificate")
     if not results:
         raise RuntimeError("Only 0 legal member sets exist")
@@ -164,6 +167,8 @@ def main():
             "--order-search",
             "given" if args.objective == "score" else "exact",
         ]
+        if args.objective == "mean":
+            witness_cmd += ["--objective", "mean"]
         if args.experimental:
             witness_cmd += ["--experimental"]
         score_doc = json.loads(subprocess.check_output(witness_cmd, text=True))
