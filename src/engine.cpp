@@ -927,56 +927,74 @@ Rules::Rules(const Problem &problem, const CatalogIndex &index)
         for (const Skill &skill : problem_.catalog.leader_skills) {
             if (active_leader_skills.find(skill.id) == active_leader_skills.end())
                 continue;
+            bool skill_has_formation = false;
             for (const SkillEffect &effect : skill.effects) {
                 if (leader_axes_.find(effect.effect_type) == leader_axes_.end())
                     continue;
                 if (effect.cumulative_type != 0) {
-                    formation_leader_conditions_ = true;
+                    skill_has_formation = true;
                     break;
                 }
                 const auto group = index_.condition_group_by_group.find(effect.condition_group);
                 if (group == index_.condition_group_by_group.end())
                     continue;
                 for (const auto &row : group->second->rows) {
-                    for (int64_t id : row) {
-                        const auto condition = index_.condition_by_id.find(id);
+                    for (int64_t cond_id : row) {
+                        const auto condition = index_.condition_by_id.find(cond_id);
                         if (condition != index_.condition_by_id.end() &&
                             (condition->second->type == 3000 || condition->second->type == 3001)) {
-                            formation_leader_conditions_ = true;
+                            skill_has_formation = true;
                             break;
                         }
                     }
-                    if (formation_leader_conditions_)
+                    if (skill_has_formation)
                         break;
                 }
-                if (formation_leader_conditions_)
+                if (skill_has_formation)
                     break;
             }
-            if (formation_leader_conditions_)
-                break;
+            if (skill_has_formation) {
+                formation_leader_skills_.insert(skill.id);
+                formation_leader_conditions_ = true;
+            }
+        }
+    }
+    // Precompute member x target matches once so target_matches() is lock-free across workers.
+    target_cache_.reserve(problem_.catalog.members.size() * problem_.catalog.targets.size());
+    for (const Member &member : problem_.catalog.members) {
+        if (member.id < 0 || member.id > UINT32_MAX)
+            continue;
+        for (const Target &target : problem_.catalog.targets) {
+            if (target.id < 0 || target.id > UINT32_MAX)
+                continue;
+            target_cache_.emplace(pack_ids(member.id, target.id),
+                                  target_matches_impl(index_, target, member));
         }
     }
 }
 
 bool Rules::target_matches(const Target &target, const Member &member) const {
-    const uint64_t key = pack_ids(member.id, target.id);
-    const auto cached = target_cache_.find(key);
-    if (cached != target_cache_.end()) {
-        return cached->second;
+    if (member.id >= 0 && member.id <= UINT32_MAX && target.id >= 0 && target.id <= UINT32_MAX) {
+        const auto cached = target_cache_.find(pack_ids(member.id, target.id));
+        if (cached != target_cache_.end()) {
+            return cached->second;
+        }
     }
-    const bool value = target_matches_impl(index_, target, member);
-    target_cache_.emplace(key, value);
-    return value;
+    return target_matches_impl(index_, target, member);
 }
 
 bool Rules::condition_group_matches(int group, const Member &member) const {
     if (group == 0) {
         return true;
     }
-    const uint64_t key = pack_ids(static_cast<int64_t>(group), member.id);
-    const auto cached = group_cache_.find(key);
-    if (cached != group_cache_.end()) {
-        return cached->second;
+    const bool cacheable = member.id >= 0 && member.id <= UINT32_MAX && group >= 0;
+    const uint64_t key = cacheable ? pack_ids(static_cast<int64_t>(group), member.id) : 0;
+    if (cacheable) {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        const auto cached = group_cache_.find(key);
+        if (cached != group_cache_.end()) {
+            return cached->second;
+        }
     }
     const auto found = index_.condition_group_by_group.find(group);
     if (found == index_.condition_group_by_group.end()) {
@@ -996,14 +1014,20 @@ bool Rules::condition_group_matches(int group, const Member &member) const {
             break;
         }
     }
-    group_cache_.emplace(key, value);
+    if (cacheable) {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        group_cache_.emplace(key, value);
+    }
     return value;
 }
 
 double Rules::live_boost(const Member &member) const {
-    const auto cached = live_cache_.find(member.id);
-    if (cached != live_cache_.end()) {
-        return cached->second;
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        const auto cached = live_cache_.find(member.id);
+        if (cached != live_cache_.end()) {
+            return cached->second;
+        }
     }
     double value = 0.0;
     const auto found = index_.live_skill_by_id.find(member.live_skill);
@@ -1023,12 +1047,19 @@ double Rules::live_boost(const Member &member) const {
         }
         value = static_cast<double>(chosen) / 10000.0;
     }
-    live_cache_.emplace(member.id, value);
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        live_cache_.emplace(member.id, value);
+    }
     return value;
 }
 
 bool Rules::formation_leader_conditions() const {
     return formation_leader_conditions_;
+}
+
+bool Rules::leader_has_formation_conditions(const Member &leader) const {
+    return leader.leader_skill != 0 && formation_leader_skills_.count(leader.leader_skill) > 0;
 }
 
 bool Rules::leader_condition_matches(int group_id, const Member &member,
@@ -1063,8 +1094,8 @@ bool Rules::leader_condition_matches(int group_id, const Member &member,
             else if (condition.type == 3000 || condition.type == 3001) {
                 // Relax either polarity until the formation is known, for safe bounds.
                 if (!team) {
-                    for (auto id : condition.targets)
-                        require_target(index_, id);
+                    for (auto target_id : condition.targets)
+                        require_target(index_, target_id);
                     continue;
                 }
                 value = condition.type == 3000 ? std::any_of(team->begin(), team->end(),
@@ -1171,14 +1202,18 @@ int64_t Rules::cumulative_multiplier(const SkillEffect &effect, const Member &le
 
 Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                               const std::vector<const Member *> *team) const {
+    const bool cacheable = !team && leader.id >= 0 && leader.id <= UINT32_MAX && member.id >= 0 &&
+                           member.id <= UINT32_MAX;
     uint64_t cache_key = 0;
-    if (!team) {
+    if (cacheable) {
         cache_key = pack_ids(leader.id, member.id);
+        std::lock_guard<std::mutex> lock(cache_mutex_);
         const auto cached = leader_cache_.find(cache_key);
         if (cached != leader_cache_.end()) {
             return cached->second;
         }
     }
+    const bool leader_has_formation = leader_has_formation_conditions(leader);
     Triple out{0, 0, 0};
     const auto found = index_.leader_skill_by_id.find(leader.leader_skill);
     if (found != index_.leader_skill_by_id.end()) {
@@ -1207,6 +1242,7 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
                                     " 未在 settings.leader_effect_axes 中定义");
                 }
                 const std::pair<int64_t, int> key = {skill.id, effect->effect_type};
+                std::lock_guard<std::mutex> lock(cache_mutex_);
                 const auto known = unmapped_.find(key);
                 if (known == unmapped_.end()) {
                     unmapped_.emplace(key, std::make_pair(1, effect->value));
@@ -1218,10 +1254,10 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
             const bool is_cumulative = effect->cumulative_type != 0;
             const int64_t mult = is_cumulative ? cumulative_multiplier(*effect, leader, team) : 1;
             const int64_t raw_value = effect->value * mult;
-            const int64_t value = !team && formation_leader_conditions_ &&
-                                          (effect->condition_group != 0 || is_cumulative)
-                                      ? std::max<int64_t>(0, raw_value)
-                                      : raw_value;
+            const int64_t value =
+                !team && leader_has_formation && (effect->condition_group != 0 || is_cumulative)
+                    ? std::max<int64_t>(0, raw_value)
+                    : raw_value;
             if (axis->second == "all") {
                 for (int d = 0; d < kDims; ++d) {
                     out[d] += value;
@@ -1237,8 +1273,10 @@ Triple Rules::leader_bonus_bp(const Member &leader, const Member &member,
             }
         }
     }
-    if (!team)
+    if (cacheable) {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
         leader_cache_.emplace(cache_key, out);
+    }
     return out;
 }
 
@@ -1360,9 +1398,12 @@ Engine::Engine(const Problem &problem, EngineCache *cache)
     if (problem_.settings.power.rounding == "none") {
         throw SpecError("settings.power_model.rounding 不支持 'none'（综合力必须是整数）");
     }
+    const bool float32_mode = power_uses_float32(problem_.settings);
+    member_common_.resize(members_.size());
     member_pos_.reserve(members_.size() * 2);
     for (size_t i = 0; i < members_.size(); ++i) {
         member_pos_[members_[i]->id] = static_cast<int>(i);
+        member_common_[i] = member_common(*members_[i], problem_.catalog.fix, float32_mode);
     }
     snapshot_pos_.reserve(snapshots_.size() * 2);
     for (size_t i = 0; i < snapshots_.size(); ++i) {
@@ -1447,6 +1488,32 @@ void Engine::build_chart() {
     for (size_t i = 0; i < count; ++i) {
         chart_.prefix[i + 1] = chart_.prefix[i] + chart_.weights[i];
     }
+
+    const Judgement &judgement = problem_.settings.judgement;
+    const bool has_deterministic_mode =
+        (judgement.mode == "all_perfect" &&
+         judgement.factors.find("perfect") != judgement.factors.end()) ||
+        judgement.mode == "fixed" || (judgement.mode == "sequence" && !judgement.sequence.empty());
+    if (has_deterministic_mode) {
+        const JudgementLabels resolved = resolve_judgement(judgement, count);
+        chart_.native_judgement_factors.resize(count);
+        chart_.note_is_perfect.resize(count);
+        chart_.deterministic_judgement = true;
+        chart_.all_judgements_nonneg_finite = true;
+        chart_.all_notes_perfect_or_just = true;
+        for (size_t i = 0; i < count; ++i) {
+            const double factor = resolved.factors[i];
+            if (!std::isfinite(factor) || factor < 0.0) {
+                chart_.all_judgements_nonneg_finite = false;
+            }
+            chart_.native_judgement_factors[i] = static_cast<float>(factor);
+            const bool is_perf = resolved.labels[i] == "perfect" || resolved.labels[i] == "just";
+            chart_.note_is_perfect[i] = is_perf ? 1 : 0;
+            if (!is_perf) {
+                chart_.all_notes_perfect_or_just = false;
+            }
+        }
+    }
 }
 
 int Engine::member_pos(int64_t id) const {
@@ -1460,32 +1527,61 @@ int Engine::snapshot_pos(int64_t id) const {
 }
 
 const std::vector<std::vector<int64_t>> &Engine::durations() const {
-    if (!durations_ready_) {
+    std::call_once(durations_once_, [&]() {
         durations_.assign(members_.size(), std::vector<int64_t>(snapshots_.size(), 0));
         for (size_t m = 0; m < members_.size(); ++m) {
             for (size_t s = 0; s < snapshots_.size(); ++s) {
                 durations_[m][s] = rules_.duration_ms(*members_[m], *snapshots_[s]);
             }
         }
-        durations_ready_ = true;
-    }
+    });
     return durations_;
 }
 
 const std::vector<double> &Engine::boosts() const {
-    if (!boosts_ready_) {
+    std::call_once(boosts_once_, [&]() {
         boosts_.clear();
         boosts_.reserve(members_.size());
         for (const Member *member : members_) {
             boosts_.push_back(rules_.live_boost(*member));
         }
-        boosts_ready_ = true;
-    }
+    });
     return boosts_;
 }
 
+const std::vector<uint8_t> &Engine::member_perfect_only() const {
+    std::call_once(perfect_only_once_, [&]() {
+        member_perfect_only_.assign(members_.size(), 0);
+        const Settings &settings = problem_.settings;
+        for (size_t m = 0; m < members_.size(); ++m) {
+            const Member &member = *members_[m];
+            const auto skill = index_.live_skill_by_id.find(member.live_skill);
+            if (skill == index_.live_skill_by_id.end())
+                continue;
+            const auto effects = filter_live_conditions(
+                problem_, index_,
+                select_effects(*skill->second,
+                               member.live_skill_level.value_or(settings.live_level),
+                               settings.skill.live_effect_type));
+            const int64_t selected = pick_effect_value(effects, settings.skill.live_effect_branch);
+            for (const SkillEffect *e : effects) {
+                if (e->value != selected)
+                    continue;
+                if (e->effect_type != 2000 && e->effect_type != 2004)
+                    throw SpecError("绝对分数尚不支持此 LIVE 效果类型: " +
+                                    std::to_string(e->effect_type));
+                if (e->effect_type == 2004) {
+                    member_perfect_only_[m] = (e->targets == std::vector<int64_t>{41, 46}) ? 1 : 2;
+                }
+                break;
+            }
+        }
+    });
+    return member_perfect_only_;
+}
+
 const std::vector<std::vector<std::vector<double>>> &Engine::gains() const {
-    if (!gains_ready_) {
+    std::call_once(gains_once_, [&]() {
         const std::vector<std::vector<int64_t>> &duration_matrix = durations();
         const std::vector<double> &boost_values = boosts();
         const std::vector<int64_t> &starts = problem_.chart.skill_times_ms;
@@ -1507,8 +1603,7 @@ const std::vector<std::vector<std::vector<double>>> &Engine::gains() const {
                 }
             }
         }
-        gains_ready_ = true;
-    }
+    });
     return gains_;
 }
 
@@ -1744,6 +1839,139 @@ Json EngineCache::audit() const {
     return out;
 }
 
+const PowerMatrix &Engine::base_power_matrix() const {
+    std::call_once(base_power_once_, [&]() {
+        const size_t member_count = members_.size();
+        const size_t snapshot_count = snapshots_.size();
+        base_power_matrix_.resize(member_count);
+        for (std::vector<int64_t> &row : base_power_matrix_) {
+            row.assign(snapshot_count, 0);
+        }
+        if (member_count == 0 || snapshot_count == 0) {
+            return;
+        }
+        const Settings &settings = problem_.settings;
+        const Fix &fix = problem_.catalog.fix;
+        const bool float32_mode = power_uses_float32(settings);
+        std::vector<int64_t> music_type_rate(member_count, 0);
+        std::vector<int64_t> music_tag_rate(member_count, 0);
+        for (size_t m = 0; m < member_count; ++m) {
+            const Member &member = *members_[m];
+            if (problem_.song.type == member.card_type) {
+                music_type_rate[m] = fix.music_type_base_bp + member.card_rank_bonus_bp.music_type;
+            }
+            if (song_tag_matches(problem_.song, member)) {
+                music_tag_rate[m] = fix.music_tag_base_bp + member.card_rank_bonus_bp.music_tag;
+            }
+        }
+        std::vector<Triple> snapshot_rate(snapshot_count);
+        std::vector<int64_t> snapshot_link(snapshot_count, 0);
+        for (size_t s = 0; s < snapshot_count; ++s) {
+            const Snapshot &snapshot = *snapshots_[s];
+            for (int d = 0; d < kDims; ++d) {
+                snapshot_rate[s][d] = snapshot.trained[d] + snapshot.event_bonus_bp;
+            }
+            snapshot_link[s] = snapshot.card_rank_bonus_bp.type_link;
+        }
+
+        struct ExtraPlan {
+            bool flat = false;
+            Triple rate{};
+            std::vector<unsigned char> applies;
+        };
+        std::vector<ExtraPlan> extra_plans;
+        for (const ExtraSource &source : settings.power.extra_sources) {
+            ExtraPlan plan;
+            plan.flat = source.kind == "flat";
+            plan.rate = source.rate_bp;
+            plan.applies.assign(member_count * snapshot_count, 0);
+            for (size_t m = 0; m < member_count; ++m) {
+                for (size_t s = 0; s < snapshot_count; ++s) {
+                    plan.applies[m * snapshot_count + s] =
+                        extra_applies(source.when, *members_[m], snapshots_[s]) ? 1 : 0;
+                }
+            }
+            extra_plans.push_back(std::move(plan));
+        }
+
+        for (size_t m = 0; m < member_count; ++m) {
+            const Member &member = *members_[m];
+            const Triple &common = member_common_[m];
+            const Triple &band_rate = band_item_rate(fix, member);
+            int64_t fixed_member = 0;
+            for (int d = 0; d < kDims; ++d) {
+                fixed_member += common[d];
+                if (settings.power.band_item) {
+                    fixed_member += power_floor(common[d] * band_rate[d], float32_mode);
+                }
+                if (settings.power.music_type) {
+                    fixed_member += power_floor(common[d] * music_type_rate[m], float32_mode);
+                }
+                if (settings.power.music_tag) {
+                    fixed_member += power_floor(common[d] * music_tag_rate[m], float32_mode);
+                }
+                if (settings.power.vip) {
+                    fixed_member += power_floor(common[d] * fix.vip_bonus_bp[d], float32_mode);
+                }
+            }
+            for (size_t s = 0; s < snapshot_count; ++s) {
+                int64_t total = fixed_member;
+                if (settings.power.snapshot) {
+                    for (int d = 0; d < kDims; ++d) {
+                        total += power_floor(common[d] * snapshot_rate[s][d], float32_mode);
+                    }
+                }
+                if (settings.power.type_link) {
+                    int64_t rate = 0;
+                    if (member.card_type == snapshots_[s]->card_type) {
+                        const int64_t link = settings.type_link_bonus_source == "snapshot"
+                                                 ? snapshot_link[s]
+                                                 : member.card_rank_bonus_bp.type_link;
+                        rate = fix.type_link_base_bp + link;
+                    }
+                    for (int d = 0; d < kDims; ++d) {
+                        total += power_floor(common[d] * rate, float32_mode);
+                    }
+                }
+                for (const ExtraPlan &plan : extra_plans) {
+                    if (plan.applies[m * snapshot_count + s] == 0) {
+                        continue;
+                    }
+                    if (plan.flat) {
+                        for (int d = 0; d < kDims; ++d) {
+                            total += plan.rate[d];
+                        }
+                    } else {
+                        for (int d = 0; d < kDims; ++d) {
+                            total += power_floor(common[d] * plan.rate[d], float32_mode);
+                        }
+                    }
+                }
+                base_power_matrix_[m][s] = total;
+            }
+        }
+    });
+    return base_power_matrix_;
+}
+
+int64_t Engine::leader_power_delta(size_t leader_index, size_t member_index,
+                                   const std::vector<const Member *> *team) const {
+    require_index(leader_index, members_.size(), "队长");
+    require_index(member_index, members_.size(), "成员");
+    if (!problem_.settings.power.leader) {
+        return 0;
+    }
+    const bool float32_mode = power_uses_float32(problem_.settings);
+    const Triple rate =
+        rules_.leader_bonus_bp(*members_[leader_index], *members_[member_index], team);
+    const Triple &common = member_common_[member_index];
+    int64_t delta = 0;
+    for (int d = 0; d < kDims; ++d) {
+        delta += power_floor(common[d] * rate[d], float32_mode);
+    }
+    return delta;
+}
+
 const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_index) const {
     std::lock_guard<std::mutex> self_lock(power_mutex_);
     const auto cached = power_matrices_.find(leader_index);
@@ -1754,12 +1982,8 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
 
     const size_t member_count = members_.size();
     const size_t snapshot_count = snapshots_.size();
-    std::vector<std::vector<int64_t>> matrix;
-    matrix.resize(member_count);
-    for (std::vector<int64_t> &row : matrix) {
-        row.assign(snapshot_count, 0);
-    }
     if (member_count == 0 || snapshot_count == 0) {
+        PowerMatrix matrix(member_count, std::vector<int64_t>(snapshot_count, 0));
         return *power_matrices_
                     .emplace(leader_index, std::make_shared<const PowerMatrix>(std::move(matrix)))
                     .first->second;
@@ -1769,15 +1993,13 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
     const Fix &fix = problem_.catalog.fix;
     const bool float32_mode = power_uses_float32(settings);
     const Member &leader = *members_[leader_index];
-    std::vector<Triple> common(member_count);
     std::vector<int64_t> music_type_rate(member_count, 0);
     std::vector<int64_t> music_tag_rate(member_count, 0);
     std::vector<Triple> leader_rate(member_count);
-    const bool formation_conditions = rules_.formation_leader_conditions();
+    const bool formation_conditions = rules_.leader_has_formation_conditions(leader);
     for (size_t m = 0; m < member_count; ++m) {
         const Member &member = *members_[m];
-        common[m] = member_common(member, fix, float32_mode);
-        if (formation_conditions && std::any_of(common[m].begin(), common[m].end(),
+        if (formation_conditions && std::any_of(member_common_[m].begin(), member_common_[m].end(),
                                                 [](int64_t value) { return value < 0; })) {
             throw SpecError("编队条件搜索要求成员基础综合力各项非负，无法为负值建立安全上界");
         }
@@ -1790,16 +2012,6 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
         if (settings.power.leader) {
             leader_rate[m] = rules_.leader_bonus_bp(leader, member);
         }
-    }
-
-    std::vector<Triple> snapshot_rate(snapshot_count);
-    std::vector<int64_t> snapshot_link(snapshot_count, 0);
-    for (size_t s = 0; s < snapshot_count; ++s) {
-        const Snapshot &snapshot = *snapshots_[s];
-        for (int d = 0; d < kDims; ++d) {
-            snapshot_rate[s][d] = snapshot.trained[d] + snapshot.event_bonus_bp;
-        }
-        snapshot_link[s] = snapshot.card_rank_bonus_bp.type_link;
     }
 
     std::vector<int64_t> cache_key;
@@ -1822,7 +2034,7 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
             cache_key.push_back(member.id);
             cache_key.push_back(member.card_type);
             cache_key.push_back(member.card_rank_bonus_bp.type_link);
-            cache_key.insert(cache_key.end(), common[m].begin(), common[m].end());
+            cache_key.insert(cache_key.end(), member_common_[m].begin(), member_common_[m].end());
             cache_key.push_back(music_type_rate[m]);
             cache_key.push_back(music_tag_rate[m]);
             cache_key.insert(cache_key.end(), leader_rate[m].begin(), leader_rate[m].end());
@@ -1830,10 +2042,13 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
             cache_key.insert(cache_key.end(), band_rate.begin(), band_rate.end());
         }
         for (size_t s = 0; s < snapshot_count; ++s) {
-            cache_key.push_back(snapshots_[s]->id);
-            cache_key.push_back(snapshots_[s]->card_type);
-            cache_key.insert(cache_key.end(), snapshot_rate[s].begin(), snapshot_rate[s].end());
-            cache_key.push_back(snapshot_link[s]);
+            const Snapshot &snapshot = *snapshots_[s];
+            cache_key.push_back(snapshot.id);
+            cache_key.push_back(snapshot.card_type);
+            for (int d = 0; d < kDims; ++d) {
+                cache_key.push_back(snapshot.trained[d] + snapshot.event_bonus_bp);
+            }
+            cache_key.push_back(snapshot.card_rank_bonus_bp.type_link);
         }
         {
             std::lock_guard<std::mutex> cache_lock(cache_->mutex_);
@@ -1846,92 +2061,17 @@ const std::vector<std::vector<int64_t>> &Engine::power_matrix(size_t leader_inde
         }
     }
 
-    struct ExtraPlan {
-        bool flat = false;
-        Triple rate{};
-        std::vector<unsigned char> applies;
-    };
-    std::vector<ExtraPlan> extra_plans;
-    for (const ExtraSource &source : settings.power.extra_sources) {
-        ExtraPlan plan;
-        plan.flat = source.kind == "flat";
-        plan.rate = source.rate_bp;
-        plan.applies.assign(member_count * snapshot_count, 0);
-        for (size_t m = 0; m < member_count; ++m) {
-            for (size_t s = 0; s < snapshot_count; ++s) {
-                plan.applies[m * snapshot_count + s] =
-                    extra_applies(source.when, *members_[m], snapshots_[s]) ? 1 : 0;
-            }
-        }
-        extra_plans.push_back(std::move(plan));
-    }
-
+    const PowerMatrix &base = base_power_matrix();
+    PowerMatrix matrix(member_count, std::vector<int64_t>(snapshot_count, 0));
     for (size_t m = 0; m < member_count; ++m) {
-        const Member &member = *members_[m];
-        int64_t base_sum = 0;
-        for (int d = 0; d < kDims; ++d) {
-            base_sum += common[m][d];
+        int64_t leader_delta = 0;
+        if (settings.power.leader) {
+            for (int d = 0; d < kDims; ++d) {
+                leader_delta += power_floor(member_common_[m][d] * leader_rate[m][d], float32_mode);
+            }
         }
         for (size_t s = 0; s < snapshot_count; ++s) {
-            int64_t total = base_sum;
-            if (settings.power.snapshot) {
-                for (int d = 0; d < kDims; ++d) {
-                    total += power_floor(common[m][d] * snapshot_rate[s][d], float32_mode);
-                }
-            }
-            if (settings.power.type_link) {
-                int64_t rate = 0;
-                if (member.card_type == snapshots_[s]->card_type) {
-                    const int64_t link = settings.type_link_bonus_source == "snapshot"
-                                             ? snapshot_link[s]
-                                             : member.card_rank_bonus_bp.type_link;
-                    rate = fix.type_link_base_bp + link;
-                }
-                for (int d = 0; d < kDims; ++d) {
-                    total += power_floor(common[m][d] * rate, float32_mode);
-                }
-            }
-            if (settings.power.band_item) {
-                for (int d = 0; d < kDims; ++d) {
-                    total +=
-                        power_floor(common[m][d] * band_item_rate(fix, member)[d], float32_mode);
-                }
-            }
-            if (settings.power.music_type) {
-                for (int d = 0; d < kDims; ++d) {
-                    total += power_floor(common[m][d] * music_type_rate[m], float32_mode);
-                }
-            }
-            if (settings.power.music_tag) {
-                for (int d = 0; d < kDims; ++d) {
-                    total += power_floor(common[m][d] * music_tag_rate[m], float32_mode);
-                }
-            }
-            if (settings.power.leader) {
-                for (int d = 0; d < kDims; ++d) {
-                    total += power_floor(common[m][d] * leader_rate[m][d], float32_mode);
-                }
-            }
-            if (settings.power.vip) {
-                for (int d = 0; d < kDims; ++d) {
-                    total += power_floor(common[m][d] * fix.vip_bonus_bp[d], float32_mode);
-                }
-            }
-            for (const ExtraPlan &plan : extra_plans) {
-                if (plan.applies[m * snapshot_count + s] == 0) {
-                    continue;
-                }
-                if (plan.flat) {
-                    for (int d = 0; d < kDims; ++d) {
-                        total += plan.rate[d];
-                    }
-                } else {
-                    for (int d = 0; d < kDims; ++d) {
-                        total += power_floor(common[m][d] * plan.rate[d], float32_mode);
-                    }
-                }
-            }
-            matrix[m][s] = total;
+            matrix[m][s] = base[m][s] + leader_delta;
         }
     }
     auto shared = std::make_shared<const PowerMatrix>(std::move(matrix));
@@ -2141,12 +2281,16 @@ Evaluation Engine::evaluate(const Formation &formation, const EvalOptions &optio
     if (leader_pos < 0) {
         throw SpecError("队长 " + std::to_string(formation.leader) + " 不在可用成员中");
     }
-    const auto *matrix = rules_.formation_leader_conditions()
-                             ? nullptr
-                             : &power_matrix(static_cast<size_t>(leader_pos));
+    const bool leader_has_formation = rules_.leader_has_formation_conditions(*members_[leader_pos]);
+    const PowerMatrix *matrix =
+        leader_has_formation ? nullptr : &power_matrix(static_cast<size_t>(leader_pos));
+    const PowerMatrix *base_matrix = leader_has_formation ? &base_power_matrix() : nullptr;
     std::vector<const Member *> team;
-    for (const auto &slot : formation.slots)
-        team.push_back(members_[member_pos(slot.member)]);
+    if (leader_has_formation || options.detail) {
+        team.reserve(formation.slots.size());
+        for (const auto &slot : formation.slots)
+            team.push_back(members_[member_pos(slot.member)]);
+    }
     const std::vector<std::vector<int64_t>> &duration_matrix = durations();
     const std::vector<double> &boost_values = boosts();
 
@@ -2159,9 +2303,10 @@ Evaluation Engine::evaluate(const Formation &formation, const EvalOptions &optio
         const size_t snapshot_index = static_cast<size_t>(pairs[static_cast<size_t>(i)].second);
         const Member &member = *members_[member_index];
         const Snapshot &snapshot = *snapshots_[snapshot_index];
-        const int64_t slot_power_value = matrix ? (*matrix)[member_index][snapshot_index]
-                                                : slot_power(static_cast<size_t>(leader_pos),
-                                                             member_index, snapshot_index, &team);
+        const int64_t slot_power_value =
+            matrix ? (*matrix)[member_index][snapshot_index]
+                   : (*base_matrix)[member_index][snapshot_index] +
+                         leader_power_delta(static_cast<size_t>(leader_pos), member_index, &team);
         total_power += slot_power_value;
 
         SlotEval slot;
@@ -2281,10 +2426,11 @@ void Engine::validate_theoretical_scope() const {
     if (!settings.score.level_alpha || settings.score.rounding != "float32_floor")
         throw SpecError(
             "理论最高分需要 level_alpha 和 float32_floor；指数搜索请用 --objective index");
-    if (settings.judgement.mode != "all_perfect" || settings.life.mode != "constant" ||
+    if (!chart_.deterministic_judgement || settings.life.mode != "constant" ||
         settings.gekisou.enabled)
-        throw SpecError("理论最高分当前支持 AP、恒定生命、无竞技击奏的课题模型；其他模型请用 "
-                        "--objective index");
+        throw SpecError(
+            "理论最高分当前支持确定性判定、恒定生命、无竞技击奏的课题模型；其他模型请用 "
+            "--objective index");
     if (team_size() > 5)
         throw SpecError("理论最高分支持最多五人队伍");
     for (double boost : boosts())
@@ -2293,7 +2439,7 @@ void Engine::validate_theoretical_scope() const {
     const double factor =
         1 + (problem_.chart.level - settings.score.level_base) * (*settings.score.level_alpha);
     if (settings.score.adjustment_factor < 0 || factor < 0 ||
-        settings.judgement.factors.at("perfect") < 0 || settings.life.onus_factor < 0 ||
+        !chart_.all_judgements_nonneg_finite || settings.life.onus_factor < 0 ||
         settings.assist.score_percent < 0)
         throw SpecError("理论最高分的安全上界要求非负计分因子");
 }
@@ -2338,6 +2484,23 @@ struct FastScoreParams {
     float assist = 1.0f;
 };
 
+struct FastSlotInfo {
+    int64_t duration_ms = 0;
+    float live_boost = 0.0f;
+    bool perfect_only = false;
+    int member_idx = 0;
+    int snap_idx = 0;
+};
+
+inline int64_t score_note_native(const FastScoreParams &params, size_t i, float live) {
+    float value = params.before_live[i] * (1.0f + live);
+    value /= params.converted;
+    value = std::floor(value);
+    value *= params.life;
+    value *= params.assist;
+    return static_cast<int64_t>(std::floor(value));
+}
+
 FastScoreParams make_fast_score_params(const Problem &problem, const ChartData &chart,
                                        int64_t power) {
     const auto &settings = problem.settings;
@@ -2352,36 +2515,122 @@ FastScoreParams make_fast_score_params(const Problem &problem, const ChartData &
     params.life = settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
     params.assist =
         settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100.0) : 1.0f;
-    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
     params.before_live.resize(chart.times.size());
     for (size_t i = 0; i < params.before_live.size(); ++i) {
         float value = static_cast<float>(chart.note_weights[i]) * note_base;
-        value *= judgement;
+        value *= chart.native_judgement_factors[i];
         value *= chart.native_combo_bonuses[i] + 1.0f;
         params.before_live[i] = value;
     }
     return params;
 }
 
-int64_t score_order_native(const FastScoreParams &params, const std::vector<int64_t> &chart_times,
-                           int n, const int64_t *starts, const int64_t *ends, const float *boosts) {
+int64_t score_order_native(const FastScoreParams &params, const ChartData &chart, int n,
+                           const int64_t *starts, const int64_t *ends, const float *boosts,
+                           const uint8_t *perfect_only) {
     int64_t total = 0;
-    const size_t note_count = chart_times.size();
+    const size_t note_count = chart.times.size();
+    const bool check_perf = !chart.all_notes_perfect_or_just && perfect_only != nullptr;
     for (size_t i = 0; i < note_count; ++i) {
         float live = 0.0f;
-        const int64_t t = chart_times[i];
+        const int64_t t = chart.times[i];
         for (int k = 0; k < n; ++k) {
-            if (t >= starts[k] && t < ends[k])
+            if (t >= starts[k] && t < ends[k] &&
+                (!check_perf || !perfect_only[k] || chart.note_is_perfect[i]))
                 live += boosts[k];
         }
-        float value = params.before_live[i] * (1.0f + live);
-        value /= params.converted;
-        value = std::floor(value);
-        value *= params.life;
-        value *= params.assist;
-        total += static_cast<int64_t>(std::floor(value));
+        total += score_note_native(params, i, live);
     }
     return total;
+}
+
+// When skill trigger windows are pairwise disjoint, each permutation's exact native
+// integer score decomposes into base_total + sum_k delta[slot_at_k][k].
+struct WindowDeltaTable {
+    bool disjoint = false;
+    int n = 0;
+    int64_t base_total = 0;
+    std::vector<int64_t> delta; // [slot_idx * n + trigger_k]
+
+    int64_t at(int slot_idx, int trigger_k) const {
+        return delta[static_cast<size_t>(slot_idx * n + trigger_k)];
+    }
+};
+
+WindowDeltaTable build_window_deltas(const FastScoreParams &params, const ChartData &chart,
+                                     const std::vector<int64_t> &starts,
+                                     const std::vector<FastSlotInfo> &slots) {
+    WindowDeltaTable table;
+    const int n = static_cast<int>(slots.size());
+    table.n = n;
+    if (n <= 0 || static_cast<int>(starts.size()) < n)
+        return table;
+    int64_t max_dur = 0;
+    for (const auto &s : slots) {
+        if (s.duration_ms < 0)
+            return table;
+        max_dur = std::max(max_dur, s.duration_ms);
+    }
+    std::vector<int> ord(static_cast<size_t>(n));
+    std::iota(ord.begin(), ord.end(), 0);
+    std::sort(ord.begin(), ord.end(), [&](int a, int b) { return starts[a] < starts[b]; });
+    for (int i = 0; i + 1 < n; ++i) {
+        if (starts[ord[static_cast<size_t>(i)]] + max_dur >
+            starts[ord[static_cast<size_t>(i + 1)]]) {
+            return table;
+        }
+    }
+
+    table.disjoint = true;
+    const size_t note_count = chart.times.size();
+    std::vector<int64_t> base_note(note_count);
+    int64_t base_total = 0;
+    for (size_t i = 0; i < note_count; ++i) {
+        const int64_t s = score_note_native(params, i, 0.0f);
+        base_note[i] = s;
+        base_total += s;
+    }
+    table.base_total = base_total;
+    table.delta.assign(static_cast<size_t>(n * n), 0);
+
+    for (int k = 0; k < n; ++k) {
+        const int64_t start = starts[static_cast<size_t>(k)];
+        const size_t lo = static_cast<size_t>(
+            std::lower_bound(chart.times.begin(), chart.times.end(), start) - chart.times.begin());
+        for (int i = 0; i < n; ++i) {
+            const float boost = slots[static_cast<size_t>(i)].live_boost;
+            if (boost == 0.0f)
+                continue;
+            const int64_t end = start + slots[static_cast<size_t>(i)].duration_ms;
+            const size_t hi = static_cast<size_t>(
+                std::lower_bound(chart.times.begin() + static_cast<ptrdiff_t>(lo),
+                                 chart.times.end(), end) -
+                chart.times.begin());
+            int64_t d = 0;
+            if (slots[static_cast<size_t>(i)].perfect_only && !chart.all_notes_perfect_or_just) {
+                for (size_t j = lo; j < hi; ++j) {
+                    if (chart.note_is_perfect[j]) {
+                        d += score_note_native(params, j, boost) - base_note[j];
+                    }
+                }
+            } else {
+                for (size_t j = lo; j < hi; ++j) {
+                    d += score_note_native(params, j, boost) - base_note[j];
+                }
+            }
+            table.delta[static_cast<size_t>(i * n + k)] = d;
+        }
+    }
+    return table;
+}
+
+bool resolve_slot_perfect_only(const std::vector<uint8_t> &flags, int member_idx) {
+    const uint8_t flag = flags[static_cast<size_t>(member_idx)];
+    if (flag == 2) {
+        throw SpecError(
+            "指定判定 LIVE 目标尚未验证；当前仅支持 Master 的 PERFECT/JUST 目标 41、46");
+    }
+    return flag == 1;
 }
 
 } // namespace
@@ -2389,9 +2638,8 @@ int64_t score_order_native(const FastScoreParams &params, const std::vector<int6
 bool Engine::fast_score_applicable() const {
     const auto &settings = problem_.settings;
     return settings.score.level_alpha.has_value() && settings.score.rounding == "float32_floor" &&
-           settings.judgement.mode == "all_perfect" && settings.life.mode == "constant" &&
-           !settings.gekisou.enabled && chart_.converted_note_count > 0 && team_size() >= 1 &&
-           settings.judgement.factors.find("perfect") != settings.judgement.factors.end();
+           chart_.deterministic_judgement && settings.life.mode == "constant" &&
+           !settings.gekisou.enabled && chart_.converted_note_count > 0 && team_size() >= 1;
 }
 
 double Engine::native_base_score(int64_t power) const {
@@ -2401,11 +2649,7 @@ double Engine::native_base_score(int64_t power) const {
     int64_t total = 0;
     const size_t note_count = params.before_live.size();
     for (size_t i = 0; i < note_count; ++i) {
-        float value = params.before_live[i] / params.converted;
-        value = std::floor(value);
-        value *= params.life;
-        value *= params.assist;
-        total += static_cast<int64_t>(std::floor(value));
+        total += score_note_native(params, i, 0.0f);
     }
     return static_cast<double>(total);
 }
@@ -2413,27 +2657,55 @@ double Engine::native_base_score(int64_t power) const {
 double Engine::native_min_score(int64_t power, const Formation &formation) const {
     if (!fast_score_applicable())
         return native_base_score(power);
+    const int n = team_size();
+    if (power < 0 || !chart_.all_judgements_nonneg_finite ||
+        formation.slots.size() != static_cast<size_t>(n))
+        return -1.0;
+    const auto &settings = problem_.settings;
+    const float adjustment = static_cast<float>(settings.score.adjustment_factor);
+    const float difficulty = static_cast<float>(problem_.chart.level - settings.score.level_base) *
+                                 static_cast<float>(*settings.score.level_alpha) +
+                             1.0f;
+    const float life =
+        settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
+    const float assist =
+        settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100.0) : 1.0f;
+    if (!std::isfinite(adjustment) || adjustment < 0.0f || !std::isfinite(difficulty) ||
+        difficulty < 0.0f || !std::isfinite(life) || life < 0.0f || !std::isfinite(assist) ||
+        assist < 0.0f)
+        return -1.0;
     const auto params = make_fast_score_params(problem_, chart_, power);
+    const auto &perf_flags = member_perfect_only();
     float min_boost = std::numeric_limits<float>::infinity();
     int64_t min_duration = std::numeric_limits<int64_t>::max();
+    bool any_perfect_only = false;
     for (const auto &slot : formation.slots) {
-        min_boost = std::min(min_boost, static_cast<float>(live_boost(member_pos(slot.member))));
-        min_duration = std::min(min_duration,
-                                duration_ms(member_pos(slot.member), snapshot_pos(slot.snapshot)));
+        const int mi = member_pos(slot.member);
+        const int si = snapshot_pos(slot.snapshot);
+        if (mi < 0 || si < 0)
+            return -1.0;
+        const float b = static_cast<float>(live_boost(mi));
+        if (!std::isfinite(b) || b < 0.0f)
+            return -1.0;
+        min_boost = std::min(min_boost, b);
+        min_duration = std::min(min_duration, duration_ms(mi, si));
+        if (resolve_slot_perfect_only(perf_flags, mi)) {
+            any_perfect_only = true;
+        }
     }
-    if (!std::isfinite(min_boost) || min_boost < 0.0f)
+    if (!std::isfinite(min_boost))
         min_boost = 0.0f;
     if (min_duration <= 0)
         min_duration = 0;
-    const int n = team_size();
-    std::vector<int64_t> starts(n), ends(n);
-    std::vector<float> boosts(n, min_boost);
+    std::vector<int64_t> starts(static_cast<size_t>(n)), ends(static_cast<size_t>(n));
+    std::vector<float> boosts(static_cast<size_t>(n), min_boost);
+    std::vector<uint8_t> perf(static_cast<size_t>(n), any_perfect_only ? 1 : 0);
     for (int k = 0; k < n; ++k) {
-        starts[k] = problem_.chart.skill_times_ms[k];
-        ends[k] = starts[k] + min_duration;
+        starts[static_cast<size_t>(k)] = problem_.chart.skill_times_ms[static_cast<size_t>(k)];
+        ends[static_cast<size_t>(k)] = starts[static_cast<size_t>(k)] + min_duration;
     }
-    const int64_t total =
-        score_order_native(params, chart_.times, n, starts.data(), ends.data(), boosts.data());
+    const int64_t total = score_order_native(params, chart_, n, starts.data(), ends.data(),
+                                             boosts.data(), perf.data());
     return static_cast<double>(total);
 }
 
@@ -2464,36 +2736,58 @@ bool Engine::for_each_score_order_fast(
 
     if (fast_score_applicable()) {
         const auto params = make_fast_score_params(problem_, chart_, base.power);
-        struct FastSlot {
-            int64_t duration_ms = 0;
-            float live_boost = 0.0f;
-            int member_idx = 0;
-            int snap_idx = 0;
-        };
-        std::vector<FastSlot> fast_slots(n);
+        const auto &perf_flags = member_perfect_only();
+        std::vector<FastSlotInfo> fast_slots(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
-            fast_slots[i] = {
-                original_slots[i].duration_ms, static_cast<float>(original_slots[i].live_boost),
-                member_pos(original_slots[i].member), snapshot_pos(original_slots[i].snapshot)};
+            const int mi = member_pos(original_slots[static_cast<size_t>(i)].member);
+            fast_slots[static_cast<size_t>(i)] = {
+                original_slots[static_cast<size_t>(i)].duration_ms,
+                static_cast<float>(original_slots[static_cast<size_t>(i)].live_boost),
+                resolve_slot_perfect_only(perf_flags, mi), mi,
+                snapshot_pos(original_slots[static_cast<size_t>(i)].snapshot)};
         }
-        std::vector<int64_t> starts(n), ends(n);
-        std::vector<float> boosts(n);
+        std::vector<int64_t> starts(static_cast<size_t>(n)), ends(static_cast<size_t>(n));
+        std::vector<float> order_boosts(static_cast<size_t>(n));
+        std::vector<uint8_t> order_perf(static_cast<size_t>(n));
         for (int k = 0; k < n; ++k)
-            starts[k] = problem_.chart.skill_times_ms[k];
-        std::vector<int> slots_at_trigger(n);
-        std::vector<double> per_pair(n);
+            starts[static_cast<size_t>(k)] = problem_.chart.skill_times_ms[static_cast<size_t>(k)];
+        const WindowDeltaTable deltas = build_window_deltas(params, chart_, starts, fast_slots);
+        std::vector<int> slots_at_trigger(static_cast<size_t>(n));
+        std::vector<double> per_pair(static_cast<size_t>(n));
         do {
             for (int i = 0; i < n; ++i)
-                slots_at_trigger[permutation[i]] = i;
-            for (int k = 0; k < n; ++k) {
-                const int slot_idx = slots_at_trigger[k];
-                ends[k] = starts[k] + fast_slots[slot_idx].duration_ms;
-                boosts[k] = fast_slots[slot_idx].live_boost;
-                per_pair[k] =
-                    grid[fast_slots[slot_idx].member_idx][fast_slots[slot_idx].snap_idx][k];
+                slots_at_trigger[static_cast<size_t>(permutation[static_cast<size_t>(i)])] = i;
+            int64_t total = 0;
+            if (deltas.disjoint) {
+                total = deltas.base_total;
+                for (int k = 0; k < n; ++k) {
+                    const int slot_idx = slots_at_trigger[static_cast<size_t>(k)];
+                    total += deltas.at(slot_idx, k);
+                    per_pair[static_cast<size_t>(k)] =
+                        grid[static_cast<size_t>(
+                            fast_slots[static_cast<size_t>(slot_idx)].member_idx)]
+                            [static_cast<size_t>(fast_slots[static_cast<size_t>(slot_idx)]
+                                                     .snap_idx)][static_cast<size_t>(k)];
+                }
+            } else {
+                for (int k = 0; k < n; ++k) {
+                    const int slot_idx = slots_at_trigger[static_cast<size_t>(k)];
+                    ends[static_cast<size_t>(k)] =
+                        starts[static_cast<size_t>(k)] +
+                        fast_slots[static_cast<size_t>(slot_idx)].duration_ms;
+                    order_boosts[static_cast<size_t>(k)] =
+                        fast_slots[static_cast<size_t>(slot_idx)].live_boost;
+                    order_perf[static_cast<size_t>(k)] =
+                        fast_slots[static_cast<size_t>(slot_idx)].perfect_only ? 1 : 0;
+                    per_pair[static_cast<size_t>(k)] =
+                        grid[static_cast<size_t>(
+                            fast_slots[static_cast<size_t>(slot_idx)].member_idx)]
+                            [static_cast<size_t>(fast_slots[static_cast<size_t>(slot_idx)]
+                                                     .snap_idx)][static_cast<size_t>(k)];
+                }
+                total = score_order_native(params, chart_, n, starts.data(), ends.data(),
+                                           order_boosts.data(), order_perf.data());
             }
-            const int64_t total = score_order_native(params, chart_.times, n, starts.data(),
-                                                     ends.data(), boosts.data());
             const double weight_factor = 1.0 + numpy_sum(per_pair.data(), per_pair.size());
             const double index = static_cast<double>(base.power) * weight_factor;
             if (!visitor(static_cast<double>(total), index, permutation))
@@ -2504,7 +2798,7 @@ bool Engine::for_each_score_order_fast(
         do {
             auto slots = original_slots;
             for (int i = 0; i < n; ++i)
-                slots[i].trigger = permutation[i] + 1;
+                slots[static_cast<size_t>(i)].trigger = permutation[static_cast<size_t>(i)] + 1;
             std::sort(slots.begin(), slots.end(), [](const SlotEval &left, const SlotEval &right) {
                 return left.trigger < right.trigger;
             });
@@ -2512,9 +2806,12 @@ bool Engine::for_each_score_order_fast(
                 absolute_score_block(problem_, index_, chart_, boosts(), member_pos_, slots,
                                      base.power, base.weight_factor);
             const double total = num_field(result, "total");
-            std::vector<double> per_pair(n);
+            std::vector<double> per_pair(static_cast<size_t>(n));
             for (int k = 0; k < n; ++k) {
-                per_pair[k] = grid[member_pos(slots[k].member)][snapshot_pos(slots[k].snapshot)][k];
+                per_pair[static_cast<size_t>(k)] =
+                    grid[static_cast<size_t>(member_pos(slots[static_cast<size_t>(k)].member))]
+                        [static_cast<size_t>(snapshot_pos(slots[static_cast<size_t>(k)].snapshot))]
+                        [static_cast<size_t>(k)];
             }
             const double weight_factor = 1.0 + numpy_sum(per_pair.data(), per_pair.size());
             const double index = static_cast<double>(base.power) * weight_factor;
@@ -2528,7 +2825,8 @@ bool Engine::for_each_score_order_fast(
 Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail) const {
     validate_theoretical_scope();
     formation.validate(problem_);
-    std::vector<int> permutation(static_cast<size_t>(team_size()));
+    const int n = team_size();
+    std::vector<int> permutation(static_cast<size_t>(n));
     std::iota(permutation.begin(), permutation.end(), 0);
     EvalOptions base_options;
     base_options.order_search = "given";
@@ -2551,40 +2849,53 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
 
     const bool fast_applicable = fast_score_applicable();
     FastScoreParams params;
-    struct FastSlot {
-        int64_t duration_ms = 0;
-        float live_boost = 0.0f;
-    };
-    std::vector<FastSlot> fast_slots(static_cast<size_t>(team_size()));
-    std::vector<int64_t> starts(static_cast<size_t>(team_size())),
-        ends(static_cast<size_t>(team_size()));
-    std::vector<float> order_boosts(static_cast<size_t>(team_size()));
-    std::vector<int> slots_at_trigger(static_cast<size_t>(team_size()));
+    std::vector<FastSlotInfo> fast_slots(static_cast<size_t>(n));
+    std::vector<int64_t> starts(static_cast<size_t>(n)), ends(static_cast<size_t>(n));
+    std::vector<float> order_boosts(static_cast<size_t>(n));
+    std::vector<uint8_t> order_perf(static_cast<size_t>(n));
+    std::vector<int> slots_at_trigger(static_cast<size_t>(n));
+    WindowDeltaTable deltas;
     if (fast_applicable) {
         params = make_fast_score_params(problem_, chart_, base.power);
-        for (int i = 0; i < team_size(); ++i)
+        const auto &perf_flags = member_perfect_only();
+        for (int i = 0; i < n; ++i) {
+            const int mi = member_pos(original_slots[static_cast<size_t>(i)].member);
             fast_slots[static_cast<size_t>(i)] = {
                 original_slots[static_cast<size_t>(i)].duration_ms,
-                static_cast<float>(original_slots[static_cast<size_t>(i)].live_boost)};
-        for (int k = 0; k < team_size(); ++k)
-            starts[static_cast<size_t>(k)] = problem_.chart.skill_times_ms[k];
+                static_cast<float>(original_slots[static_cast<size_t>(i)].live_boost),
+                resolve_slot_perfect_only(perf_flags, mi), mi,
+                snapshot_pos(original_slots[static_cast<size_t>(i)].snapshot)};
+        }
+        for (int k = 0; k < n; ++k)
+            starts[static_cast<size_t>(k)] = problem_.chart.skill_times_ms[static_cast<size_t>(k)];
+        deltas = build_window_deltas(params, chart_, starts, fast_slots);
     }
     do {
         double score = 0;
         if (fast_applicable) {
-            for (int i = 0; i < team_size(); ++i)
+            for (int i = 0; i < n; ++i)
                 slots_at_trigger[static_cast<size_t>(permutation[static_cast<size_t>(i)])] = i;
-            for (int k = 0; k < team_size(); ++k) {
-                const auto &slot = fast_slots[static_cast<size_t>(slots_at_trigger[k])];
-                ends[static_cast<size_t>(k)] = starts[static_cast<size_t>(k)] + slot.duration_ms;
-                order_boosts[static_cast<size_t>(k)] = slot.live_boost;
+            if (deltas.disjoint) {
+                int64_t total = deltas.base_total;
+                for (int k = 0; k < n; ++k)
+                    total += deltas.at(slots_at_trigger[static_cast<size_t>(k)], k);
+                score = static_cast<double>(total);
+            } else {
+                for (int k = 0; k < n; ++k) {
+                    const auto &slot =
+                        fast_slots[static_cast<size_t>(slots_at_trigger[static_cast<size_t>(k)])];
+                    ends[static_cast<size_t>(k)] =
+                        starts[static_cast<size_t>(k)] + slot.duration_ms;
+                    order_boosts[static_cast<size_t>(k)] = slot.live_boost;
+                    order_perf[static_cast<size_t>(k)] = slot.perfect_only ? 1 : 0;
+                }
+                score = static_cast<double>(score_order_native(params, chart_, n, starts.data(),
+                                                               ends.data(), order_boosts.data(),
+                                                               order_perf.data()));
             }
-            score = static_cast<double>(score_order_native(params, chart_.times, team_size(),
-                                                           starts.data(), ends.data(),
-                                                           order_boosts.data()));
         } else {
             auto slots = original_slots;
-            for (int i = 0; i < team_size(); ++i)
+            for (int i = 0; i < n; ++i)
                 slots[static_cast<size_t>(i)].trigger = permutation[static_cast<size_t>(i)] + 1;
             std::sort(slots.begin(), slots.end(), [](const SlotEval &left, const SlotEval &right) {
                 return left.trigger < right.trigger;
@@ -2613,8 +2924,8 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
         best.slots.begin(), best.slots.end(),
         [](const SlotEval &left, const SlotEval &right) { return left.trigger < right.trigger; });
     const auto &grid = gains();
-    std::vector<double> per_pair(static_cast<size_t>(team_size()));
-    for (int k = 0; k < team_size(); ++k) {
+    std::vector<double> per_pair(static_cast<size_t>(n));
+    for (int k = 0; k < n; ++k) {
         auto &slot = best.slots[static_cast<size_t>(k)];
         per_pair[static_cast<size_t>(k)] =
             grid[static_cast<size_t>(member_pos(slot.member))]
@@ -2626,7 +2937,7 @@ Evaluation Engine::evaluate_theoretical(const Formation &formation, bool detail)
     populate_estimated_score(best);
 
     Json order = Json::array();
-    for (int trigger = 1; trigger <= team_size(); ++trigger)
+    for (int trigger = 1; trigger <= n; ++trigger)
         for (const auto &slot : best.slots)
             if (slot.trigger == trigger)
                 order.push_back(Json(slot.member));
@@ -2654,35 +2965,47 @@ std::optional<Evaluation> Engine::evaluate_best_order(const Formation &formation
     options.order_search = "given";
     options.calculate_score = false;
     const Evaluation base = evaluate(formation, options);
+    const int n = team_size();
     struct Order {
         std::vector<int> positions;
         double cap;
     };
     std::vector<Order> orders;
-    std::vector<int> positions(team_size());
+    std::vector<int> positions(static_cast<size_t>(n));
     std::iota(positions.begin(), positions.end(), 0);
     do {
         double gain = 0;
-        for (int i = 0; i < team_size(); ++i) {
-            const auto &slot = base.slots[i];
-            const int pair =
-                member_pos(slot.member) * snapshots().size() + snapshot_pos(slot.snapshot);
-            gain = std::nextafter(gain + bound.gains[pair][positions[i]],
+        for (int i = 0; i < n; ++i) {
+            const auto &slot = base.slots[static_cast<size_t>(i)];
+            const int pair = member_pos(slot.member) * static_cast<int>(snapshots().size()) +
+                             snapshot_pos(slot.snapshot);
+            gain = std::nextafter(gain + bound.gains[static_cast<size_t>(pair)][static_cast<size_t>(
+                                             positions[static_cast<size_t>(i)])],
                                   std::numeric_limits<double>::infinity());
         }
         orders.push_back(
-            {positions, NativeScoreBound::upper(base.power, gain, bound.base, bound.max_power,
-                                                team_size(), chart_.times.size())});
+            {positions, NativeScoreBound::upper(base.power, gain, bound.base, bound.max_power, n,
+                                                chart_.times.size())});
     } while (std::next_permutation(positions.begin(), positions.end()));
     std::stable_sort(orders.begin(), orders.end(),
                      [](const Order &a, const Order &b) { return a.cap > b.cap; });
     const auto params = make_fast_score_params(problem_, chart_, base.power);
-    const int n = team_size();
-    std::vector<int64_t> starts(n), ends(n);
-    std::vector<float> boosts(n);
+    const auto &perf_flags = member_perfect_only();
+    std::vector<FastSlotInfo> fast_slots(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const auto &slot = base.slots[static_cast<size_t>(i)];
+        const int mi = member_pos(slot.member);
+        fast_slots[static_cast<size_t>(i)] = {slot.duration_ms, static_cast<float>(slot.live_boost),
+                                              resolve_slot_perfect_only(perf_flags, mi), mi,
+                                              snapshot_pos(slot.snapshot)};
+    }
+    std::vector<int64_t> starts(static_cast<size_t>(n)), ends(static_cast<size_t>(n));
+    std::vector<float> order_boosts(static_cast<size_t>(n));
+    std::vector<uint8_t> order_perf(static_cast<size_t>(n));
     for (int k = 0; k < n; ++k)
-        starts[k] = problem_.chart.skill_times_ms[k];
-    std::vector<int> slots(n);
+        starts[static_cast<size_t>(k)] = problem_.chart.skill_times_ms[static_cast<size_t>(k)];
+    const WindowDeltaTable deltas = build_window_deltas(params, chart_, starts, fast_slots);
+    std::vector<int> slots(static_cast<size_t>(n));
     std::vector<int> best;
     for (const auto &order : orders) {
         if (order.cap <= cutoff) {
@@ -2690,14 +3013,22 @@ std::optional<Evaluation> Engine::evaluate_best_order(const Formation &formation
             continue;
         }
         for (int i = 0; i < n; ++i)
-            slots[order.positions[i]] = i;
-        for (int k = 0; k < n; ++k) {
-            const auto &slot = base.slots[slots[k]];
-            ends[k] = starts[k] + slot.duration_ms;
-            boosts[k] = static_cast<float>(slot.live_boost);
+            slots[static_cast<size_t>(order.positions[static_cast<size_t>(i)])] = i;
+        int64_t total = 0;
+        if (deltas.disjoint) {
+            total = deltas.base_total;
+            for (int k = 0; k < n; ++k)
+                total += deltas.at(slots[static_cast<size_t>(k)], k);
+        } else {
+            for (int k = 0; k < n; ++k) {
+                const auto &slot = fast_slots[static_cast<size_t>(slots[static_cast<size_t>(k)])];
+                ends[static_cast<size_t>(k)] = starts[static_cast<size_t>(k)] + slot.duration_ms;
+                order_boosts[static_cast<size_t>(k)] = slot.live_boost;
+                order_perf[static_cast<size_t>(k)] = slot.perfect_only ? 1 : 0;
+            }
+            total = score_order_native(params, chart_, n, starts.data(), ends.data(),
+                                       order_boosts.data(), order_perf.data());
         }
-        const int64_t total =
-            score_order_native(params, chart_.times, n, starts.data(), ends.data(), boosts.data());
         ++stats.evaluated;
         if (total > cutoff) {
             cutoff = static_cast<double>(total);
@@ -2729,6 +3060,120 @@ std::optional<Evaluation> Engine::evaluate_best_order(const Formation &formation
     return result;
 }
 
+std::optional<Evaluation> Engine::evaluate_mean_if_above(const Formation &formation, double cutoff,
+                                                         ScoreOrderStats &stats) const {
+    if (!fast_score_applicable()) {
+        Evaluation eval = evaluate_mean(formation, false);
+        int64_t orders = 1;
+        for (int i = 2; i <= team_size(); ++i)
+            orders *= i;
+        stats.evaluated += orders;
+        if (!eval.ranking_score || *eval.ranking_score <= cutoff)
+            return std::nullopt;
+        return eval;
+    }
+    const int n = team_size();
+    if (formation.slots.size() != static_cast<size_t>(n))
+        throw SpecError("formation.slots 数量与 settings.team_size 不一致");
+    int64_t fact_n = 1;
+    for (int i = 2; i <= n; ++i)
+        fact_n *= i;
+    stats.evaluated += fact_n;
+
+    const int leader_idx = member_pos(formation.leader);
+    if (leader_idx < 0)
+        throw SpecError("队长 " + std::to_string(formation.leader) + " 不在可用成员中");
+    const bool leader_has_formation =
+        rules_.leader_has_formation_conditions(*members_[static_cast<size_t>(leader_idx)]);
+    const PowerMatrix *matrix =
+        leader_has_formation ? nullptr : &power_matrix(static_cast<size_t>(leader_idx));
+    const PowerMatrix *base_matrix = leader_has_formation ? &base_power_matrix() : nullptr;
+    std::vector<int> member_indices(static_cast<size_t>(n));
+    std::vector<int> snap_indices(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        const int mi = member_pos(formation.slots[static_cast<size_t>(i)].member);
+        if (mi < 0)
+            throw SpecError("成员 " +
+                            std::to_string(formation.slots[static_cast<size_t>(i)].member) +
+                            " 不在可用成员中");
+        const int si = snapshot_pos(formation.slots[static_cast<size_t>(i)].snapshot);
+        if (si < 0)
+            throw SpecError("Snapshot " +
+                            std::to_string(formation.slots[static_cast<size_t>(i)].snapshot) +
+                            " 不在可用卡池中");
+        member_indices[static_cast<size_t>(i)] = mi;
+        snap_indices[static_cast<size_t>(i)] = si;
+    }
+    std::vector<const Member *> team;
+    if (leader_has_formation) {
+        team.reserve(static_cast<size_t>(n));
+        for (int mi : member_indices)
+            team.push_back(members_[static_cast<size_t>(mi)]);
+    }
+    const auto &dur_matrix = durations();
+    const auto &boost_values = boosts();
+    const auto &perf_flags = member_perfect_only();
+    std::vector<FastSlotInfo> fast_slots(static_cast<size_t>(n));
+    int64_t total_power = 0;
+    for (int i = 0; i < n; ++i) {
+        const int mi = member_indices[static_cast<size_t>(i)];
+        const int si = snap_indices[static_cast<size_t>(i)];
+        total_power += matrix ? (*matrix)[static_cast<size_t>(mi)][static_cast<size_t>(si)]
+                              : (*base_matrix)[static_cast<size_t>(mi)][static_cast<size_t>(si)] +
+                                    leader_power_delta(static_cast<size_t>(leader_idx),
+                                                       static_cast<size_t>(mi), &team);
+        fast_slots[static_cast<size_t>(i)] = {
+            dur_matrix[static_cast<size_t>(mi)][static_cast<size_t>(si)],
+            static_cast<float>(boost_values[static_cast<size_t>(mi)]),
+            resolve_slot_perfect_only(perf_flags, mi), mi, si};
+    }
+
+    const auto params = make_fast_score_params(problem_, chart_, total_power);
+    std::vector<int64_t> starts(static_cast<size_t>(n));
+    for (int k = 0; k < n; ++k)
+        starts[static_cast<size_t>(k)] = problem_.chart.skill_times_ms[static_cast<size_t>(k)];
+    const WindowDeltaTable deltas = build_window_deltas(params, chart_, starts, fast_slots);
+    double mean_score = 0.0;
+    if (deltas.disjoint) {
+        int64_t delta_sum = 0;
+        for (int i = 0; i < n; ++i)
+            for (int k = 0; k < n; ++k)
+                delta_sum += deltas.at(i, k);
+        const int64_t fact_nm1 = fact_n / n;
+        const long double exact_sum =
+            static_cast<long double>(deltas.base_total) * static_cast<long double>(fact_n) +
+            static_cast<long double>(delta_sum) * static_cast<long double>(fact_nm1);
+        mean_score = static_cast<double>(exact_sum / static_cast<long double>(fact_n));
+    } else {
+        std::vector<int> perm(static_cast<size_t>(n));
+        std::iota(perm.begin(), perm.end(), 0);
+        std::vector<int64_t> ends(static_cast<size_t>(n));
+        std::vector<float> order_boosts(static_cast<size_t>(n));
+        std::vector<uint8_t> order_perf(static_cast<size_t>(n));
+        std::vector<int> slots_at_trigger(static_cast<size_t>(n));
+        double sum = 0.0;
+        do {
+            for (int i = 0; i < n; ++i)
+                slots_at_trigger[static_cast<size_t>(perm[static_cast<size_t>(i)])] = i;
+            for (int k = 0; k < n; ++k) {
+                const auto &slot =
+                    fast_slots[static_cast<size_t>(slots_at_trigger[static_cast<size_t>(k)])];
+                ends[static_cast<size_t>(k)] = starts[static_cast<size_t>(k)] + slot.duration_ms;
+                order_boosts[static_cast<size_t>(k)] = slot.live_boost;
+                order_perf[static_cast<size_t>(k)] = slot.perfect_only ? 1 : 0;
+            }
+            sum += static_cast<double>(score_order_native(params, chart_, n, starts.data(),
+                                                          ends.data(), order_boosts.data(),
+                                                          order_perf.data()));
+        } while (std::next_permutation(perm.begin(), perm.end()));
+        mean_score = sum / static_cast<double>(fact_n);
+    }
+    if (mean_score <= cutoff) {
+        return std::nullopt;
+    }
+    return evaluate_mean(formation, false);
+}
+
 Evaluation Engine::evaluate_mean(const Formation &formation, bool detail) const {
     auto result = evaluate_theoretical(formation, detail);
     result.ranking_objective = "mean_score";
@@ -2750,25 +3195,26 @@ NativeScoreBound Engine::linear_score_bound(const std::vector<float> &live_bound
     difficulty *= static_cast<float>(*settings.score.level_alpha);
     difficulty += 1.0f;
     const float adjustment = static_cast<float>(settings.score.adjustment_factor);
-    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
     const float life =
         settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
     const float assist =
         settings.assist.enabled ? static_cast<float>(settings.assist.score_percent / 100) : 1.0f;
     const float denominator = static_cast<float>(chart.converted_note_count);
     auto finite_positive = [](float value) { return std::isfinite(value) && value > 0; };
-    if (!finite_positive(adjustment) || !finite_positive(difficulty) ||
-        !finite_positive(judgement) || !finite_positive(life) || !finite_positive(assist) ||
-        !finite_positive(denominator))
+    if (!finite_positive(adjustment) || !finite_positive(difficulty) || !finite_positive(life) ||
+        !finite_positive(assist) || !finite_positive(denominator))
         return result;
-    std::vector<long double> coefficients(chart.times.size());
+    std::vector<long double> coefficients(chart.times.size(), 0.0L);
     long double base = 0;
+    float max_judgement = 0.0f;
     for (size_t i = 0; i < chart.times.size(); ++i) {
         const float weight = static_cast<float>(chart.note_weights[i]);
+        const float judgement = chart.native_judgement_factors[i];
         const float combo = chart.native_combo_bonuses[i] + 1.0f;
-        if (weight == 0)
+        max_judgement = std::max(max_judgement, judgement);
+        if (weight == 0.0f || judgement == 0.0f)
             continue;
-        if (!finite_positive(weight) || !finite_positive(combo))
+        if (!finite_positive(weight) || !finite_positive(judgement) || !finite_positive(combo))
             return result;
         float check = adjustment;
         for (float operand : {difficulty, weight, judgement, combo}) {
@@ -2795,19 +3241,35 @@ NativeScoreBound Engine::linear_score_bound(const std::vector<float> &live_bound
     };
     result.base = up(base);
     result.gains.assign(members().size() * snapshots().size(), std::vector<double>(team_size()));
+    const auto &perf_flags = member_perfect_only();
     for (size_t p = 0; p < result.gains.size(); ++p) {
-        const int member = p / snapshots().size(), snap = p % snapshots().size();
+        const int member = static_cast<int>(p / snapshots().size());
+        const int snap = static_cast<int>(p % snapshots().size());
         const float boost = static_cast<float>(e.live_boost(member));
         if (boost < 0 || !std::isfinite(boost))
             return result;
+        const bool perf_only =
+            !chart.all_notes_perfect_or_just && perf_flags[static_cast<size_t>(member)] == 1;
         for (int k = 0; k < team_size(); ++k) {
-            const auto start = e.problem().chart.skill_times_ms[k];
+            const auto start = e.problem().chart.skill_times_ms[static_cast<size_t>(k)];
             const auto end = start + e.duration_ms(member, snap);
+            const size_t lo = static_cast<size_t>(
+                std::lower_bound(chart.times.begin(), chart.times.end(), start) -
+                chart.times.begin());
+            const size_t hi = static_cast<size_t>(
+                std::lower_bound(chart.times.begin() + static_cast<ptrdiff_t>(lo),
+                                 chart.times.end(), end) -
+                chart.times.begin());
             long double sum = 0;
-            for (size_t i = 0; i < chart.times.size(); ++i)
-                if (chart.times[i] >= start && chart.times[i] < end)
+            if (perf_only) {
+                for (size_t i = lo; i < hi; ++i)
+                    if (chart.note_is_perfect[i])
+                        sum += coefficients[i] * boost;
+            } else {
+                for (size_t i = lo; i < hi; ++i)
                     sum += coefficients[i] * boost;
-            result.gains[p][k] = up(sum);
+            }
+            result.gains[p][static_cast<size_t>(k)] = up(sum);
         }
     }
     long double peak = 1;
@@ -2821,7 +3283,7 @@ NativeScoreBound Engine::linear_score_bound(const std::vector<float> &live_bound
         return result;
     for (long double f :
          {static_cast<long double>(adjustment), static_cast<long double>(difficulty),
-          static_cast<long double>(max_weight), static_cast<long double>(judgement),
+          static_cast<long double>(max_weight), static_cast<long double>(max_judgement),
           static_cast<long double>(max_combo), 1 + static_cast<long double>(max_live),
           1 / static_cast<long double>(denominator), static_cast<long double>(life),
           static_cast<long double>(assist)})
@@ -2851,6 +3313,9 @@ double NativeScoreBound::upper(double power, double gain, double base, double ma
 double Engine::theoretical_upper_bound(double power_bound,
                                        const std::vector<float> &live_bound) const {
     const auto &settings = problem_.settings;
+    if (!chart_.deterministic_judgement ||
+        chart_.native_judgement_factors.size() != chart_.times.size())
+        throw SpecError("理论分数上界需要确定性判定");
     if (live_bound.size() != chart_.times.size())
         throw SpecError("理论分数上界形状错误");
 
@@ -2864,7 +3329,6 @@ double Engine::theoretical_upper_bound(double power_bound,
     difficulty += 1.0f;
     float base = static_cast<float>(settings.score.adjustment_factor) * p;
     base *= difficulty;
-    const float judgement = static_cast<float>(settings.judgement.factors.at("perfect"));
     const float life =
         settings.life.initial > 0 ? 1.0f : static_cast<float>(settings.life.onus_factor);
     const float assist =
@@ -2872,7 +3336,7 @@ double Engine::theoretical_upper_bound(double power_bound,
     long double sum = 0;
     for (size_t i = 0; i < chart_.times.size(); ++i) {
         float value = static_cast<float>(chart_.note_weights[i]) * base;
-        value *= judgement;
+        value *= chart_.native_judgement_factors[i];
         value *= chart_.native_combo_bonuses[i] + 1.0f;
         value *= 1.0f + live_bound[i];
         value /= static_cast<float>(chart_.converted_note_count);

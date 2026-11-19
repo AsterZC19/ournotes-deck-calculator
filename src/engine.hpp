@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "model.hpp"
@@ -41,12 +42,13 @@ public:
     Triple leader_bonus_bp(const Member &leader, const Member &member,
                            const std::vector<const Member *> *team = nullptr) const;
     bool formation_leader_conditions() const;
+    bool leader_has_formation_conditions(const Member &leader) const;
     bool leader_condition_matches(int group, const Member &member,
                                   const std::vector<const Member *> *team) const;
     int64_t duration_ms(const Member &member, const Snapshot &snapshot) const;
 
-    const std::map<std::pair<int64_t, int>, std::pair<int, int64_t>> &
-    unmapped_leader_effects() const {
+    std::map<std::pair<int64_t, int>, std::pair<int, int64_t>> unmapped_leader_effects() const {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
         return unmapped_;
     }
 
@@ -66,8 +68,11 @@ private:
     std::map<int, std::string> leader_axes_;
     bool unmapped_is_error_;
     bool formation_leader_conditions_ = false;
+    std::unordered_set<int64_t> formation_leader_skills_;
 
-    mutable std::unordered_map<uint64_t, bool> target_cache_;
+    // Populated once in constructor for lock-free concurrent reads during search.
+    std::unordered_map<uint64_t, bool> target_cache_;
+    mutable std::mutex cache_mutex_;
     mutable std::unordered_map<uint64_t, bool> group_cache_;
     mutable std::unordered_map<int64_t, double> live_cache_;
     mutable std::unordered_map<uint64_t, Triple> leader_cache_;
@@ -81,6 +86,11 @@ struct ChartData {
     std::vector<double> note_weights;
     std::vector<double> combo_bonuses;
     std::vector<float> native_combo_bonuses;
+    std::vector<float> native_judgement_factors;
+    std::vector<uint8_t> note_is_perfect;
+    bool deterministic_judgement = false;
+    bool all_judgements_nonneg_finite = false;
+    bool all_notes_perfect_or_just = false;
     std::vector<double> prefix;
     double base = 0;
     double all_note_weight_sum = 0;
@@ -203,8 +213,12 @@ public:
                         const std::vector<const Member *> *team = nullptr) const;
 
     const std::vector<std::vector<int64_t>> &power_matrix(size_t leader_index) const;
+    const PowerMatrix &base_power_matrix() const;
+    int64_t leader_power_delta(size_t leader_index, size_t member_index,
+                               const std::vector<const Member *> *team = nullptr) const;
     const std::vector<std::vector<int64_t>> &durations() const;
     const std::vector<double> &boosts() const;
+    const std::vector<uint8_t> &member_perfect_only() const;
     const std::vector<std::vector<std::vector<double>>> &gains() const;
 
     ChartInfo chart_info() const;
@@ -226,6 +240,8 @@ public:
         Evaluation *base_out = nullptr) const;
     Evaluation evaluate_theoretical(const Formation &formation, bool detail = false) const;
     Evaluation evaluate_mean(const Formation &formation, bool detail = false) const;
+    std::optional<Evaluation> evaluate_mean_if_above(const Formation &formation, double cutoff,
+                                                     ScoreOrderStats &stats) const;
     std::optional<Evaluation> evaluate_best_order(const Formation &formation,
                                                   const NativeScoreBound &bound, double cutoff,
                                                   ScoreOrderStats &stats) const;
@@ -242,16 +258,21 @@ private:
     Rules rules_;
     std::vector<const Member *> members_;
     std::vector<const Snapshot *> snapshots_;
+    std::vector<Triple> member_common_;
     std::unordered_map<int64_t, int> member_pos_;
     std::unordered_map<int64_t, int> snapshot_pos_;
     ChartData chart_;
 
     mutable std::vector<std::vector<int64_t>> durations_;
     mutable std::vector<double> boosts_;
+    mutable std::vector<uint8_t> member_perfect_only_;
     mutable std::vector<std::vector<std::vector<double>>> gains_;
-    mutable bool durations_ready_ = false;
-    mutable bool boosts_ready_ = false;
-    mutable bool gains_ready_ = false;
+    mutable PowerMatrix base_power_matrix_;
+    mutable std::once_flag durations_once_;
+    mutable std::once_flag boosts_once_;
+    mutable std::once_flag perfect_only_once_;
+    mutable std::once_flag gains_once_;
+    mutable std::once_flag base_power_once_;
     mutable std::mutex power_mutex_;
     mutable std::unordered_map<size_t, std::shared_ptr<const PowerMatrix>> power_matrices_;
 };

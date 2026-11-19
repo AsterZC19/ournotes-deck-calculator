@@ -1672,14 +1672,14 @@ Json Problem::describe() const {
     constraints_json.set("required_members", int64_array_json(constraints.required_members));
     constraints_json.set("required_snapshots", int64_array_json(constraints.required_snapshots));
 
-    Json search = Json::object();
-    search.set("mode", Json(this->search.mode));
-    search.set("top", Json(this->search.top));
-    search.set("time_limit_s", Json(this->search.time_limit_s));
-    search.set("order_search", Json(this->search.order_search));
-    search.set("prescreen", Json(this->search.prescreen));
-    search.set("seed", Json(this->search.seed));
-    search.set("verbose", Json(this->search.verbose));
+    Json search_json = Json::object();
+    search_json.set("mode", Json(this->search.mode));
+    search_json.set("top", Json(this->search.top));
+    search_json.set("time_limit_s", Json(this->search.time_limit_s));
+    search_json.set("order_search", Json(this->search.order_search));
+    search_json.set("prescreen", Json(this->search.prescreen));
+    search_json.set("seed", Json(this->search.seed));
+    search_json.set("verbose", Json(this->search.verbose));
 
     Json out = Json::object();
     out.set("song", song_json);
@@ -1689,7 +1689,7 @@ Json Problem::describe() const {
     out.set("available", available);
     out.set("settings", settings_json(settings));
     out.set("constraints", constraints_json);
-    out.set("search", search);
+    out.set("search", search_json);
     return out;
 }
 

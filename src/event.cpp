@@ -426,9 +426,9 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             if (score.index < min_index)
                 return;
             for (auto &slot : scored_formation.slots)
-                for (const auto &evaluated : score.slots)
-                    if (slot.member == evaluated.member)
-                        slot.trigger = evaluated.trigger;
+                for (const auto &eval_slot : score.slots)
+                    if (slot.member == eval_slot.member)
+                        slot.trigger = eval_slot.trigger;
             int result_rank = rank;
             if (!fixed_rank) {
                 double total = num_field(score.estimated_score, "total");
@@ -462,8 +462,9 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                     c.cp_distribution[cp_integer(cp)] += num_field(row, "probability");
                     c.cp_counts[cp_integer(cp)] += int_field(row, "orders");
                 }
-            auto covers = [&](const Candidate &a, const Candidate &b) {
-                return dominates(a.yield, b.yield) && (!finite_random_cp || cp_dominates(a, b));
+            auto covers = [&](const Candidate &lhs, const Candidate &rhs) {
+                return dominates(lhs.yield, rhs.yield) &&
+                       (!finite_random_cp || cp_dominates(lhs, rhs));
             };
             bool dominated = false;
             for (const auto &other : pool)
@@ -505,14 +506,16 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             double s_base = -1.0;
             double s_upper = stats.score_ceiling;
             int64_t f_power = power >= 0 ? static_cast<int64_t>(power) : -1;
-            if (f_power < 0 || engine.rules().formation_leader_conditions()) {
+            const bool leader_formation = engine.rules().leader_has_formation_conditions(
+                *engine.index().member_by_id.at(formation.leader));
+            if (f_power < 0 || leader_formation) {
                 EvalOptions po;
                 po.order_search = "given";
                 po.calculate_score = false;
                 po.validate = false;
                 f_power = engine.evaluate(formation, po).power;
             }
-            if (engine.fast_score_applicable()) {
+            if (score_bound.enabled && engine.fast_score_applicable()) {
                 s_base = engine.native_min_score(f_power, formation);
             }
             if (score_bound.enabled) {
@@ -543,43 +546,54 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                     if (s_upper >= num_field(row, "required_score"))
                         rank_upper = std::max(rank_upper, static_cast<int>(int_field(row, "rank")));
             }
-            const Yield cap_yield = reward_models[rank_upper - 2].calculate(pt, drop);
-            for (const auto &other : pool) {
-                if (dominates(other.yield, cap_yield)) {
-                    ++stats.dominated_before_evaluation;
-                    return;
+            // Envelope across reachable ranks stays sound even when CP/rewards are non-monotonic.
+            Yield range_envelope;
+            bool has_range_yield = false;
+            for (const auto &row : rank_rows->items()) {
+                const int r = static_cast<int>(int_field(row, "rank"));
+                if (r < rank_lower || r > rank_upper)
+                    continue;
+                const Yield y = reward_models[static_cast<size_t>(r - 2)].calculate(pt, drop);
+                if (!has_range_yield) {
+                    range_envelope = y;
+                    has_range_yield = true;
+                } else {
+                    range_envelope.cp = std::max(range_envelope.cp, y.cp);
+                    range_envelope.pt = std::max(range_envelope.pt, y.pt);
+                    range_envelope.shop = std::max(range_envelope.shop, y.shop);
                 }
+            }
+            if (!has_range_yield) {
+                range_envelope =
+                    reward_models[static_cast<size_t>(rank_upper - 2)].calculate(pt, drop);
+            }
+            const bool range_dominated =
+                finite_random_cp
+                    ? finite_envelope_covered(range_envelope)
+                    : std::any_of(pool.begin(), pool.end(), [&](const Candidate &other) {
+                          return dominates(other.yield, range_envelope);
+                      });
+            if (range_dominated) {
+                ++stats.dominated_before_evaluation;
+                return;
             }
             int orders = 1;
             for (int i = 2; i <= engine.team_size(); ++i)
                 orders *= i;
-            if (s_base >= 0 && rank_lower == rank_upper) {
-                EvalOptions rep_options;
-                rep_options.order_search = "given";
-                rep_options.validate = false;
-                Evaluation representative = engine.evaluate(formation, rep_options);
+            if (s_base >= 0 && rank_lower == rank_upper && min_index <= 0 &&
+                engine.team_size() <= 5 && score_bound.enabled) {
+                const Yield exact_yield =
+                    reward_models[static_cast<size_t>(rank_lower - 2)].calculate(pt, drop);
+                Evaluation representative = engine.evaluate_mean(formation, false);
                 ++stats.index_evaluations;
                 ++stats.absolute_score_evaluations;
-                if (representative.index < min_index)
-                    return;
-                const double total = num_field(representative.estimated_score, "total");
-                representative.ranking_objective = "mean_score";
-                representative.ranking_score = total;
-                representative.order_analysis = Json::object();
-                representative.order_analysis.set("activation_order", Json("random_permutation"));
-                representative.order_analysis.set("best_order_is_controllable", Json(false));
-                representative.order_analysis.set("mean_score", Json(total));
-                representative.order_analysis.set("best_score", Json(total));
-                representative.order_analysis.set("worst_score", Json(total));
-                representative.order_analysis.set("score_permutations", Json(orders));
-                representative.order_analysis.set("order_search_complete", Json(true));
                 Json distribution = Json::array();
                 Json row = Json::object();
                 row.set("rank", Json(rank_lower));
                 row.set("orders", Json(orders));
                 row.set("probability", Json(1.0));
                 distribution.push_back(std::move(row));
-                retain_score(std::move(representative), formation, &cap_yield,
+                retain_score(std::move(representative), formation, &exact_yield,
                              std::move(distribution));
                 return;
             }
@@ -637,6 +651,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             ++stats.absolute_score_evaluations;
             representative.ranking_objective = "mean_score";
             representative.ranking_score = score_sum / count;
+            representative.has_order = true;
             representative.order_analysis = Json::object();
             representative.order_analysis.set("activation_order", Json("random_permutation"));
             representative.order_analysis.set("best_order_is_controllable", Json(false));
@@ -656,15 +671,54 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             retain_score(std::move(representative), formation, &sum, std::move(distribution));
             return;
         }
-        if (!engine.for_each_score_order(formation, [&](const Evaluation &score) {
+        // Best-order objective: keep only the highest-index witness per achieved rank.
+        struct RankWitness {
+            bool found = false;
+            double best_index = -std::numeric_limits<double>::infinity();
+            std::vector<int> permutation;
+        };
+        std::array<RankWitness, 6> best_by_rank{};
+        const bool finished = engine.for_each_score_order_fast(
+            formation, [&](double total, double index, const std::vector<int> &permutation) {
                 if (expired())
                     return false;
                 ++stats.index_evaluations;
                 ++stats.absolute_score_evaluations;
-                retain_score(score, formation);
+                if (index < min_index)
+                    return true;
+                int achieved = 2;
+                for (const auto &row : rank_rows->items())
+                    if (total >= num_field(row, "required_score"))
+                        achieved = std::max(achieved, static_cast<int>(int_field(row, "rank")));
+                auto &witness = best_by_rank[static_cast<size_t>(achieved - 2)];
+                if (!witness.found || index > witness.best_index) {
+                    witness.found = true;
+                    witness.best_index = index;
+                    witness.permutation = permutation;
+                }
                 return true;
-            }))
+            });
+        if (!finished) {
             complete = false;
+            return;
+        }
+        for (int r = 2; r <= 7; ++r) {
+            const auto &witness = best_by_rank[static_cast<size_t>(r - 2)];
+            if (!witness.found)
+                continue;
+            const Yield y = reward_models[static_cast<size_t>(r - 2)].calculate(pt, drop);
+            if (std::any_of(pool.begin(), pool.end(),
+                            [&](const Candidate &other) { return dominates(other.yield, y); }))
+                continue;
+            Formation witness_formation = formation;
+            for (size_t i = 0; i < witness_formation.slots.size() && i < witness.permutation.size();
+                 ++i)
+                witness_formation.slots[i].trigger = witness.permutation[i] + 1;
+            EvalOptions rep_options;
+            rep_options.order_search = "given";
+            rep_options.validate = false;
+            retain_score(engine.evaluate(witness_formation, rep_options), witness_formation);
+        }
     };
     if (options.method == "exact") {
         if (engine.members().size() < static_cast<size_t>(engine.team_size()) ||
@@ -702,10 +756,10 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             upper_score = std::min(upper_score, stats.score_ceiling);
             if (mean_rewards) {
                 Yield envelope;
-                for (const auto &[rank, threshold] : reward_thresholds) {
+                for (const auto &[thr_rank, threshold] : reward_thresholds) {
                     if (threshold > upper_score)
                         continue;
-                    const Yield y = reward_models[rank - 2].calculate(pt, drop);
+                    const Yield y = reward_models[thr_rank - 2].calculate(pt, drop);
                     envelope.cp = std::max(envelope.cp, y.cp);
                     envelope.pt = std::max(envelope.pt, y.pt);
                     envelope.shop = std::max(envelope.shop, y.shop);
@@ -718,9 +772,9 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 }
                 return covered(envelope);
             }
-            for (const auto &[rank, threshold] : reward_thresholds)
+            for (const auto &[thr_rank, threshold] : reward_thresholds)
                 if (threshold <= upper_score &&
-                    !covered(reward_models[rank - 2].calculate(pt, drop)))
+                    !covered(reward_models[thr_rank - 2].calculate(pt, drop)))
                     return false;
             return true;
         };
@@ -857,7 +911,7 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             for (size_t snap = 0; snap < snapshot_count; ++snap)
                 order[snap] = snap;
             std::stable_sort(order.begin(), order.end(),
-                             [&](size_t a, size_t b) { return value(a) > value(b); });
+                             [&](size_t lhs, size_t rhs) { return value(lhs) > value(rhs); });
             return order;
         };
         const auto pt_order = descending([&](size_t snap) { return snapshot_pt[snap]; });
@@ -924,6 +978,13 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                 }
             return upwards(sum);
         };
+        std::vector<double> work_dp(mask_count), next_dp(mask_count);
+        std::vector<std::vector<double>> future_gain_buf(
+            static_cast<size_t>(engine.team_size()),
+            std::vector<double>(static_cast<size_t>(engine.team_size())));
+        std::vector<std::vector<double>> cond_rows_buf(
+            static_cast<size_t>(engine.team_size()),
+            std::vector<double>(static_cast<size_t>(engine.team_size())));
         auto cached_prunable = [&](size_t depth, double pt, double drop, double selected_power) {
             ++stats.bound_nodes;
             ++stats.cached_snapshot_nodes;
@@ -973,29 +1034,29 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                         dp[mask | (size_t{1} << k)] =
                             std::max(dp[mask | (size_t{1} << k)],
                                      selected_dp[depth - 1][mask] + last_gain[k]);
-            auto completion_gain = [&](const std::vector<std::vector<double>> &rows) {
-                auto work = dp;
-                for (size_t i = 0; i < rows.size(); ++i) {
-                    std::vector<double> next(mask_count, -std::numeric_limits<double>::infinity());
+            auto completion_gain = [&](const std::vector<std::vector<double>> &rows,
+                                       size_t row_count) {
+                std::copy(dp.begin(), dp.end(), work_dp.begin());
+                for (size_t i = 0; i < row_count; ++i) {
+                    std::fill(next_dp.begin(), next_dp.end(),
+                              -std::numeric_limits<double>::infinity());
                     for (size_t mask : trigger_masks[depth + i])
                         for (int k = 0; k < engine.team_size(); ++k)
                             if (!(mask & (size_t{1} << k)))
-                                next[mask | (size_t{1} << k)] = std::max(
-                                    next[mask | (size_t{1} << k)], work[mask] + rows[i][k]);
-                    work = std::move(next);
+                                next_dp[mask | (size_t{1} << k)] = std::max(
+                                    next_dp[mask | (size_t{1} << k)], work_dp[mask] + rows[i][k]);
+                    work_dp.swap(next_dp);
                 }
-                return work.back();
+                return work_dp.back();
             };
-            std::vector<std::vector<double>> future_gain(remaining,
-                                                         std::vector<double>(engine.team_size()));
             for (size_t i = depth; i < scoped_members.size(); ++i) {
                 const size_t m = scoped_members[i];
                 for (int k = 0; k < engine.team_size(); ++k) {
                     const size_t snap = first_available(gain_order[m][k]);
-                    future_gain[i - depth][k] = score_bound.gains[m * snapshot_count + snap][k];
+                    future_gain_buf[i - depth][k] = score_bound.gains[m * snapshot_count + snap][k];
                 }
             }
-            const double upper_score = score_upper(completion_gain(future_gain));
+            const double upper_score = score_upper(completion_gain(future_gain_buf, remaining));
             if (covered_score(upper_score))
                 return true;
             if (mean_rewards)
@@ -1006,10 +1067,10 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
             auto axis_value = [](const Yield &y, int axis) {
                 return axis == 0 ? y.cp : axis == 1 ? y.pt : y.shop;
             };
-            for (const auto &[rank, threshold] : reward_thresholds) {
+            for (const auto &[thr_rank, threshold] : reward_thresholds) {
                 if (threshold > std::min(upper_score, stats.score_ceiling))
                     continue;
-                const auto &model = reward_models[rank - 2];
+                const auto &model = reward_models[thr_rank - 2];
                 const Yield upper_yield = model.calculate(upper_pt, upper_drop);
                 if (covered(upper_yield))
                     continue;
@@ -1020,8 +1081,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                         if (axis_value(upper_yield, axis) <= axis_value(witness.yield, axis))
                             continue;
                         double conditional_power = selected_power;
-                        std::vector<std::vector<double>> rows(
-                            remaining, std::vector<double>(engine.team_size()));
+                        for (size_t r = 0; r < remaining; ++r)
+                            std::fill(cond_rows_buf[r].begin(), cond_rows_buf[r].end(), 0.0);
                         bool feasible = true;
                         const double other_pt =
                             snapshot_bonus(pt_order, snapshot_pt, remaining - 1);
@@ -1041,8 +1102,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                                     continue;
                                 best_power = std::max(best_power, double((*power_matrix)[m][snap]));
                                 for (int k = 0; k < engine.team_size(); ++k)
-                                    rows[i - depth][k] =
-                                        std::max(rows[i - depth][k],
+                                    cond_rows_buf[i - depth][k] =
+                                        std::max(cond_rows_buf[i - depth][k],
                                                  score_bound.gains[m * snapshot_count + snap][k]);
                             }
                             if (best_power < 0) {
@@ -1053,7 +1114,8 @@ std::vector<Candidate> search(const Engine &engine, const RankOptions &options,
                         }
                         if (feasible &&
                             NativeScoreBound::upper(
-                                upwards(conditional_power), upwards(completion_gain(rows)),
+                                upwards(conditional_power),
+                                upwards(completion_gain(cond_rows_buf, remaining)),
                                 score_bound.base, score_bound.max_power, engine.team_size(),
                                 engine.chart().times.size()) >= threshold)
                             can_escape = true;
@@ -1714,10 +1776,10 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
         double rb = num_field(b, "challenge_runs_per_normal_live");
         if (ra != rb)
             return ra > rb;
-        int64_t na = int_field(a, "normal_candidate");
-        int64_t nb = int_field(b, "normal_candidate");
-        if (na != nb)
-            return na < nb;
+        int64_t norm_a = int_field(a, "normal_candidate");
+        int64_t norm_b = int_field(b, "normal_candidate");
+        if (norm_a != norm_b)
+            return norm_a < norm_b;
         return int_field(a, "challenge_candidate") < int_field(b, "challenge_candidate");
     };
     Json recommended = Json::object();
@@ -1781,14 +1843,14 @@ Json event_recommend(const Engine &engine, const RankOptions &options,
             double sb = num_field(b, secondary.c_str());
             if (sa != sb)
                 return sa > sb;
-            double ca = num_field(a, "remaining_cp");
-            double cb = num_field(b, "remaining_cp");
-            if (ca != cb)
-                return ca > cb;
-            int64_t na = int_field(a, "normal_candidate");
-            int64_t nb = int_field(b, "normal_candidate");
-            if (na != nb)
-                return na < nb;
+            double rem_cp_a = num_field(a, "remaining_cp");
+            double rem_cp_b = num_field(b, "remaining_cp");
+            if (rem_cp_a != rem_cp_b)
+                return rem_cp_a > rem_cp_b;
+            int64_t norm_a = int_field(a, "normal_candidate");
+            int64_t norm_b = int_field(b, "normal_candidate");
+            if (norm_a != norm_b)
+                return norm_a < norm_b;
             return int_field(a, "challenge_candidate") < int_field(b, "challenge_candidate");
         };
         const Json *best_pt = nullptr;

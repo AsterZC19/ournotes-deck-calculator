@@ -462,9 +462,12 @@ struct ClassSearch {
     std::vector<int64_t> dp_, next_;
     std::vector<int> assigned_;
     std::vector<int> candidate_snapshots_;
+    std::vector<uint8_t> cand_snap_seen_;
     std::vector<char> is_required_snap_;
     std::vector<int> required_snap_indices_;
     std::vector<std::vector<int>> best_class_snap_;
+    std::vector<std::vector<std::array<int, kMaxTeam>>> top_class_snaps_;
+    std::vector<std::vector<int>> top_class_snap_count_;
     std::vector<int64_t> rem_power_;
     std::vector<double> rem_gain_;
     std::vector<std::vector<double>> member_pos_gain;
@@ -546,7 +549,8 @@ struct ClassSearch {
         rem_power_.resize(s.team_size + 1);
         rem_gain_.resize(s.team_size + 1);
 
-        candidate_snapshots_.reserve(s.snap_count);
+        candidate_snapshots_.reserve(static_cast<size_t>(s.snap_count));
+        cand_snap_seen_.assign(static_cast<size_t>(s.snap_count), 0);
         is_required_snap_.assign(s.snap_count, 0);
         for (int snap = 0; snap < s.snap_count; ++snap) {
             if (std::find(s.required_snapshots.begin(), s.required_snapshots.end(),
@@ -650,14 +654,26 @@ struct ClassSearch {
         }
 
         candidate_snapshots_.clear();
-        for (int s = 0; s < shared.snap_count; ++s) {
-            for (int row = 0; row < n; ++row) {
-                if (class_of[members[row]][s] == selected_classes[row]) {
+        for (int req_s : required_snap_indices_) {
+            if (!cand_snap_seen_[static_cast<size_t>(req_s)]) {
+                cand_snap_seen_[static_cast<size_t>(req_s)] = 1;
+                candidate_snapshots_.push_back(req_s);
+            }
+        }
+        for (int row = 0; row < n; ++row) {
+            const int c = selected_classes[row];
+            const int cnt = top_class_snap_count_[row][c];
+            const auto &top = top_class_snaps_[row][c];
+            for (int i = 0; i < cnt; ++i) {
+                const int s = top[static_cast<size_t>(i)];
+                if (!cand_snap_seen_[static_cast<size_t>(s)]) {
+                    cand_snap_seen_[static_cast<size_t>(s)] = 1;
                     candidate_snapshots_.push_back(s);
-                    break;
                 }
             }
         }
+        for (int s : candidate_snapshots_)
+            cand_snap_seen_[static_cast<size_t>(s)] = 0;
         if (candidate_snapshots_.size() < static_cast<size_t>(n))
             return {};
 
@@ -672,7 +688,7 @@ struct ClassSearch {
         dp_[0] = 0;
 
         for (size_t i = 0; i < num_candidates; ++i) {
-            if (expired())
+            if ((i & 31) == 0 && expired())
                 return {};
             const int s = candidate_snapshots_[i];
             const bool required = is_required_snap_[s] != 0;
@@ -755,16 +771,20 @@ struct ClassSearch {
         }
         ++score_evaluations;
         std::optional<Evaluation> evaluation;
-        if (shared.average_objective || matched_power < 0) {
+        if (shared.average_objective && matched_power >= 0) {
+            evaluation =
+                shared.engine->evaluate_mean_if_above(formation, current_set_cutoff(), order_stats);
+        } else if (shared.average_objective || matched_power < 0) {
             evaluation = shared.average_objective ? shared.engine->evaluate_mean(formation)
                                                   : shared.engine->evaluate_theoretical(formation);
             int64_t orders = 1;
             for (int i = 2; i <= shared.team_size; ++i)
                 orders *= i;
             order_stats.evaluated += orders;
-        } else
+        } else {
             evaluation = shared.engine->evaluate_best_order(formation, bound, current_set_cutoff(),
                                                             order_stats);
+        }
         if (!evaluation || *evaluation->ranking_score <= current_set_cutoff())
             return;
         Solution candidate;
@@ -965,17 +985,22 @@ struct ClassSearch {
         }
 
         ++compositions;
-        const bool has_team_conditions = shared.engine->rules().formation_leader_conditions();
+        const bool has_team_conditions = shared.engine->rules().leader_has_formation_conditions(
+            *shared.members[static_cast<size_t>(game.leader_member)]);
         const auto *leader_matrix =
             has_team_conditions
                 ? nullptr
                 : &shared.engine->power_matrix(static_cast<size_t>(game.leader_member));
+        const auto *base_matrix =
+            has_team_conditions ? &shared.engine->base_power_matrix() : nullptr;
 
         exact_power.assign(n, std::vector<int64_t>(shared.snap_count));
         class_power.resize(n);
         class_order.resize(n);
         selected_classes.resize(n);
         best_class_snap_.resize(n);
+        top_class_snaps_.resize(n);
+        top_class_snap_count_.resize(n);
 
         for (int row = 0; row < n; ++row) {
             const int m = members[row];
@@ -984,12 +1009,17 @@ struct ClassSearch {
             class_order[row].resize(num_classes);
             std::iota(class_order[row].begin(), class_order[row].end(), 0);
             best_class_snap_[row].assign(num_classes, -1);
+            top_class_snaps_[row].resize(num_classes);
+            top_class_snap_count_[row].assign(num_classes, 0);
 
-            const auto *m_row = leader_matrix ? &(*leader_matrix)[m] : nullptr;
+            const auto *m_row = leader_matrix ? &(*leader_matrix)[m] : &(*base_matrix)[m];
+            const int64_t leader_delta =
+                has_team_conditions
+                    ? shared.engine->leader_power_delta(static_cast<size_t>(game.leader_member),
+                                                        static_cast<size_t>(m), &team)
+                    : 0;
             for (int s = 0; s < shared.snap_count; ++s) {
-                const int64_t p = has_team_conditions
-                                      ? shared.engine->slot_power(game.leader_member, m, s, &team)
-                                      : (*m_row)[s];
+                const int64_t p = (*m_row)[s] + leader_delta;
                 exact_power[row][s] = p;
                 const int c = class_of[m][s];
                 if (p > class_power[row][c]) {
@@ -999,6 +1029,21 @@ struct ClassSearch {
                            best_class_snap_[row][c] >= 0 &&
                            !is_required_snap_[best_class_snap_[row][c]]) {
                     best_class_snap_[row][c] = s;
+                }
+                if (!is_required_snap_[s]) {
+                    auto &top = top_class_snaps_[row][c];
+                    int &cnt = top_class_snap_count_[row][c];
+                    int pos = cnt;
+                    while (pos > 0 && exact_power[row][top[static_cast<size_t>(pos - 1)]] < p) {
+                        if (pos < n)
+                            top[static_cast<size_t>(pos)] = top[static_cast<size_t>(pos - 1)];
+                        --pos;
+                    }
+                    if (pos < n) {
+                        top[static_cast<size_t>(pos)] = s;
+                        if (cnt < n)
+                            ++cnt;
+                    }
                 }
             }
         }
@@ -2190,7 +2235,8 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
             game.flat_power.insert(game.flat_power.end(), row.begin(), row.end());
         game.leader_id = leader_id;
         game.leader_member = leader_member;
-        if (use_index_pruning && !engine.rules().formation_leader_conditions())
+        if (use_index_pruning && !engine.rules().leader_has_formation_conditions(
+                                     *shared.members[static_cast<size_t>(leader_member)]))
             prune(shared, matrix);
         else if (use_index_pruning)
             shared.keep_at.assign(shared.pairs.size() * static_cast<size_t>(team_size), 1);
@@ -2492,8 +2538,7 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                 const unsigned int hw = std::thread::hardware_concurrency();
                 const size_t num_workers =
                     std::min<size_t>(rem_leaders.size(), std::min<size_t>(8, std::max(1u, hw)));
-                if (num_workers <= 1 || engine.rules().formation_leader_conditions() ||
-                    static_cast<bool>(options.progress)) {
+                if (num_workers <= 1) {
                     for (int64_t lid : rem_leaders) {
                         if (wall_s() > deadline || !run_leader(search, lid)) {
                             certified = false;
@@ -2505,10 +2550,16 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                                              " member nodes " + std::to_string(search.nodes));
                     }
                 } else {
+                    engine.base_power_matrix();
+                    engine.durations();
+                    engine.boosts();
+                    engine.gains();
+                    engine.member_perfect_only();
                     for (int64_t lid : rem_leaders) {
                         engine.power_matrix(static_cast<size_t>(engine.member_pos(lid)));
                     }
                     std::mutex pool_mtx;
+                    std::mutex progress_mtx;
                     std::atomic<double> shared_cut(search.pool.cutoff());
                     std::atomic<size_t> next_idx(0);
                     std::vector<std::unique_ptr<ClassSearch>> workers(num_workers);
@@ -2537,10 +2588,16 @@ RankResult rank_formations(const Engine &engine, const RankOptions &options) {
                                     std::lock_guard<std::mutex> lock(pool_mtx);
                                     ws.pool = search.pool;
                                 }
-                                if (!run_leader(ws, rem_leaders[idx])) {
+                                const int64_t lid = rem_leaders[idx];
+                                if (!run_leader(ws, lid)) {
                                     break;
                                 }
                                 ++worker_proven[w];
+                                if (options.progress) {
+                                    std::lock_guard<std::mutex> lock(progress_mtx);
+                                    options.progress("proven leader " + std::to_string(lid) +
+                                                     " member nodes " + std::to_string(ws.nodes));
+                                }
                             }
                         } catch (...) {
                             std::lock_guard<std::mutex> lock(exception_mtx);
