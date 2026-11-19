@@ -1,14 +1,21 @@
 CXX      ?= g++
-CXXFLAGS ?= -std=c++20 -O2 -pthread -Wall -Wextra -Isrc -MMD -MP
+CXXFLAGS ?= -std=c++20 -O2 -pthread -Wall -Wextra -Wshadow -Isrc -MMD -MP
+ifeq ($(SANITIZE),1)
+override CXXFLAGS += -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+else ifeq ($(TSAN),1)
+override CXXFLAGS += -O1 -g -fno-omit-frame-pointer -fsanitize=thread
+else ifeq ($(RELEASE),1)
+override CXXFLAGS += -O3 -flto
+endif
 BUILD    := build
 
-CORE      := json model engine solver event gekisou
+CORE      := json model engine solver event gekisou_master gekisou_sim gekisou_scoring gekisou_search gekisou
 OBJ       := $(addprefix $(BUILD)/,$(addsuffix .o,$(CORE)))
 TESTS     := json model engine solver cache
 TEST_BINS := $(addprefix $(BUILD)/test_,$(TESTS))
 TEST_OBJ  := $(addsuffix .o,$(TEST_BINS))
 
-.PHONY: all clean test format format-check
+.PHONY: all clean test test-asan format format-check
 
 all: $(BUILD)/deckcalc
 
@@ -45,6 +52,15 @@ test: $(BUILD)/deckcalc $(TEST_BINS)
 	python3 tests/test_topk.py
 	python3 tests/test_warm_start.py
 	python3 tests/test_gekisou.py
+
+test-asan:
+	$(MAKE) clean
+	$(MAKE) -j4 SANITIZE=1 $(BUILD)/deckcalc $(TEST_BINS)
+	@for t in $(TESTS); do ./$(BUILD)/test_$$t || exit 1; done
+	python3 tests/test_event_mean.py
+	python3 tests/test_topk.py
+	python3 tests/test_gekisou.py
+	$(MAKE) clean
 
 format:
 	clang-format -i src/*.cpp src/*.hpp tests/*.cpp

@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,9 +43,16 @@ void usage() {
            "                    [-p normal2.json ...] (批量计算并复用缓存)\n"
            "  deckcalc gekisou-score (-i input.json | -p problem.json -f formation.json) [-o "
            "out.json]\n"
+           "                         [--assumed-placement 1..5] [--seeds 0,1] "
+           "[--accuracy-just P] [--accuracy-great P] [--master-dir DIR]\n"
            "  deckcalc gekisou-rank  (-i input.json | -p problem.json) [-k N] [--criterion "
            "mean|max|min]\n"
-           "                         [--oracle] [--time-limit S] [-o out.json]\n"
+           "                         [--oracle] [--time-limit S | --time-limit-ms MS] "
+           "[--assumed-placement 1..5] [--seeds 0,1]\n"
+           "                         [--required-members IDS] [--excluded-members IDS] "
+           "[--required-snaps IDS] [--excluded-snaps IDS]\n"
+           "                         [--leader ID] [--candidates-file FILE] "
+           "[--accuracy-just P] [--accuracy-great P] [--master-dir DIR] [-o out.json]\n"
            "  deckcalc rank     -p problem.json [-o out.json] [--top N] [--prove-top N] "
            "[--time-limit S]\n"
            "                    [--method auto|fast|exact] [--leaders 61,62] [--detail] [--quiet]\n"
@@ -87,6 +96,42 @@ std::string need_value(int argc, char **argv, int &i, const char *flag) {
         throw SpecError(std::string("参数缺少取值: ") + flag);
     }
     return argv[++i];
+}
+
+int64_t parse_int64_strict(const std::string &text, const char *flag) {
+    size_t pos = 0;
+    int64_t value = 0;
+    try {
+        value = std::stoll(text, &pos);
+    } catch (const std::exception &) {
+        throw SpecError(std::string("参数 ") + flag + " 需要有效整数，收到: " + text);
+    }
+    if (pos != text.size()) {
+        throw SpecError(std::string("参数 ") + flag + " 包含非法字符: " + text);
+    }
+    return value;
+}
+
+int parse_int_strict(const std::string &text, const char *flag) {
+    const int64_t value = parse_int64_strict(text, flag);
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        throw SpecError(std::string("参数 ") + flag + " 超出整数范围: " + text);
+    }
+    return static_cast<int>(value);
+}
+
+double parse_double_strict(const std::string &text, const char *flag) {
+    size_t pos = 0;
+    double value = 0.0;
+    try {
+        value = std::stod(text, &pos);
+    } catch (const std::exception &) {
+        throw SpecError(std::string("参数 ") + flag + " 需要有效数字，收到: " + text);
+    }
+    if (pos != text.size() || !std::isfinite(value)) {
+        throw SpecError(std::string("参数 ") + flag + " 需要有限数字，收到: " + text);
+    }
+    return value;
 }
 
 Args parse_args(int argc, char **argv) {
@@ -134,23 +179,27 @@ Args parse_args(int argc, char **argv) {
             args.method_explicit = true;
             args.method = need_value(argc, argv, i, "--method");
         } else if (flag == "--prove-top") {
-            args.prove_top = std::stoi(need_value(argc, argv, i, "--prove-top"));
+            args.prove_top =
+                parse_int_strict(need_value(argc, argv, i, "--prove-top"), "--prove-top");
             if (args.prove_top <= 0)
                 throw SpecError("--prove-top 必须为正数");
         } else if (flag == "--leaders") {
             args.leaders = need_value(argc, argv, i, "--leaders");
         } else if (flag == "--top") {
-            args.top = std::stoi(need_value(argc, argv, i, "--top"));
+            args.top = parse_int_strict(need_value(argc, argv, i, "--top"), "--top");
         } else if (flag == "--time-limit") {
-            args.time_limit = std::stod(need_value(argc, argv, i, "--time-limit"));
+            args.time_limit =
+                parse_double_strict(need_value(argc, argv, i, "--time-limit"), "--time-limit");
         } else if (flag == "--beam-width") {
-            args.beam_width = std::stoi(need_value(argc, argv, i, "--beam-width"));
+            args.beam_width =
+                parse_int_strict(need_value(argc, argv, i, "--beam-width"), "--beam-width");
         } else if (flag == "--restarts") {
-            args.restarts = std::stoi(need_value(argc, argv, i, "--restarts"));
+            args.restarts = parse_int_strict(need_value(argc, argv, i, "--restarts"), "--restarts");
         } else if (flag == "--anneal-steps") {
-            args.anneal_steps = std::stoi(need_value(argc, argv, i, "--anneal-steps"));
+            args.anneal_steps =
+                parse_int_strict(need_value(argc, argv, i, "--anneal-steps"), "--anneal-steps");
         } else if (flag == "--seed") {
-            args.seed = std::stoll(need_value(argc, argv, i, "--seed"));
+            args.seed = parse_int64_strict(need_value(argc, argv, i, "--seed"), "--seed");
         } else if (flag == "--detail") {
             args.detail = true;
         } else if (flag == "--quiet") {
@@ -329,14 +378,14 @@ Json rank_document(const Problem &problem, const Engine &engine, const deckcalc:
     return document;
 }
 
-std::vector<int64_t> parse_id_list(const std::string &text) {
+std::vector<int64_t> parse_id_list(const std::string &text, const char *flag = "--leaders") {
     std::vector<int64_t> ids;
     std::string current;
     for (size_t i = 0; i <= text.size(); ++i) {
         char c = i < text.size() ? text[i] : ',';
         if (c == ',' || c == ' ') {
             if (!current.empty()) {
-                ids.push_back(std::stoll(current));
+                ids.push_back(parse_int64_strict(current, flag));
                 current.clear();
             }
         } else {
@@ -352,9 +401,19 @@ int run_gekisou_command(const std::string &command, int argc, char **argv) {
     std::string formation_path;
     std::string output_path;
     std::string criterion;
+    std::string master_dir;
+    std::string candidates_file;
     std::optional<int64_t> top_k;
-    std::optional<double> time_limit_s;
+    std::optional<double> time_limit_ms;
     std::optional<int64_t> assumed_placement;
+    std::optional<std::vector<int64_t>> seeds;
+    std::optional<double> accuracy_just;
+    std::optional<double> accuracy_great;
+    std::optional<std::vector<int64_t>> required_members;
+    std::optional<std::vector<int64_t>> excluded_members;
+    std::optional<std::vector<int64_t>> required_snaps;
+    std::optional<std::vector<int64_t>> excluded_snaps;
+    std::optional<int64_t> leader_id;
     bool oracle = false;
 
     for (int i = 2; i < argc; ++i) {
@@ -371,15 +430,47 @@ int run_gekisou_command(const std::string &command, int argc, char **argv) {
         } else if (flag == "-o" || flag == "--output") {
             output_path = need_value(argc, argv, i, "--output");
         } else if (flag == "-k" || flag == "--top") {
-            top_k = std::stoll(need_value(argc, argv, i, "--top"));
+            top_k = parse_int64_strict(need_value(argc, argv, i, "--top"), "--top");
         } else if (flag == "--criterion" || flag == "--objective") {
             criterion = need_value(argc, argv, i, "--criterion");
         } else if (flag == "--oracle") {
             oracle = true;
         } else if (flag == "--time-limit") {
-            time_limit_s = std::stod(need_value(argc, argv, i, "--time-limit"));
+            time_limit_ms =
+                parse_double_strict(need_value(argc, argv, i, "--time-limit"), "--time-limit") *
+                1000.0;
+        } else if (flag == "--time-limit-ms") {
+            time_limit_ms = parse_double_strict(need_value(argc, argv, i, "--time-limit-ms"),
+                                                "--time-limit-ms");
         } else if (flag == "--assumed-placement") {
-            assumed_placement = std::stoll(need_value(argc, argv, i, "--assumed-placement"));
+            assumed_placement = parse_int64_strict(need_value(argc, argv, i, "--assumed-placement"),
+                                                   "--assumed-placement");
+        } else if (flag == "--seeds") {
+            seeds = parse_id_list(need_value(argc, argv, i, "--seeds"), "--seeds");
+        } else if (flag == "--accuracy-just") {
+            accuracy_just = parse_double_strict(need_value(argc, argv, i, "--accuracy-just"),
+                                                "--accuracy-just");
+        } else if (flag == "--accuracy-great") {
+            accuracy_great = parse_double_strict(need_value(argc, argv, i, "--accuracy-great"),
+                                                 "--accuracy-great");
+        } else if (flag == "--master-dir") {
+            master_dir = need_value(argc, argv, i, "--master-dir");
+        } else if (flag == "--candidates-file") {
+            candidates_file = need_value(argc, argv, i, "--candidates-file");
+        } else if (flag == "--required-members") {
+            required_members = parse_id_list(need_value(argc, argv, i, "--required-members"),
+                                             "--required-members");
+        } else if (flag == "--excluded-members") {
+            excluded_members = parse_id_list(need_value(argc, argv, i, "--excluded-members"),
+                                             "--excluded-members");
+        } else if (flag == "--required-snaps" || flag == "--required-snapshots") {
+            required_snaps =
+                parse_id_list(need_value(argc, argv, i, "--required-snaps"), "--required-snaps");
+        } else if (flag == "--excluded-snaps" || flag == "--excluded-snapshots") {
+            excluded_snaps =
+                parse_id_list(need_value(argc, argv, i, "--excluded-snaps"), "--excluded-snaps");
+        } else if (flag == "--leader") {
+            leader_id = parse_int64_strict(need_value(argc, argv, i, "--leader"), "--leader");
         } else {
             throw SpecError("未知参数: " + flag);
         }
@@ -394,6 +485,12 @@ int run_gekisou_command(const std::string &command, int argc, char **argv) {
     if (!formation_path.empty()) {
         input.set("formation", Json::read(formation_path));
     }
+    if (!master_dir.empty()) {
+        input.set("master_dir", Json(master_dir));
+    }
+    if (!candidates_file.empty()) {
+        input.set("candidates", Json::read(candidates_file));
+    }
     if (top_k) {
         input.set("k", Json(*top_k));
     }
@@ -403,14 +500,48 @@ int run_gekisou_command(const std::string &command, int argc, char **argv) {
     if (oracle) {
         input.set("oracle", Json(true));
     }
-    if (time_limit_s || assumed_placement) {
+    auto to_json_ids = [](const std::vector<int64_t> &ids) {
+        Json arr = Json::array();
+        for (int64_t id : ids)
+            arr.push_back(Json(id));
+        return arr;
+    };
+    if (required_members || excluded_members || required_snaps || excluded_snaps || leader_id) {
+        Json cons = input.find("constraints") && input.find("constraints")->is_object()
+                        ? *input.find("constraints")
+                        : Json::object();
+        if (required_members)
+            cons.set("required_members", to_json_ids(*required_members));
+        if (excluded_members)
+            cons.set("excluded_members", to_json_ids(*excluded_members));
+        if (required_snaps)
+            cons.set("required_snaps", to_json_ids(*required_snaps));
+        if (excluded_snaps)
+            cons.set("excluded_snaps", to_json_ids(*excluded_snaps));
+        if (leader_id)
+            cons.set("leader", Json(*leader_id));
+        input.set("constraints", std::move(cons));
+    }
+    if (time_limit_ms || assumed_placement || seeds || accuracy_just || accuracy_great) {
         Json opts = input.find("options") && input.find("options")->is_object()
                         ? *input.find("options")
                         : Json::object();
-        if (time_limit_s)
-            opts.set("time_limit_ms", Json(*time_limit_s * 1000.0));
+        if (time_limit_ms)
+            opts.set("time_limit_ms", Json(*time_limit_ms));
         if (assumed_placement)
             opts.set("assumed_placement", Json(*assumed_placement));
+        if (seeds)
+            opts.set("seeds", to_json_ids(*seeds));
+        if (accuracy_just || accuracy_great) {
+            Json acc = opts.find("accuracy") && opts.find("accuracy")->is_object()
+                           ? *opts.find("accuracy")
+                           : Json::object();
+            if (accuracy_just)
+                acc.set("just", Json(*accuracy_just));
+            if (accuracy_great)
+                acc.set("great", Json(*accuracy_great));
+            opts.set("accuracy", std::move(acc));
+        }
         input.set("options", std::move(opts));
     }
     const Json output = command == "gekisou-score" ? deckcalc::handle_gekisou_score(input)
@@ -543,13 +674,13 @@ int main(int argc, char **argv) {
                 return deckcalc::event_recommend(model, per_song, challenge_engine.get(),
                                                  &phase_cache);
             };
-            Json first = calculate(problem, engine);
+            Json first_plan = calculate(problem, engine);
             if (args.problems.size() == 1) {
-                write_output(first, args.output);
+                write_output(first_plan, args.output);
                 return 0;
             }
             Json plans = Json::array();
-            plans.push_back(std::move(first));
+            plans.push_back(std::move(first_plan));
             for (size_t i = 1; i < args.problems.size(); ++i) {
                 Problem next = deckcalc::parse_problem(Json::read(args.problems[i]));
                 check_mode(next);

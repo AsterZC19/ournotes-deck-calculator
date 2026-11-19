@@ -1102,6 +1102,312 @@ class GekisouTestCase(unittest.TestCase):
             )
             self.assertEqual(gk_rank["hits"][0]["power"], powers_by_sid[61])
 
+    def test_13_required_members_same_character_leader(self) -> None:
+        """测试 13: 必选成员与其他同角色卡并存时，跳过冲突队长不得中止搜索。"""
+        doc = json.loads(self.fixture_path.read_text(encoding="utf-8"))
+        # 克隆成员 1 为成员 9（同角色 1，成长略低以保证成员 1 在队长排序中靠前）
+        m9_cat = copy.deepcopy(doc["catalog"]["members"][0])
+        m9_cat["id"] = 9
+        m9_cat["level"] = 50
+        doc["catalog"]["members"].append(m9_cat)
+        m9_raw = copy.deepcopy(doc["gekisou_master_tables"]["MasterMemberCard"][0])
+        m9_raw["_id"] = 9
+        m9_raw["_performancePowerMax"] = int(m9_raw["_performancePowerMax"] * 0.9)
+        doc["gekisou_master_tables"]["MasterMemberCard"].append(m9_raw)
+
+        res = self.run_bridge(
+            "rank",
+            {
+                "problem": doc,
+                "candidates": {
+                    "members": [{"id": i} for i in [1, 2, 3, 4, 5, 9]],
+                    "snaps": [{"id": i} for i in range(1, 6)],
+                },
+                "constraints": {"required_members": [9]},
+                "k": 3,
+                "options": {"seeds": [0]},
+            },
+        )
+        self.assertEqual(res["status"], "ok")
+        self.assertGreater(len(res["hits"]), 0)
+        for hit in res["hits"]:
+            mids = hit["formation"]["member_ids"]
+            self.assertIn(9, mids)
+            self.assertNotIn(1, mids)
+
+    def test_14_oracle_combo_cap_enforced(self) -> None:
+        """测试 14: available >= 5 时 --oracle 必须正确估算组合数并拒绝超过 50000 上限的池子。"""
+        doc = json.loads(self.fixture_path.read_text(encoding="utf-8"))
+        s6_cat = copy.deepcopy(doc["catalog"]["snapshots"][0])
+        s6_cat["id"] = 6
+        doc["catalog"]["snapshots"].append(s6_cat)
+        s6_raw = copy.deepcopy(doc["gekisou_master_tables"]["MasterSupportCard"][0])
+        s6_raw["_id"] = 6
+        doc["gekisou_master_tables"]["MasterSupportCard"].append(s6_raw)
+
+        # 8 成员 × 6 快照: C(8,5)*5*P(6,5) = 56 * 5 * 720 = 201600 > 50000
+        with self.assertRaises(RuntimeError) as cm:
+            self.run_bridge(
+                "rank",
+                {
+                    "problem": doc,
+                    "oracle": True,
+                    "k": 1,
+                },
+            )
+        self.assertIn("Oracle 穷举组合数超过上限 50000", str(cm.exception))
+
+        # 排除 2 名成员与 1 张快照后剩余 6 成员 × 5 快照 = 3600 <= 50000，应允许 Oracle 执行
+        res_excluded = self.run_bridge(
+            "rank",
+            {
+                "problem": doc,
+                "oracle": True,
+                "constraints": {"excluded_members": [7, 8], "excluded_snaps": [6]},
+                "k": 1,
+                "options": {"seeds": [0]},
+            },
+        )
+        self.assertTrue(res_excluded["search_complete"])
+        self.assertEqual(res_excluded["optimality_scope"], "exact_seeded_oracle")
+
+        # k == 0 必须显式报错，不得静默回退到 10
+        with self.assertRaises(RuntimeError) as cm_k0:
+            self.run_bridge("rank", {"problem": doc, "k": 0})
+        self.assertIn("k (Top-K)", str(cm_k0.exception))
+
+        # 原生 CLI 数值参数包含尾随非法字符必须拒绝
+        bad_cli = subprocess.run(
+            [str(DECKCALC), "gekisou-rank", "-p", str(self.fixture_path), "--leader", "1abc"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertNotEqual(bad_cli.returncode, 0)
+        self.assertIn("非法字符", bad_cli.stderr)
+
+    def test_15_time_limit_zero_and_non_oracle_certification(self) -> None:
+        """测试 15: 显式 time_limit_ms=0 表示不限时，小池穷举完毕后应正确标记 search_complete。"""
+        cand = {
+            "members": [{"id": i} for i in range(1, 7)],
+            "snaps": [{"id": i} for i in range(1, 6)],
+        }
+        res_global = self.run_bridge(
+            "rank",
+            {
+                "problem": str(self.fixture_path),
+                "candidates": cand,
+                "k": 2,
+                "options": {"time_limit_ms": 0, "seeds": []},
+            },
+        )
+        self.assertTrue(res_global["search_complete"])
+        self.assertTrue(res_global["optimality_certified"])
+        self.assertEqual(res_global["optimality_scope"], "exact_global")
+
+        res_seeded = self.run_bridge(
+            "rank",
+            {
+                "problem": str(self.fixture_path),
+                "candidates": cand,
+                "k": 2,
+                "options": {"time_limit_ms": 0, "seeds": [0]},
+            },
+        )
+        self.assertTrue(res_seeded["search_complete"])
+        self.assertTrue(res_seeded["optimality_certified"])
+        self.assertEqual(res_seeded["optimality_scope"], "exact_seeded")
+
+    def test_16_large_pool_warm_start_and_cli_flags(self) -> None:
+        """测试 16: 多快照大池在短时限下通过 warm-start 返回有效 Top-K，并验证原生 CLI 与 tools/gekisou.py 参数。"""
+        doc = json.loads(self.fixture_path.read_text(encoding="utf-8"))
+        # 扩展至 12 成员、12 快照以触发大池 warm-start
+        for new_id in range(9, 13):
+            m_cat = copy.deepcopy(doc["catalog"]["members"][(new_id - 1) % 8])
+            m_cat["id"] = new_id
+            m_cat["character"] = new_id
+            doc["catalog"]["members"].append(m_cat)
+            m_raw = copy.deepcopy(
+                doc["gekisou_master_tables"]["MasterMemberCard"][(new_id - 1) % 8]
+            )
+            m_raw["_id"] = new_id
+            m_raw["_characterID"] = new_id
+            doc["gekisou_master_tables"]["MasterMemberCard"].append(m_raw)
+            ch_raw = copy.deepcopy(doc["gekisou_master_tables"]["MasterCharacter"][0])
+            ch_raw["_id"] = new_id
+            doc["gekisou_master_tables"]["MasterCharacter"].append(ch_raw)
+        for new_sid in range(6, 13):
+            s_cat = copy.deepcopy(doc["catalog"]["snapshots"][(new_sid - 1) % 5])
+            s_cat["id"] = new_sid
+            doc["catalog"]["snapshots"].append(s_cat)
+            s_raw = copy.deepcopy(
+                doc["gekisou_master_tables"]["MasterSupportCard"][(new_sid - 1) % 5]
+            )
+            s_raw["_id"] = new_sid
+            doc["gekisou_master_tables"]["MasterSupportCard"].append(s_raw)
+
+        with tempfile.TemporaryDirectory() as td:
+            p_path = Path(td) / "big_gk.json"
+            p_path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+            # 原生 CLI 标志校验
+            proc = subprocess.run(
+                [
+                    str(DECKCALC),
+                    "gekisou-rank",
+                    "-p",
+                    str(p_path),
+                    "-k",
+                    "3",
+                    "--leader",
+                    "1",
+                    "--required-members",
+                    "2",
+                    "--excluded-members",
+                    "3",
+                    "--required-snaps",
+                    "1",
+                    "--seeds",
+                    "0",
+                    "--time-limit-ms",
+                    "1200",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=str(REPO_ROOT),
+            )
+            native_out = json.loads(proc.stdout)
+            self.assertEqual(native_out["status"], "ok")
+            self.assertGreater(len(native_out["hits"]), 0)
+            self.assertGreater(native_out["stats"]["exact"], 0)
+            for hit in native_out["hits"]:
+                form = hit["formation"]
+                self.assertEqual(form["leader"], 1)
+                self.assertIn(2, form["member_ids"])
+                self.assertNotIn(3, form["member_ids"])
+                self.assertIn(1, form["snap_ids"])
+
+            # tools/gekisou.py 零拷贝路径传递
+            py_out_path = Path(td) / "py_out.json"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "gekisou.py"),
+                    "rank",
+                    "-p",
+                    str(p_path),
+                    "-k",
+                    "2",
+                    "--leader",
+                    "1",
+                    "--seeds",
+                    "0",
+                    "--time-limit-ms",
+                    "1000",
+                    "-o",
+                    str(py_out_path),
+                    "-q",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=str(REPO_ROOT),
+            )
+            py_out = json.loads(py_out_path.read_text(encoding="utf-8"))
+            self.assertEqual(py_out["status"], "ok")
+            self.assertGreater(len(py_out["hits"]), 0)
+
+    def test_17_conversion_limit_and_shared_gk_skill(self) -> None:
+        """测试 17: 限次判定转换耗尽 (13005) 与多名成员共享激奏技能 ID 时不发生内存错误或键冲突。"""
+        doc = json.loads(self.fixture_path.read_text(encoding="utf-8"))
+        # 设为全 Just 任务以触发 Just 转换与激奏技能 1 (13000)
+        doc["song"]["gekisou_missions"] = [3, 3, 3]
+        formation = {
+            "schema": "ournotes-deck-formation@1",
+            "leader": 3,
+            "slots": [
+                {"slot": 0, "member": 3, "snapshot": 3},
+                {"slot": 1, "member": 4, "snapshot": 1},
+                {"slot": 2, "member": 7, "snapshot": 2},
+                {"slot": 3, "member": 1, "snapshot": 4},
+                {"slot": 4, "member": 2, "snapshot": 5},
+            ],
+        }
+        base_res = self.run_bridge(
+            "score",
+            {
+                "problem": doc,
+                "formation": formation,
+                "options": {"accuracy": {"just": 50.0, "great": 0.0}},
+            },
+        )
+
+        gmt = doc["gekisou_master_tables"]
+        # 为快照 3 增加限次 2 次的 Just 转换效果 (13005, _judgement=5 即 Perfect -> Just)
+        gmt["MasterSkillTarget"].append(
+            {
+                "_id": 9041,
+                "_skillTargetType": 0,
+                "_bandID": 0,
+                "_cardType": 0,
+                "_characterID": 0,
+                "_tagID": 0,
+                "_liveSkillCategories": [],
+                "_gekisouSkillCategories": [],
+                "_gekisouMissionType": 0,
+                "_liveMusicType": 0,
+                "_judgement": 5,
+            }
+        )
+        gmt["MasterGekisouSupportSkill"].append(
+            {
+                "_id": 9901,
+                "_nameTextID": "conv",
+                "_descriptionTextFormatID": "conv",
+                "_skillIconID": 7,
+                "_gekisouSupportSkillExecTiming": 1,
+                "_gekisouMissionType": 3,
+                "_displaySkillCategories": [1],
+            }
+        )
+        gmt["MasterGekisouSupportSkillEffect"].append(
+            {
+                "_id": 990101,
+                "_gekisouSupportSkillID": 9901,
+                "_level": 5,
+                "_skillTriggerConditionGroup": 253,
+                "_skillTriggerType": 1,
+                "_skillConditionGroup": 0,
+                "_skillReleaseConditionGroup": 0,
+                "_skillTargetIDs": [9041],
+                "_skillEffectType": 13005,
+                "_activationTimeSecond": 10.0,
+                "_effectValue": 0,
+                "_maxEffectValue": 0,
+                "_effectLimitCount": 2,
+                "_skillCumulativeConditionID": 0,
+                "_effectExecuteLimitCount": 0,
+                "_effectExecuteLimitResetConditionGroup": 0,
+                "_icon": "",
+            }
+        )
+        gmt["MasterSupportCard"][2]["_gekisouSupportSkillId01"] = 9901
+        res = self.run_bridge(
+            "score",
+            {
+                "problem": doc,
+                "formation": formation,
+                "options": {"accuracy": {"just": 50.0, "great": 0.0}},
+            },
+        )
+        self.assertEqual(res["status"], "ok")
+        self.assertGreater(
+            res["mean"],
+            base_res["mean"],
+            "13005 Just 转换必须实际触发并提升得分以覆盖限次耗尽路径",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
